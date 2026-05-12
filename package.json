@@ -1,0 +1,22 @@
+{
+  "name": "redmine-mattermost-dm",
+  "version": "1.0.0",
+  "description": "Integração Redmine com Mattermost para envio de mensagens diretas",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "keywords": [
+    "redmine",
+    "mattermost",
+    "webhook",
+    "nodejs"
+  ],
+  "author": "Daniel",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.9.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0"
+  }
+}
