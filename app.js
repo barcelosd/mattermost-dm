@@ -3,28 +3,13 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 
+const app = express();
+
 app.use(express.json({ type: '*/*' }));
-
-app.use((err, req, res, next) => {
-  console.error('Erro ao ler JSON recebido:');
-  console.error(err.message);
-  res.status(400).json({
-    message: 'JSON inválido recebido.',
-    error: err.message
-  });
-});
-
-app.post('/redmine-webhook', async (req, res) => {
-  console.log('Headers recebidos:');
-  console.log(req.headers);
-
-  console.log('Body recebido:');
-  console.log(JSON.stringify(req.body, null, 2));
-
-  try {
+app.use(express.urlencoded({ extended: true }));
 
 const {
-  PORT,
+  PORT = 3000,
   REDMINE_URL,
   REDMINE_API_KEY,
   MATTERMOST_URL,
@@ -89,16 +74,43 @@ async function sendMattermostMessage(channelId, message) {
   );
 }
 
+function getIssueFromPayload(body) {
+  if (body.issue) return body.issue;
+  if (body.payload?.issue) return body.payload.issue;
+  if (body.webhook?.issue) return body.webhook.issue;
+
+  if (typeof body.payload === 'string') {
+    try {
+      const parsed = JSON.parse(body.payload);
+      return parsed.issue || parsed.payload?.issue || parsed.webhook?.issue;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
 app.post('/redmine-webhook', async (req, res) => {
+  console.log('Headers recebidos:');
+  console.log(req.headers);
+
+  console.log('Body recebido:');
+  console.log(JSON.stringify(req.body, null, 2));
+
   try {
-    const issue = req.body.issue;
+    const issue = getIssueFromPayload(req.body);
 
     if (!issue) {
-      return res.status(200).json({ message: 'Payload sem issue.' });
+      return res.status(200).json({
+        message: 'Payload recebido, mas sem issue.'
+      });
     }
 
     if (!issue.assigned_to || !issue.assigned_to.id) {
-      return res.status(200).json({ message: 'Tarefa sem responsável.' });
+      return res.status(200).json({
+        message: 'Tarefa sem responsável.'
+      });
     }
 
     const issueId = issue.id;
@@ -134,6 +146,8 @@ app.post('/redmine-webhook', async (req, res) => {
     });
 
   } catch (error) {
+    console.error('Erro detalhado:');
+    console.error(error.response?.status);
     console.error(error.response?.data || error.message);
 
     return res.status(500).json({
@@ -141,6 +155,16 @@ app.post('/redmine-webhook', async (req, res) => {
       error: error.response?.data || error.message
     });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error('Erro ao ler requisição recebida:');
+  console.error(err.message);
+
+  res.status(400).json({
+    message: 'Erro ao ler requisição recebida.',
+    error: err.message
+  });
 });
 
 app.get('/', (req, res) => {
