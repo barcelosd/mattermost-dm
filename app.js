@@ -5,8 +5,7 @@ const axios = require('axios');
 
 const app = express();
 
-app.use(express.json({ type: '*/*' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.text({ type: '*/*' }));
 
 const {
   PORT = 3000,
@@ -75,18 +74,32 @@ async function sendMattermostMessage(channelId, message) {
 }
 
 function getIssueFromPayload(body) {
-  if (body.issue) return body.issue;
-  if (body.payload?.issue) return body.payload.issue;
-  if (body.webhook?.issue) return body.webhook.issue;
+  console.log('Body bruto recebido:');
+  console.log(body);
 
-  if (typeof body.payload === 'string') {
+  let data = body;
+
+  if (typeof body === 'string') {
     try {
-      const parsed = JSON.parse(body.payload);
-      return parsed.issue || parsed.payload?.issue || parsed.webhook?.issue;
+      data = JSON.parse(body);
     } catch {
-      return null;
+      const params = new URLSearchParams(body);
+
+      if (params.has('payload')) {
+        try {
+          data = JSON.parse(params.get('payload'));
+        } catch {
+          return null;
+        }
+      } else {
+        return null;
+      }
     }
   }
+
+  if (data.issue) return data.issue;
+  if (data.payload?.issue) return data.payload.issue;
+  if (data.webhook?.issue) return data.webhook.issue;
 
   return null;
 }
@@ -96,7 +109,7 @@ app.post('/redmine-webhook', async (req, res) => {
   console.log(req.headers);
 
   console.log('Body recebido:');
-  console.log(JSON.stringify(req.body, null, 2));
+  console.log(req.body);
 
   try {
     const issue = getIssueFromPayload(req.body);
