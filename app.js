@@ -25,6 +25,79 @@ const redmineHeaders = {
   'Content-Type': 'application/json'
 };
 
+function parseBody(rawBody) {
+  if (!rawBody) return {};
+
+  if (typeof rawBody !== 'string') {
+    return rawBody;
+  }
+
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    const params = new URLSearchParams(rawBody);
+
+    if (params.has('payload')) {
+      try {
+        return {
+          payload: JSON.parse(params.get('payload'))
+        };
+      } catch {
+        return {};
+      }
+    }
+
+    return {};
+  }
+}
+
+function getIssueFromPayload(body) {
+  const data = parseBody(body);
+
+  console.log('Payload convertido:');
+  console.log(JSON.stringify(data, null, 2));
+
+  if (data.issue) return data.issue;
+
+  if (data.payload) {
+    if (typeof data.payload === 'string') {
+      try {
+        const parsedPayload = JSON.parse(data.payload);
+        return parsedPayload.issue || null;
+      } catch {
+        return null;
+      }
+    }
+
+    return data.payload.issue || null;
+  }
+
+  if (data.webhook?.issue) return data.webhook.issue;
+
+  return null;
+}
+
+function getActionFromPayload(body) {
+  const data = parseBody(body);
+
+  if (data.action) return data.action;
+
+  if (data.payload) {
+    if (typeof data.payload === 'string') {
+      try {
+        const parsedPayload = JSON.parse(data.payload);
+        return parsedPayload.action || null;
+      } catch {
+        return null;
+      }
+    }
+
+    return data.payload.action || null;
+  }
+
+  return null;
+}
+
 async function getRedmineUserEmail(userId) {
   const response = await axios.get(
     `${REDMINE_URL}/users/${userId}.json`,
@@ -73,33 +146,25 @@ async function sendMattermostMessage(channelId, message) {
   );
 }
 
-function getIssueFromPayload(body) {
-  console.log('Body bruto recebido:');
-  console.log(body);
-
-  let data = body;
-
-  if (typeof body === 'string') {
-    try {
-      data = JSON.parse(body);
-    } catch {
-      const params = new URLSearchParams(body);
-
-      if (params.has('payload')) {
-        try {
-          data = JSON.parse(params.get('payload'));
-        } catch {
-          return null;
-        }
-      } else {
-        return null;
-      }
-    }
+async function getResponsibleEmail(issue) {
+  if (issue.assignee?.mail) {
+    return issue.assignee.mail;
   }
 
-  if (data.issue) return data.issue;
-  if (data.payload?.issue) return data.payload.issue;
-  if (data.webhook?.issue) return data.webhook.issue;
+  if (issue.assigned_to?.mail) {
+    return issue.assigned_to.mail;
+  }
+
+  if (
+    typeof issue.assigned_to?.id === 'string' &&
+    issue.assigned_to.id.includes('@')
+  ) {
+    return issue.assigned_to.id;
+  }
+
+  if (issue.assigned_to?.id) {
+    return await getRedmineUserEmail(issue.assigned_to.id);
+  }
 
   return null;
 }
@@ -108,11 +173,12 @@ app.post('/redmine-webhook', async (req, res) => {
   console.log('Headers recebidos:');
   console.log(req.headers);
 
-  console.log('Body recebido:');
+  console.log('Body bruto recebido:');
   console.log(req.body);
 
   try {
     const issue = getIssueFromPayload(req.body);
+    const action = getActionFromPayload(req.body);
 
     if (!issue) {
       return res.status(200).json({
@@ -120,17 +186,16 @@ app.post('/redmine-webhook', async (req, res) => {
       });
     }
 
-    if (!issue.assigned_to || !issue.assigned_to.id) {
+    const email = await getResponsibleEmail(issue);
+
+    if (!email) {
       return res.status(200).json({
-        message: 'Tarefa sem responsável.'
+        message: 'Tarefa sem responsável ou sem e-mail.'
       });
     }
 
-    const issueId = issue.id;
-    const subject = issue.subject || 'Sem assunto';
-    const assignedUserId = issue.assigned_to.id;
+    console.log('E-mail usado para buscar no Mattermost:', email);
 
-    const email = await getRedmineUserEmail(assignedUserId);
     const mattermostUser = await getMattermostUserByEmail(email);
     const botUser = await getMattermostBotUser();
 
@@ -139,17 +204,26 @@ app.post('/redmine-webhook', async (req, res) => {
       mattermostUser.id
     );
 
-    const issueUrl = `${REDMINE_URL}/issues/${issueId}`;
+    const issueId = issue.id;
+    const subject = issue.subject || 'Sem assunto';
+    const status = issue.status?.name || issue.status || '';
+    const priority = issue.priority?.name || issue.priority || '';
+    const project = issue.project?.name || issue.project || '';
+    const url = issue.url || `${REDMINE_URL}/issues/${issueId}`;
 
     const message = [
-      `### Nova notificação do Redmine`,
+      `### Notificação do Redmine`,
       ``,
       `Você é o responsável pela tarefa **#${issueId}**.`,
       ``,
+      `**Ação:** ${action || 'Atualização'}`,
+      `**Projeto:** ${project}`,
       `**Assunto:** ${subject}`,
+      status ? `**Status:** ${status}` : null,
+      priority ? `**Prioridade:** ${priority}` : null,
       ``,
-      `[Abrir tarefa no Redmine](${issueUrl})`
-    ].join('\n');
+      `[Abrir tarefa no Redmine](${url})`
+    ].filter(Boolean).join('\n');
 
     await sendMattermostMessage(directChannel.id, message);
 
@@ -168,16 +242,6 @@ app.post('/redmine-webhook', async (req, res) => {
       error: error.response?.data || error.message
     });
   }
-});
-
-app.use((err, req, res, next) => {
-  console.error('Erro ao ler requisição recebida:');
-  console.error(err.message);
-
-  res.status(400).json({
-    message: 'Erro ao ler requisição recebida.',
-    error: err.message
-  });
 });
 
 app.get('/', (req, res) => {
