@@ -26,7 +26,6 @@ const redmineHeaders = {
 
 function parseBody(rawBody) {
   if (!rawBody) return {};
-
   if (typeof rawBody !== 'string') return rawBody;
 
   try {
@@ -46,26 +45,36 @@ function parseBody(rawBody) {
   }
 }
 
-function getIssueFromPayload(body) {
+function getPayloadData(body) {
   const data = parseBody(body);
+
+  if (data.payload && typeof data.payload === 'string') {
+    try {
+      return JSON.parse(data.payload);
+    } catch {
+      return data;
+    }
+  }
+
+  if (data.payload && typeof data.payload === 'object') {
+    return data.payload;
+  }
+
+  return data;
+}
+
+function getIssueFromPayload(body) {
+  const data = getPayloadData(body);
 
   console.log('Payload convertido:');
   console.log(JSON.stringify(data, null, 2));
 
-  if (data.issue) return data.issue;
-  if (data.payload?.issue) return data.payload.issue;
-  if (data.webhook?.issue) return data.webhook.issue;
-
-  return null;
+  return data.issue || data.webhook?.issue || null;
 }
 
 function getActionFromPayload(body) {
-  const data = parseBody(body);
-
-  if (data.action) return data.action;
-  if (data.payload?.action) return data.payload.action;
-
-  return null;
+  const data = getPayloadData(body);
+  return data.action || null;
 }
 
 async function getRedmineUser(userId) {
@@ -78,9 +87,7 @@ async function getRedmineUser(userId) {
 }
 
 async function getRedmineGroup(groupId) {
-
   try {
-
     console.log('Buscando grupo Redmine:', groupId);
 
     const response = await axios.get(
@@ -89,11 +96,11 @@ async function getRedmineGroup(groupId) {
     );
 
     console.log('Grupo encontrado:', response.data.group?.name);
+    console.log('Usuários retornados no grupo:', response.data.group?.users?.length || 0);
 
     return response.data.group;
 
   } catch (error) {
-
     console.error('Erro ao buscar grupo Redmine:');
 
     if (error.response) {
@@ -106,16 +113,18 @@ async function getRedmineGroup(groupId) {
     return null;
   }
 }
+
+async function getMattermostBotUser() {
   const response = await axios.get(
-    `${REDMINE_URL}/groups/${groupId}.json?include=users`,
-    { headers: redmineHeaders }
+    `${MATTERMOST_URL}/api/v4/users/me`,
+    { headers: mattermostHeaders }
   );
 
-  return response.data.group;
+  return response.data;
 }
 
 async function getMattermostUserByEmail(email) {
-  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedEmail = String(email).trim().toLowerCase();
 
   console.log('Buscando usuário Mattermost pelo e-mail:', normalizedEmail);
 
@@ -124,22 +133,13 @@ async function getMattermostUserByEmail(email) {
     { headers: mattermostHeaders }
   );
 
-  console.log('Usuário encontrado no Mattermost:', {
+  console.log('Usuário Mattermost encontrado:', {
     id: response.data.id,
     username: response.data.username,
     email: response.data.email,
     delete_at: response.data.delete_at,
     is_bot: response.data.is_bot
   });
-
-  return response.data;
-}
-
-async function getMattermostBotUser() {
-  const response = await axios.get(
-    `${MATTERMOST_URL}/api/v4/users/me`,
-    { headers: mattermostHeaders }
-  );
 
   return response.data;
 }
@@ -207,71 +207,68 @@ async function getResponsibleTargets(issue) {
     console.log(errorUser.response?.status || errorUser.message);
   }
 
-  try {
-    const group = await getRedmineGroup(assignee.id);
+  const group = await getRedmineGroup(assignee.id);
 
-if (!group) {
-  return [{
-    type: 'group_error',
-    name: assignee.lastname || assignee.name || assignee.id,
-    error: 'Grupo não encontrado na API do Redmine.'
-  }];
-}
+  if (!group) {
+    return [{
+      type: 'group_error',
+      name: assignee.lastname || assignee.name || assignee.id,
+      success: false,
+      error: 'Grupo não encontrado na API do Redmine.'
+    }];
+  }
 
-if (!group.users || group.users.length === 0) {
-      return [{
-        type: 'group_error',
-        name: group.name || assignee.name,
-        error: 'Grupo encontrado, mas sem usuários retornados pela API.'
-      }];
-    }
+  if (!group.users || group.users.length === 0) {
+    return [{
+      type: 'group_error',
+      name: group.name || assignee.lastname || assignee.id,
+      success: false,
+      error: 'Grupo encontrado, mas sem usuários retornados pela API.'
+    }];
+  }
 
-    const users = [];
+  const targets = [];
 
-    for (const groupUser of group.users) {
-      try {
-        const fullUser = await getRedmineUser(groupUser.id);
+  for (const groupUser of group.users) {
+    try {
+      const fullUser = await getRedmineUser(groupUser.id);
 
-        if (fullUser?.mail) {
-          users.push({
-            type: 'group_user',
-            groupName: group.name,
-            name: `${fullUser.firstname || ''} ${fullUser.lastname || ''}`.trim() || fullUser.login,
-            email: fullUser.mail.trim().toLowerCase()
-          });
-        } else {
-          users.push({
-            type: 'group_user_error',
-            groupName: group.name,
-            name: groupUser.name || groupUser.id,
-            error: 'Usuário do grupo não possui e-mail na API do Redmine.'
-          });
-        }
-      } catch (errorFullUser) {
-        users.push({
+      if (fullUser?.mail) {
+        targets.push({
+          type: 'group_user',
+          groupName: group.name,
+          name: `${fullUser.firstname || ''} ${fullUser.lastname || ''}`.trim() || fullUser.login,
+          email: fullUser.mail.trim().toLowerCase()
+        });
+      } else {
+        targets.push({
           type: 'group_user_error',
           groupName: group.name,
           name: groupUser.name || groupUser.id,
-          error: errorFullUser.response?.data || errorFullUser.message
+          success: false,
+          error: 'Usuário do grupo não possui e-mail no Redmine.'
         });
       }
+
+    } catch (errorFullUser) {
+      targets.push({
+        type: 'group_user_error',
+        groupName: group.name,
+        name: groupUser.name || groupUser.id,
+        success: false,
+        error: errorFullUser.response?.data || errorFullUser.message
+      });
     }
-
-    return users;
-
-  } catch (errorGroup) {
-    return [{
-      type: 'assignee_error',
-      name: assignee.name || assignee.id,
-      error: errorGroup.response?.data || errorGroup.message
-    }];
   }
+
+  return targets;
 }
 
 async function notifyMattermostUser(target, message, botUser) {
   const result = {
     email: target.email,
     name: target.name,
+    groupName: target.groupName || null,
     type: target.type,
     success: false,
     stage: null,
@@ -280,6 +277,7 @@ async function notifyMattermostUser(target, message, botUser) {
 
   try {
     result.stage = 'buscar_usuario_mattermost';
+
     const mattermostUser = await getMattermostUserByEmail(target.email);
 
     if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
@@ -289,12 +287,14 @@ async function notifyMattermostUser(target, message, botUser) {
     }
 
     result.stage = 'criar_dm';
+
     const directChannel = await createDirectChannel(
       botUser.id,
       mattermostUser.id
     );
 
     result.stage = 'enviar_mensagem';
+
     await sendMattermostMessage(directChannel.id, message);
 
     result.success = true;
@@ -304,7 +304,10 @@ async function notifyMattermostUser(target, message, botUser) {
 
   } catch (error) {
     result.error = error.response?.data || error.message;
-    console.error('Falha ao notificar usuário:', result);
+
+    console.error('Falha ao notificar usuário:');
+    console.error(JSON.stringify(result, null, 2));
+
     return result;
   }
 }
@@ -363,6 +366,7 @@ app.post('/redmine-webhook', async (req, res) => {
       if (!target.email) {
         results.push({
           name: target.name,
+          groupName: target.groupName || null,
           type: target.type,
           success: false,
           stage: 'sem_email',
