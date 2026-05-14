@@ -4,7 +4,6 @@ const express = require('express');
 const axios = require('axios');
 
 const app = express();
-
 app.use(express.text({ type: '*/*' }));
 
 const {
@@ -28,9 +27,7 @@ const redmineHeaders = {
 function parseBody(rawBody) {
   if (!rawBody) return {};
 
-  if (typeof rawBody !== 'string') {
-    return rawBody;
-  }
+  if (typeof rawBody !== 'string') return rawBody;
 
   try {
     return JSON.parse(rawBody);
@@ -39,9 +36,7 @@ function parseBody(rawBody) {
 
     if (params.has('payload')) {
       try {
-        return {
-          payload: JSON.parse(params.get('payload'))
-        };
+        return { payload: JSON.parse(params.get('payload')) };
       } catch {
         return {};
       }
@@ -73,49 +68,43 @@ function getActionFromPayload(body) {
   return null;
 }
 
-async function getRedmineUserEmail(userId) {
+async function getRedmineUser(userId) {
   const response = await axios.get(
     `${REDMINE_URL}/users/${userId}.json`,
     { headers: redmineHeaders }
   );
 
-  return response.data.user.mail;
+  return response.data.user;
+}
+
+async function getRedmineGroup(groupId) {
+  const response = await axios.get(
+    `${REDMINE_URL}/groups/${groupId}.json?include=users`,
+    { headers: redmineHeaders }
+  );
+
+  return response.data.group;
 }
 
 async function getMattermostUserByEmail(email) {
-  try {
-    const normalizedEmail = email.trim().toLowerCase();
+  const normalizedEmail = email.trim().toLowerCase();
 
-    console.log('Buscando usuário Mattermost pelo e-mail:', normalizedEmail);
+  console.log('Buscando usuário Mattermost pelo e-mail:', normalizedEmail);
 
-    const response = await axios.get(
-      `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(normalizedEmail)}`,
-      { headers: mattermostHeaders }
-    );
+  const response = await axios.get(
+    `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(normalizedEmail)}`,
+    { headers: mattermostHeaders }
+  );
 
-    console.log('Usuário encontrado no Mattermost:');
-    console.log({
-      id: response.data.id,
-      username: response.data.username,
-      email: response.data.email,
-      delete_at: response.data.delete_at,
-      is_bot: response.data.is_bot
-    });
+  console.log('Usuário encontrado no Mattermost:', {
+    id: response.data.id,
+    username: response.data.username,
+    email: response.data.email,
+    delete_at: response.data.delete_at,
+    is_bot: response.data.is_bot
+  });
 
-    return response.data;
-
-  } catch (error) {
-    console.error('Erro ao buscar usuário no Mattermost:');
-
-    if (error.response) {
-      console.error(error.response.status);
-      console.error(error.response.data);
-    } else {
-      console.error(error.message);
-    }
-
-    throw error;
-  }
+  return response.data;
 }
 
 async function getMattermostBotUser() {
@@ -148,27 +137,140 @@ async function sendMattermostMessage(channelId, message) {
   );
 }
 
-async function getResponsibleEmail(issue) {
-  if (issue.assignee?.mail) {
-    return issue.assignee.mail;
+async function getResponsibleTargets(issue) {
+  const assignee = issue.assignee || issue.assigned_to;
+
+  if (!assignee) {
+    return [];
   }
 
-  if (issue.assigned_to?.mail) {
-    return issue.assigned_to.mail;
+  if (assignee.mail) {
+    return [{
+      type: 'user',
+      name: assignee.name || assignee.login || assignee.mail,
+      email: assignee.mail.trim().toLowerCase()
+    }];
   }
 
-  if (
-    typeof issue.assigned_to?.id === 'string' &&
-    issue.assigned_to.id.includes('@')
-  ) {
-    return issue.assigned_to.id;
+  if (typeof assignee.id === 'string' && assignee.id.includes('@')) {
+    return [{
+      type: 'user',
+      name: assignee.name || assignee.id,
+      email: assignee.id.trim().toLowerCase()
+    }];
   }
 
-  if (issue.assigned_to?.id) {
-    return await getRedmineUserEmail(issue.assigned_to.id);
+  if (!assignee.id) {
+    return [];
   }
 
-  return null;
+  try {
+    const user = await getRedmineUser(assignee.id);
+
+    if (user?.mail) {
+      return [{
+        type: 'user',
+        name: `${user.firstname || ''} ${user.lastname || ''}`.trim() || user.login,
+        email: user.mail.trim().toLowerCase()
+      }];
+    }
+  } catch (errorUser) {
+    console.log('Não localizou como usuário Redmine. Tentando como grupo.');
+    console.log(errorUser.response?.status || errorUser.message);
+  }
+
+  try {
+    const group = await getRedmineGroup(assignee.id);
+
+    if (!group.users || group.users.length === 0) {
+      return [{
+        type: 'group_error',
+        name: group.name || assignee.name,
+        error: 'Grupo encontrado, mas sem usuários retornados pela API.'
+      }];
+    }
+
+    const users = [];
+
+    for (const groupUser of group.users) {
+      try {
+        const fullUser = await getRedmineUser(groupUser.id);
+
+        if (fullUser?.mail) {
+          users.push({
+            type: 'group_user',
+            groupName: group.name,
+            name: `${fullUser.firstname || ''} ${fullUser.lastname || ''}`.trim() || fullUser.login,
+            email: fullUser.mail.trim().toLowerCase()
+          });
+        } else {
+          users.push({
+            type: 'group_user_error',
+            groupName: group.name,
+            name: groupUser.name || groupUser.id,
+            error: 'Usuário do grupo não possui e-mail na API do Redmine.'
+          });
+        }
+      } catch (errorFullUser) {
+        users.push({
+          type: 'group_user_error',
+          groupName: group.name,
+          name: groupUser.name || groupUser.id,
+          error: errorFullUser.response?.data || errorFullUser.message
+        });
+      }
+    }
+
+    return users;
+
+  } catch (errorGroup) {
+    return [{
+      type: 'assignee_error',
+      name: assignee.name || assignee.id,
+      error: errorGroup.response?.data || errorGroup.message
+    }];
+  }
+}
+
+async function notifyMattermostUser(target, message, botUser) {
+  const result = {
+    email: target.email,
+    name: target.name,
+    type: target.type,
+    success: false,
+    stage: null,
+    error: null
+  };
+
+  try {
+    result.stage = 'buscar_usuario_mattermost';
+    const mattermostUser = await getMattermostUserByEmail(target.email);
+
+    if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
+      result.stage = 'usuario_mattermost_desativado';
+      result.error = 'Usuário Mattermost encontrado, mas está desativado.';
+      return result;
+    }
+
+    result.stage = 'criar_dm';
+    const directChannel = await createDirectChannel(
+      botUser.id,
+      mattermostUser.id
+    );
+
+    result.stage = 'enviar_mensagem';
+    await sendMattermostMessage(directChannel.id, message);
+
+    result.success = true;
+    result.stage = 'entregue';
+
+    return result;
+
+  } catch (error) {
+    result.error = error.response?.data || error.message;
+    console.error('Falha ao notificar usuário:', result);
+    return result;
+  }
 }
 
 app.post('/redmine-webhook', async (req, res) => {
@@ -188,31 +290,13 @@ app.post('/redmine-webhook', async (req, res) => {
       });
     }
 
-    const email = (await getResponsibleEmail(issue))?.trim().toLowerCase();
+    const targets = await getResponsibleTargets(issue);
 
-    if (!email) {
+    if (!targets.length) {
       return res.status(200).json({
         message: 'Tarefa sem responsável ou sem e-mail.'
       });
     }
-
-    console.log('E-mail usado para buscar no Mattermost:', email);
-
-    const mattermostUser = await getMattermostUserByEmail(email);
-
-    if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
-      return res.status(200).json({
-        message: 'Usuário Mattermost encontrado, mas está desativado.',
-        email
-      });
-    }
-
-    const botUser = await getMattermostBotUser();
-
-    const directChannel = await createDirectChannel(
-      botUser.id,
-      mattermostUser.id
-    );
 
     const issueId = issue.id;
     const subject = issue.subject || 'Sem assunto';
@@ -224,7 +308,7 @@ app.post('/redmine-webhook', async (req, res) => {
     const message = [
       `### Notificação do Redmine`,
       ``,
-      `Você é o responsável pela tarefa **#${issueId}**.`,
+      `Você recebeu uma notificação da tarefa **#${issueId}**.`,
       ``,
       `**Ação:** ${action || 'Atualização'}`,
       project ? `**Projeto:** ${project}` : null,
@@ -235,17 +319,44 @@ app.post('/redmine-webhook', async (req, res) => {
       `[Abrir tarefa no Redmine](${url})`
     ].filter(Boolean).join('\n');
 
-    await sendMattermostMessage(directChannel.id, message);
+    const botUser = await getMattermostBotUser();
 
-    console.log('Notificação enviada com sucesso para:', email);
+    const results = [];
+
+    for (const target of targets) {
+      if (!target.email) {
+        results.push({
+          name: target.name,
+          type: target.type,
+          success: false,
+          stage: 'sem_email',
+          error: target.error || 'Responsável sem e-mail.'
+        });
+
+        continue;
+      }
+
+      const result = await notifyMattermostUser(target, message, botUser);
+      results.push(result);
+    }
+
+    console.log('Resultado das notificações:');
+    console.log(JSON.stringify(results, null, 2));
+
+    const sent = results.filter(r => r.success);
+    const failed = results.filter(r => !r.success);
 
     return res.status(200).json({
-      message: 'Notificação enviada com sucesso.',
-      email
+      message: 'Webhook processado.',
+      issue: issueId,
+      total: results.length,
+      enviados: sent.length,
+      falhas: failed.length,
+      results
     });
 
   } catch (error) {
-    console.error('Erro detalhado:');
+    console.error('Erro geral no webhook:');
     console.error(error.response?.status);
     console.error(error.response?.data || error.message);
 
