@@ -78,6 +78,34 @@ async function getRedmineUser(userId) {
 }
 
 async function getRedmineGroup(groupId) {
+
+  try {
+
+    console.log('Buscando grupo Redmine:', groupId);
+
+    const response = await axios.get(
+      `${REDMINE_URL}/groups/${groupId}.json?include=users`,
+      { headers: redmineHeaders }
+    );
+
+    console.log('Grupo encontrado:', response.data.group?.name);
+
+    return response.data.group;
+
+  } catch (error) {
+
+    console.error('Erro ao buscar grupo Redmine:');
+
+    if (error.response) {
+      console.error(error.response.status);
+      console.error(error.response.data);
+    } else {
+      console.error(error.message);
+    }
+
+    return null;
+  }
+}
   const response = await axios.get(
     `${REDMINE_URL}/groups/${groupId}.json?include=users`,
     { headers: redmineHeaders }
@@ -182,7 +210,15 @@ async function getResponsibleTargets(issue) {
   try {
     const group = await getRedmineGroup(assignee.id);
 
-    if (!group.users || group.users.length === 0) {
+if (!group) {
+  return [{
+    type: 'group_error',
+    name: assignee.lastname || assignee.name || assignee.id,
+    error: 'Grupo não encontrado na API do Redmine.'
+  }];
+}
+
+if (!group.users || group.users.length === 0) {
       return [{
         type: 'group_error',
         name: group.name || assignee.name,
