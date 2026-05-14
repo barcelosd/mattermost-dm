@@ -108,6 +108,41 @@ async function getRedmineUserEmail(userId) {
 }
 
 async function getMattermostUserByEmail(email) {
+
+  try {
+
+    console.log('Buscando usuário Mattermost pelo e-mail:', email);
+
+    const response = await axios.get(
+      `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email.trim().toLowerCase())}`,
+      { headers: mattermostHeaders }
+    );
+
+    console.log('Usuário encontrado no Mattermost:');
+    console.log({
+      id: response.data.id,
+      username: response.data.username,
+      email: response.data.email,
+      delete_at: response.data.delete_at,
+      is_bot: response.data.is_bot
+    });
+
+    return response.data;
+
+  } catch (error) {
+
+    console.error('Erro ao buscar usuário no Mattermost:');
+
+    if (error.response) {
+      console.error(error.response.status);
+      console.error(error.response.data);
+    } else {
+      console.error(error.message);
+    }
+
+    throw error;
+  }
+}
   const response = await axios.get(
     `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`,
     { headers: mattermostHeaders }
@@ -186,7 +221,9 @@ app.post('/redmine-webhook', async (req, res) => {
       });
     }
 
-    const email = await getResponsibleEmail(issue);
+    const email = (
+  await getResponsibleEmail(issue)
+)?.trim().toLowerCase();
 
     if (!email) {
       return res.status(200).json({
