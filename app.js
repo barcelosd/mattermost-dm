@@ -58,20 +58,7 @@ function getIssueFromPayload(body) {
   console.log(JSON.stringify(data, null, 2));
 
   if (data.issue) return data.issue;
-
-  if (data.payload) {
-    if (typeof data.payload === 'string') {
-      try {
-        const parsedPayload = JSON.parse(data.payload);
-        return parsedPayload.issue || null;
-      } catch {
-        return null;
-      }
-    }
-
-    return data.payload.issue || null;
-  }
-
+  if (data.payload?.issue) return data.payload.issue;
   if (data.webhook?.issue) return data.webhook.issue;
 
   return null;
@@ -81,19 +68,7 @@ function getActionFromPayload(body) {
   const data = parseBody(body);
 
   if (data.action) return data.action;
-
-  if (data.payload) {
-    if (typeof data.payload === 'string') {
-      try {
-        const parsedPayload = JSON.parse(data.payload);
-        return parsedPayload.action || null;
-      } catch {
-        return null;
-      }
-    }
-
-    return data.payload.action || null;
-  }
+  if (data.payload?.action) return data.payload.action;
 
   return null;
 }
@@ -108,13 +83,13 @@ async function getRedmineUserEmail(userId) {
 }
 
 async function getMattermostUserByEmail(email) {
-
   try {
+    const normalizedEmail = email.trim().toLowerCase();
 
-    console.log('Buscando usuário Mattermost pelo e-mail:', email);
+    console.log('Buscando usuário Mattermost pelo e-mail:', normalizedEmail);
 
     const response = await axios.get(
-      `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email.trim().toLowerCase())}`,
+      `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(normalizedEmail)}`,
       { headers: mattermostHeaders }
     );
 
@@ -130,7 +105,6 @@ async function getMattermostUserByEmail(email) {
     return response.data;
 
   } catch (error) {
-
     console.error('Erro ao buscar usuário no Mattermost:');
 
     if (error.response) {
@@ -142,13 +116,6 @@ async function getMattermostUserByEmail(email) {
 
     throw error;
   }
-}
-  const response = await axios.get(
-    `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`,
-    { headers: mattermostHeaders }
-  );
-
-  return response.data;
 }
 
 async function getMattermostBotUser() {
@@ -221,9 +188,7 @@ app.post('/redmine-webhook', async (req, res) => {
       });
     }
 
-    const email = (
-  await getResponsibleEmail(issue)
-)?.trim().toLowerCase();
+    const email = (await getResponsibleEmail(issue))?.trim().toLowerCase();
 
     if (!email) {
       return res.status(200).json({
@@ -234,6 +199,14 @@ app.post('/redmine-webhook', async (req, res) => {
     console.log('E-mail usado para buscar no Mattermost:', email);
 
     const mattermostUser = await getMattermostUserByEmail(email);
+
+    if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
+      return res.status(200).json({
+        message: 'Usuário Mattermost encontrado, mas está desativado.',
+        email
+      });
+    }
+
     const botUser = await getMattermostBotUser();
 
     const directChannel = await createDirectChannel(
@@ -254,7 +227,7 @@ app.post('/redmine-webhook', async (req, res) => {
       `Você é o responsável pela tarefa **#${issueId}**.`,
       ``,
       `**Ação:** ${action || 'Atualização'}`,
-      `**Projeto:** ${project}`,
+      project ? `**Projeto:** ${project}` : null,
       `**Assunto:** ${subject}`,
       status ? `**Status:** ${status}` : null,
       priority ? `**Prioridade:** ${priority}` : null,
@@ -263,6 +236,8 @@ app.post('/redmine-webhook', async (req, res) => {
     ].filter(Boolean).join('\n');
 
     await sendMattermostMessage(directChannel.id, message);
+
+    console.log('Notificação enviada com sucesso para:', email);
 
     return res.status(200).json({
       message: 'Notificação enviada com sucesso.',
