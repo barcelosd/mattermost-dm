@@ -62,7 +62,7 @@ const issueAssigneeCache = new Map();
 const sentAppointmentAlertsMemory = new Set();
 const notifiedEventsMemory = new Set();
 
-let lastPollingDate = new Date(Date.now() - 10 * 60 * 1000);
+let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
 function logSkipped(message) {
   if (LOG_SKIPPED_EVENTS === 'true') {
@@ -136,10 +136,7 @@ function getPayloadData(body) {
 
 function getIssueFromPayload(body) {
   const data = getPayloadData(body);
-
-  console.log('Payload convertido:');
-  console.log(JSON.stringify(data, null, 2));
-
+  console.log('Payload convertido:', JSON.stringify(data, null, 2));
   return data.issue || data.webhook?.issue || null;
 }
 
@@ -266,7 +263,6 @@ async function getRedmineGroup(groupId) {
     console.log('Usuários retornados no grupo:', response.data.group?.users?.length || 0);
 
     return response.data.group;
-
   } catch (error) {
     console.error('Erro ao buscar grupo Redmine:');
     console.error(error.response?.status);
@@ -405,7 +401,6 @@ async function getResponsibleTargets(issue) {
           error: 'Usuário do grupo não possui e-mail no Redmine.'
         });
       }
-
     } catch (errorFullUser) {
       targets.push({
         type: 'group_user_error',
@@ -481,7 +476,6 @@ async function notifyMattermostUser(target, message, botUser) {
     result.stage = 'entregue';
 
     return result;
-
   } catch (error) {
     result.error = error.response?.data || error.message;
 
@@ -783,7 +777,6 @@ app.post('/redmine-webhook', async (req, res) => {
     await checkAppointmentAlert(issue);
 
     return res.status(200).json(result);
-
   } catch (error) {
     console.error('Erro geral no webhook:');
     console.error(error.response?.status);
@@ -797,8 +790,6 @@ app.post('/redmine-webhook', async (req, res) => {
 });
 
 async function fetchRecentIssues() {
-  const since = lastPollingDate.toISOString();
-
   const response = await axios.get(
     `${REDMINE_URL}/issues.json`,
     {
@@ -806,13 +797,10 @@ async function fetchRecentIssues() {
       params: {
         status_id: '*',
         sort: 'updated_on:desc',
-        limit: Number(POLLING_LIMIT),
-        updated_on: `>=${since}`
+        limit: Number(POLLING_LIMIT)
       }
     }
   );
-
-  lastPollingDate = new Date();
 
   return response.data.issues || [];
 }
@@ -834,16 +822,24 @@ async function fetchIssueDetails(issueId) {
 async function pollingRedmineIssues() {
   console.log('Polling Redmine iniciado.');
 
+  const currentPollingTimestamp = Date.now();
+
   try {
     const issues = await fetchRecentIssues();
 
-    console.log(`Polling encontrou ${issues.length} tarefas alteradas.`);
+    const changedIssues = issues.filter(issueSummary => {
+      const updatedAt = new Date(issueSummary.updated_on).getTime();
+      return updatedAt >= lastPollingTimestamp;
+    });
 
-    if (!issues.length) {
+    console.log(`Polling encontrou ${changedIssues.length} tarefas alteradas.`);
+
+    if (!changedIssues.length) {
+      lastPollingTimestamp = currentPollingTimestamp;
       return;
     }
 
-    for (const issueSummary of issues) {
+    for (const issueSummary of changedIssues) {
       try {
         if (shouldIgnoreIssueByStatus(issueSummary)) {
           logSkipped(`Issue #${issueSummary.id} ignorada por status no resumo: ${getStatusName(issueSummary)}`);
@@ -873,13 +869,13 @@ async function pollingRedmineIssues() {
         );
 
         await checkAppointmentAlert(issueWithUrl);
-
       } catch (errorIssue) {
         console.error(`Erro no polling da issue #${issueSummary.id}:`);
         console.error(errorIssue.response?.data || errorIssue.message);
       }
     }
 
+    lastPollingTimestamp = currentPollingTimestamp;
   } catch (error) {
     console.error('Erro geral no polling Redmine:');
     console.error(error.response?.status);
