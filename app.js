@@ -989,28 +989,48 @@ app.get('/', (req, res) => {
   res.send('API Redmine → Mattermost funcionando.');
 });
 
+let pollingStarted = false;
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 
-  if (POLLING_ENABLED === 'true') {
-    const pollingIntervalMs = Number(POLLING_INTERVAL_SECONDS) * 1000;
-    const alertPollingIntervalMs = Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
-
-    console.log(`Polling habilitado a cada ${POLLING_INTERVAL_SECONDS} segundos.`);
-    console.log(`Polling limit: ${POLLING_LIMIT}`);
-    console.log(`Polling de alertas a cada ${ALERT_POLLING_INTERVAL_SECONDS} segundos.`);
-    console.log(`Alerta de compromisso habilitado: ${ALERT_MINUTES_BEFORE} minutos antes.`);
-    console.log(`Campo de horário: ${ALERT_FIELD_NAME}`);
-    console.log(`Timezone offset dos alertas: ${ALERT_TIMEZONE_OFFSET}`);
-    console.log(`Status ignorados: ${IGNORE_STATUSES}`);
-    console.log(redis ? 'Controle de duplicidade persistente: Redis habilitado.' : 'Controle de duplicidade persistente: Redis não configurado.');
-
-    setTimeout(() => {
-      pollingRedmineIssues();
-      pollingAppointmentAlerts();
-    }, 10000);
-
-    setInterval(pollingRedmineIssues, pollingIntervalMs);
-    setInterval(pollingAppointmentAlerts, alertPollingIntervalMs);
+  if (POLLING_ENABLED !== 'true') {
+    return;
   }
+
+  if (pollingStarted) {
+    console.log('Polling já iniciado.');
+    return;
+  }
+
+  pollingStarted = true;
+
+  const pollingIntervalMs =
+    Number(POLLING_INTERVAL_SECONDS) * 1000;
+
+  const alertPollingIntervalMs =
+    Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
+
+  console.log(
+    `Polling habilitado a cada ${POLLING_INTERVAL_SECONDS} segundos.`
+  );
+
+  console.log(
+    `Polling de alertas a cada ${ALERT_POLLING_INTERVAL_SECONDS} segundos.`
+  );
+
+  setTimeout(async () => {
+    await pollingRedmineIssues();
+    await pollingAppointmentAlerts();
+  }, 10000);
+
+  global.redminePollingInterval = setInterval(
+    pollingRedmineIssues,
+    pollingIntervalMs
+  );
+
+  global.alertPollingInterval = setInterval(
+    pollingAppointmentAlerts,
+    alertPollingIntervalMs
+  );
 });
