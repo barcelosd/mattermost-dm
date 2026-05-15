@@ -15,7 +15,8 @@ const {
   POLLING_ENABLED = 'true',
   POLLING_INTERVAL_SECONDS = 60,
   ALERT_MINUTES_BEFORE = 10,
-  ALERT_FIELD_NAME = 'Horário'
+  ALERT_FIELD_NAME = 'Horário',
+  IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido'
 } = process.env;
 
 const mattermostHeaders = {
@@ -30,6 +31,30 @@ const redmineHeaders = {
 
 const issueAssigneeCache = new Map();
 const sentAppointmentAlerts = new Set();
+
+function normalizeText(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function getStatusName(issue) {
+  if (!issue) return '';
+  if (typeof issue.status === 'string') return issue.status;
+  return issue.status?.name || '';
+}
+
+function shouldIgnoreIssueByStatus(issue) {
+  const statusName = getStatusName(issue);
+  const ignored = String(IGNORE_STATUSES || '')
+    .split(',')
+    .map(s => normalizeText(s))
+    .filter(Boolean);
+
+  return ignored.includes(normalizeText(statusName));
+}
 
 function parseBody(rawBody) {
   if (!rawBody) return {};
@@ -276,7 +301,7 @@ function getAssigneeCacheKey(issue) {
 function buildMessage(issue, action, source) {
   const issueId = issue.id;
   const subject = issue.subject || 'Sem assunto';
-  const status = issue.status?.name || issue.status || '';
+  const status = getStatusName(issue);
   const priority = issue.priority?.name || issue.priority || '';
   const project = issue.project?.name || issue.project || '';
   const url = issue.url || `${REDMINE_URL}/issues/${issueId}`;
@@ -347,20 +372,29 @@ async function notifyMattermostUser(target, message, botUser) {
 
 async function processIssueNotification(issue, action, source, forceNotify = false) {
   const issueId = issue.id;
+  const status = getStatusName(issue);
+
+  if (shouldIgnoreIssueByStatus(issue)) {
+    console.log(`Issue #${issueId} ignorada por status: ${status}`);
+
+    return {
+      message: `Ignorada por status: ${status}`,
+      issue: issueId,
+      notified: false
+    };
+  }
+
   const newAssigneeKey = getAssigneeCacheKey(issue);
   const oldAssigneeKey = issueAssigneeCache.get(issueId);
 
-  const isNewIssue = !oldAssigneeKey;
-
   if (
-    !forceNotify &&
-    !isNewIssue &&
+    source === 'Polling' &&
     oldAssigneeKey === newAssigneeKey
   ) {
-    console.log(`Issue #${issueId} sem mudança de responsável. Não notificado.`);
+    console.log(`Issue #${issueId} já notificada pelo webhook ou sem mudança de responsável. Não notificado pelo polling.`);
 
     return {
-      message: 'Sem mudança de responsável.',
+      message: 'Já notificada ou sem mudança de responsável.',
       issue: issueId,
       notified: false
     };
@@ -503,6 +537,11 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
 }
 
 async function checkAppointmentAlert(issue) {
+  if (shouldIgnoreIssueByStatus(issue)) {
+    console.log(`Alerta da issue #${issue.id} ignorado por status: ${getStatusName(issue)}`);
+    return;
+  }
+
   const alertMinutes = Number(ALERT_MINUTES_BEFORE || 10);
   const appointment = parseAppointmentDateTime(issue);
 
@@ -695,6 +734,7 @@ app.listen(PORT, () => {
     console.log(`Polling habilitado a cada ${POLLING_INTERVAL_SECONDS} segundos.`);
     console.log(`Alerta de compromisso habilitado: ${ALERT_MINUTES_BEFORE} minutos antes.`);
     console.log(`Campo de horário: ${ALERT_FIELD_NAME}`);
+    console.log(`Status ignorados: ${IGNORE_STATUSES}`);
 
     setTimeout(pollingRedmineIssues, 10000);
     setInterval(pollingRedmineIssues, intervalMs);
