@@ -347,14 +347,21 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
   const newAssigneeKey = getAssigneeCacheKey(issue);
   const oldAssigneeKey = issueAssigneeCache.get(issueId);
 
-  if (!forceNotify && oldAssigneeKey === newAssigneeKey) {
-    console.log(`Issue #${issueId} sem mudança de responsável. Não notificado.`);
-    return {
-      message: 'Sem mudança de responsável.',
-      issue: issueId,
-      notified: false
-    };
-  }
+const isNewIssue = !oldAssigneeKey;
+
+if (
+  !forceNotify &&
+  !isNewIssue &&
+  oldAssigneeKey === newAssigneeKey
+) {
+  console.log(`Issue #${issueId} sem mudança de responsável. Não notificado.`);
+
+  return {
+    message: 'Sem mudança de responsável.',
+    issue: issueId,
+    notified: false
+  };
+}
 
   issueAssigneeCache.set(issueId, newAssigneeKey);
 
