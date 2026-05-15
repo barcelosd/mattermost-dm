@@ -849,7 +849,7 @@ async function pollingRedmineIssues() {
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   res.json({ message: 'Polling executado manualmente.' });
-});
+}); 
 
 app.get('/', (req, res) => {
   res.send('API Redmine → Mattermost funcionando.');
