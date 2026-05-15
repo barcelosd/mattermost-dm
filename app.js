@@ -22,7 +22,24 @@ const {
   REDIS_TTL_DAYS = 90
 } = process.env;
 
-const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
+const redis = REDIS_URL
+  ? new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 1,
+      enableReadyCheck: false,
+      lazyConnect: true
+    })
+  : null;
+
+(async () => {
+  if (redis) {
+    try {
+      await redis.connect();
+      console.log('Redis conectado com sucesso.');
+    } catch (err) {
+      console.error('Erro ao conectar Redis:', err.message);
+    }
+  }
+})();
 
 if (redis) {
   redis.on('connect', () => console.log('Redis conectado.'));
