@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
+const Redis = require('ioredis');
 
 const app = express();
 app.use(express.text({ type: '*/*' }));
@@ -16,8 +17,19 @@ const {
   POLLING_INTERVAL_SECONDS = 60,
   ALERT_MINUTES_BEFORE = 10,
   ALERT_FIELD_NAME = 'Horário',
-  IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido'
+  IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido',
+  REDIS_URL,
+  REDIS_TTL_DAYS = 90
 } = process.env;
+
+const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
+
+if (redis) {
+  redis.on('connect', () => console.log('Redis conectado.'));
+  redis.on('error', err => console.error('Erro Redis:', err.message));
+} else {
+  console.log('REDIS_URL não configurado. Duplicidade será controlada apenas em memória.');
+}
 
 const mattermostHeaders = {
   Authorization: `Bearer ${MATTERMOST_TOKEN}`,
@@ -30,7 +42,8 @@ const redmineHeaders = {
 };
 
 const issueAssigneeCache = new Map();
-const sentAppointmentAlerts = new Set();
+const sentAppointmentAlertsMemory = new Set();
+const notifiedEventsMemory = new Set();
 
 function normalizeText(value) {
   return String(value || '')
@@ -48,6 +61,7 @@ function getStatusName(issue) {
 
 function shouldIgnoreIssueByStatus(issue) {
   const statusName = getStatusName(issue);
+
   const ignored = String(IGNORE_STATUSES || '')
     .split(',')
     .map(s => normalizeText(s))
@@ -107,6 +121,89 @@ function getIssueFromPayload(body) {
 function getActionFromPayload(body) {
   const data = getPayloadData(body);
   return data.action || null;
+}
+
+function getJournalFromPayload(body) {
+  const data = getPayloadData(body);
+  return data.journal || data.payload?.journal || null;
+}
+
+function getLastJournal(issue) {
+  if (Array.isArray(issue.journals) && issue.journals.length > 0) {
+    return issue.journals[issue.journals.length - 1];
+  }
+
+  if (issue.journal) {
+    return issue.journal;
+  }
+
+  return null;
+}
+
+function getEventKey(issue, source, journalFromPayload = null) {
+  const issueId = issue.id;
+  const journal = journalFromPayload || getLastJournal(issue);
+
+  if (journal?.id) {
+    return `redmine:notified:journal:${issueId}:${journal.id}`;
+  }
+
+  if (issue.updated_on) {
+    return `redmine:notified:updated:${issueId}:${issue.updated_on}`;
+  }
+
+  const assigneeKey = getAssigneeCacheKey(issue);
+  return `redmine:notified:fallback:${issueId}:${source}:${assigneeKey}`;
+}
+
+function getAppointmentAlertKey(issue, appointmentDate, alertMinutes) {
+  return `redmine:appointment:${issue.id}:${appointmentDate.toISOString()}:${alertMinutes}`;
+}
+
+async function wasAlreadyNotified(key) {
+  if (!key) return false;
+
+  if (redis) {
+    const exists = await redis.get(key);
+    return exists === '1';
+  }
+
+  return notifiedEventsMemory.has(key);
+}
+
+async function markAsNotified(key) {
+  if (!key) return;
+
+  if (redis) {
+    const ttlSeconds = Number(REDIS_TTL_DAYS) * 24 * 60 * 60;
+    await redis.set(key, '1', 'EX', ttlSeconds);
+    return;
+  }
+
+  notifiedEventsMemory.add(key);
+}
+
+async function wasAppointmentAlertSent(key) {
+  if (!key) return false;
+
+  if (redis) {
+    const exists = await redis.get(key);
+    return exists === '1';
+  }
+
+  return sentAppointmentAlertsMemory.has(key);
+}
+
+async function markAppointmentAlertSent(key) {
+  if (!key) return;
+
+  if (redis) {
+    const ttlSeconds = Number(REDIS_TTL_DAYS) * 24 * 60 * 60;
+    await redis.set(key, '1', 'EX', ttlSeconds);
+    return;
+  }
+
+  sentAppointmentAlertsMemory.add(key);
 }
 
 async function getRedmineUser(userId) {
@@ -370,7 +467,7 @@ async function notifyMattermostUser(target, message, botUser) {
   }
 }
 
-async function processIssueNotification(issue, action, source, forceNotify = false) {
+async function processIssueNotification(issue, action, source, forceNotify = false, journalFromPayload = null) {
   const issueId = issue.id;
   const status = getStatusName(issue);
 
@@ -384,18 +481,35 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
     };
   }
 
+  const eventKey = getEventKey(issue, source, journalFromPayload);
+
+  if (await wasAlreadyNotified(eventKey)) {
+    console.log(`Evento já notificado. Ignorando: ${eventKey}`);
+
+    return {
+      message: 'Evento já notificado anteriormente.',
+      issue: issueId,
+      eventKey,
+      notified: false
+    };
+  }
+
   const newAssigneeKey = getAssigneeCacheKey(issue);
   const oldAssigneeKey = issueAssigneeCache.get(issueId);
 
   if (
     source === 'Polling' &&
-    oldAssigneeKey === newAssigneeKey
+    oldAssigneeKey === newAssigneeKey &&
+    !forceNotify
   ) {
-    console.log(`Issue #${issueId} já notificada pelo webhook ou sem mudança de responsável. Não notificado pelo polling.`);
+    console.log(`Issue #${issueId} sem mudança de responsável. Não notificado pelo polling.`);
+
+    await markAsNotified(eventKey);
 
     return {
-      message: 'Já notificada ou sem mudança de responsável.',
+      message: 'Sem mudança de responsável.',
       issue: issueId,
+      eventKey,
       notified: false
     };
   }
@@ -405,9 +519,12 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
   const targets = await getResponsibleTargets(issue);
 
   if (!targets.length) {
+    await markAsNotified(eventKey);
+
     return {
       message: 'Tarefa sem responsável ou sem e-mail.',
       issue: issueId,
+      eventKey,
       notified: false
     };
   }
@@ -441,9 +558,14 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
   const sent = results.filter(r => r.success);
   const failed = results.filter(r => !r.success);
 
+  if (sent.length > 0) {
+    await markAsNotified(eventKey);
+  }
+
   return {
     message: 'Processado.',
     issue: issueId,
+    eventKey,
     total: results.length,
     enviados: sent.length,
     falhas: failed.length,
@@ -556,14 +678,12 @@ async function checkAppointmentAlert(issue) {
     return;
   }
 
-  const alertKey = `${issue.id}-${appointment.dateTime.toISOString()}-${alertMinutes}`;
+  const alertKey = getAppointmentAlertKey(issue, appointment.dateTime, alertMinutes);
 
-  if (sentAppointmentAlerts.has(alertKey)) {
-    console.log(`Alerta da issue #${issue.id} já enviado.`);
+  if (await wasAppointmentAlertSent(alertKey)) {
+    console.log(`Alerta da issue #${issue.id} já enviado: ${alertKey}`);
     return;
   }
-
-  sentAppointmentAlerts.add(alertKey);
 
   console.log(`Enviando alerta de compromisso da issue #${issue.id}.`);
 
@@ -571,6 +691,7 @@ async function checkAppointmentAlert(issue) {
 
   if (!targets.length) {
     console.log(`Issue #${issue.id} sem responsável para alerta.`);
+    await markAppointmentAlertSent(alertKey);
     return;
   }
 
@@ -604,6 +725,12 @@ async function checkAppointmentAlert(issue) {
 
   console.log('Resultado dos alertas de compromisso:');
   console.log(JSON.stringify(results, null, 2));
+
+  const sent = results.filter(r => r.success);
+
+  if (sent.length > 0) {
+    await markAppointmentAlertSent(alertKey);
+  }
 }
 
 app.post('/redmine-webhook', async (req, res) => {
@@ -616,6 +743,7 @@ app.post('/redmine-webhook', async (req, res) => {
   try {
     const issue = getIssueFromPayload(req.body);
     const action = getActionFromPayload(req.body);
+    const journal = getJournalFromPayload(req.body);
 
     if (!issue) {
       return res.status(200).json({
@@ -627,7 +755,8 @@ app.post('/redmine-webhook', async (req, res) => {
       issue,
       action,
       'Webhook',
-      true
+      true,
+      journal
     );
 
     await checkAppointmentAlert(issue);
@@ -687,21 +816,22 @@ async function pollingRedmineIssues() {
     for (const issueSummary of issues) {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
-
-        await processIssueNotification(
-          {
-            ...issue,
-            url: `${REDMINE_URL}/issues/${issue.id}`
-          },
-          'Responsável alterado ou verificação periódica',
-          'Polling',
-          false
-        );
-
-        await checkAppointmentAlert({
+        const issueWithUrl = {
           ...issue,
           url: `${REDMINE_URL}/issues/${issue.id}`
-        });
+        };
+
+        const lastJournal = getLastJournal(issueWithUrl);
+
+        await processIssueNotification(
+          issueWithUrl,
+          'Responsável alterado ou verificação periódica',
+          'Polling',
+          false,
+          lastJournal
+        );
+
+        await checkAppointmentAlert(issueWithUrl);
 
       } catch (errorIssue) {
         console.error(`Erro no polling da issue #${issueSummary.id}:`);
@@ -735,6 +865,7 @@ app.listen(PORT, () => {
     console.log(`Alerta de compromisso habilitado: ${ALERT_MINUTES_BEFORE} minutos antes.`);
     console.log(`Campo de horário: ${ALERT_FIELD_NAME}`);
     console.log(`Status ignorados: ${IGNORE_STATUSES}`);
+    console.log(redis ? 'Controle de duplicidade persistente: Redis habilitado.' : 'Controle de duplicidade persistente: Redis não configurado.');
 
     setTimeout(pollingRedmineIssues, 10000);
     setInterval(pollingRedmineIssues, intervalMs);
