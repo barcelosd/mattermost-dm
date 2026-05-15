@@ -648,23 +648,54 @@ function parseAppointmentDateTime(issue) {
   const date = issue.start_date || issue.due_date;
   const timeValue = getCustomFieldValue(issue, ALERT_FIELD_NAME);
 
-  if (!date || !timeValue) return null;
+  if (!date || !timeValue) {
+    return null;
+  }
 
   const parsedTime = parseTimeText(timeValue);
 
   if (!parsedTime) {
-    logSkipped(`Horário inválido na issue #${issue.id}: ${timeValue}`);
+    console.log(
+      `Horário inválido na issue #${issue.id}: "${timeValue}"`
+    );
+
     return null;
   }
 
-  const dateTime = new Date(
-    `${date}T${String(parsedTime.hour).padStart(2, '0')}:${String(parsedTime.minute).padStart(2, '0')}:00${ALERT_TIMEZONE_OFFSET}`
-  );
+  try {
+    const [year, month, day] = date.split('-').map(Number);
 
-  return {
-    dateTime,
-    timeLabel: parsedTime.label
-  };
+    const dateTime = new Date(
+      year,
+      month - 1,
+      day,
+      parsedTime.hour,
+      parsedTime.minute,
+      0,
+      0
+    );
+
+    if (isNaN(dateTime.getTime())) {
+      console.log(
+        `Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`
+      );
+
+      return null;
+    }
+
+    return {
+      dateTime,
+      timeLabel: parsedTime.label
+    };
+
+  } catch (err) {
+    console.log(
+      `Erro parse data issue #${issue.id}:`,
+      err.message
+    );
+
+    return null;
+  }
 }
 
 function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
