@@ -857,13 +857,23 @@ async function fetchTodayIssuesForAlerts() {
       headers: redmineHeaders,
       params: {
         status_id: '*',
-        limit: 100,
-        start_date: today
+        sort: 'updated_on:desc',
+        limit: 100
       }
     }
   );
 
-  return response.data.issues || [];
+  const issues = response.data.issues || [];
+
+  const todayIssues = issues.filter(issue =>
+    issue.start_date === today || issue.due_date === today
+  );
+
+  console.log(
+    `Alertas: ${todayIssues.length} tarefas com data de hoje ${today}.`
+  );
+
+  return todayIssues;
 }
 
 async function fetchIssueDetails(issueId) {
