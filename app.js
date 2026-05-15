@@ -18,6 +18,8 @@ const {
   POLLING_LIMIT = 20,
   ALERT_MINUTES_BEFORE = 10,
   ALERT_FIELD_NAME = 'Horário',
+  ALERT_POLLING_INTERVAL_SECONDS = 60,
+  ALERT_TIMEZONE_OFFSET = '-03:00',
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido',
   LOG_SKIPPED_EVENTS = 'false',
   REDIS_URL,
@@ -44,8 +46,6 @@ if (redis) {
       console.error('Erro ao conectar Redis:', err.message);
     }
   })();
-} else {
-  console.log('REDIS_URL não configurado. Duplicidade será controlada apenas em memória.');
 }
 
 const mattermostHeaders = {
@@ -93,6 +93,17 @@ function shouldIgnoreIssueByStatus(issue) {
     .filter(Boolean);
 
   return ignored.includes(normalizeText(statusName));
+}
+
+function getBrazilTodayDateString() {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+
+  return formatter.format(new Date());
 }
 
 function parseBody(rawBody) {
@@ -647,7 +658,7 @@ function parseAppointmentDateTime(issue) {
   }
 
   const dateTime = new Date(
-    `${date}T${String(parsedTime.hour).padStart(2, '0')}:${String(parsedTime.minute).padStart(2, '0')}:00-03:00`
+    `${date}T${String(parsedTime.hour).padStart(2, '0')}:${String(parsedTime.minute).padStart(2, '0')}:00${ALERT_TIMEZONE_OFFSET}`
   );
 
   return {
@@ -692,8 +703,9 @@ async function checkAppointmentAlert(issue) {
   const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
 
   const diffMs = now.getTime() - alertAt.getTime();
+  const alertWindowMs = Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
 
-  if (diffMs < 0 || diffMs > Number(POLLING_INTERVAL_SECONDS) * 1000) {
+  if (diffMs < 0 || diffMs > alertWindowMs) {
     return;
   }
 
@@ -805,6 +817,24 @@ async function fetchRecentIssues() {
   return response.data.issues || [];
 }
 
+async function fetchTodayIssuesForAlerts() {
+  const today = getBrazilTodayDateString();
+
+  const response = await axios.get(
+    `${REDMINE_URL}/issues.json`,
+    {
+      headers: redmineHeaders,
+      params: {
+        status_id: '*',
+        limit: 100,
+        start_date: today
+      }
+    }
+  );
+
+  return response.data.issues || [];
+}
+
 async function fetchIssueDetails(issueId) {
   const response = await axios.get(
     `${REDMINE_URL}/issues/${issueId}.json`,
@@ -867,8 +897,6 @@ async function pollingRedmineIssues() {
           false,
           lastJournal
         );
-
-        await checkAppointmentAlert(issueWithUrl);
       } catch (errorIssue) {
         console.error(`Erro no polling da issue #${issueSummary.id}:`);
         console.error(errorIssue.response?.data || errorIssue.message);
@@ -883,9 +911,47 @@ async function pollingRedmineIssues() {
   }
 }
 
+async function pollingAppointmentAlerts() {
+  console.log('Polling de alertas iniciado.');
+
+  try {
+    const issues = await fetchTodayIssuesForAlerts();
+
+    console.log(`Alertas verificando ${issues.length} tarefas de hoje.`);
+
+    for (const issueSummary of issues) {
+      try {
+        if (shouldIgnoreIssueByStatus(issueSummary)) {
+          continue;
+        }
+
+        const issue = await fetchIssueDetails(issueSummary.id);
+
+        const issueWithUrl = {
+          ...issue,
+          url: `${REDMINE_URL}/issues/${issue.id}`
+        };
+
+        await checkAppointmentAlert(issueWithUrl);
+      } catch (errorIssue) {
+        console.error(`Erro alerta issue #${issueSummary.id}:`);
+        console.error(errorIssue.response?.data || errorIssue.message);
+      }
+    }
+  } catch (error) {
+    console.error('Erro geral no polling de alertas:');
+    console.error(error.response?.status);
+    console.error(error.response?.data || error.message);
+  }
+}
+
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
-  res.json({ message: 'Polling executado manualmente.' });
+  await pollingAppointmentAlerts();
+
+  res.json({
+    message: 'Polling executado manualmente.'
+  });
 });
 
 app.get('/', (req, res) => {
@@ -896,17 +962,24 @@ app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 
   if (POLLING_ENABLED === 'true') {
-    const intervalMs = Number(POLLING_INTERVAL_SECONDS) * 1000;
+    const pollingIntervalMs = Number(POLLING_INTERVAL_SECONDS) * 1000;
+    const alertPollingIntervalMs = Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
 
     console.log(`Polling habilitado a cada ${POLLING_INTERVAL_SECONDS} segundos.`);
     console.log(`Polling limit: ${POLLING_LIMIT}`);
-    console.log(`Log de eventos ignorados: ${LOG_SKIPPED_EVENTS}`);
+    console.log(`Polling de alertas a cada ${ALERT_POLLING_INTERVAL_SECONDS} segundos.`);
     console.log(`Alerta de compromisso habilitado: ${ALERT_MINUTES_BEFORE} minutos antes.`);
     console.log(`Campo de horário: ${ALERT_FIELD_NAME}`);
+    console.log(`Timezone offset dos alertas: ${ALERT_TIMEZONE_OFFSET}`);
     console.log(`Status ignorados: ${IGNORE_STATUSES}`);
     console.log(redis ? 'Controle de duplicidade persistente: Redis habilitado.' : 'Controle de duplicidade persistente: Redis não configurado.');
 
-    setTimeout(pollingRedmineIssues, 10000);
-    setInterval(pollingRedmineIssues, intervalMs);
+    setTimeout(() => {
+      pollingRedmineIssues();
+      pollingAppointmentAlerts();
+    }, 10000);
+
+    setInterval(pollingRedmineIssues, pollingIntervalMs);
+    setInterval(pollingAppointmentAlerts, alertPollingIntervalMs);
   }
 });
