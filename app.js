@@ -13,7 +13,9 @@ const {
   MATTERMOST_URL,
   MATTERMOST_TOKEN,
   POLLING_ENABLED = 'true',
-  POLLING_INTERVAL_SECONDS = 60
+  POLLING_INTERVAL_SECONDS = 60,
+  ALERT_MINUTES_BEFORE = 10,
+  ALERT_FIELD_NAME = 'Horário'
 } = process.env;
 
 const mattermostHeaders = {
@@ -27,6 +29,7 @@ const redmineHeaders = {
 };
 
 const issueAssigneeCache = new Map();
+const sentAppointmentAlerts = new Set();
 
 function parseBody(rawBody) {
   if (!rawBody) return {};
@@ -347,21 +350,21 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
   const newAssigneeKey = getAssigneeCacheKey(issue);
   const oldAssigneeKey = issueAssigneeCache.get(issueId);
 
-const isNewIssue = !oldAssigneeKey;
+  const isNewIssue = !oldAssigneeKey;
 
-if (
-  !forceNotify &&
-  !isNewIssue &&
-  oldAssigneeKey === newAssigneeKey
-) {
-  console.log(`Issue #${issueId} sem mudança de responsável. Não notificado.`);
+  if (
+    !forceNotify &&
+    !isNewIssue &&
+    oldAssigneeKey === newAssigneeKey
+  ) {
+    console.log(`Issue #${issueId} sem mudança de responsável. Não notificado.`);
 
-  return {
-    message: 'Sem mudança de responsável.',
-    issue: issueId,
-    notified: false
-  };
-}
+    return {
+      message: 'Sem mudança de responsável.',
+      issue: issueId,
+      notified: false
+    };
+  }
 
   issueAssigneeCache.set(issueId, newAssigneeKey);
 
@@ -414,6 +417,156 @@ if (
   };
 }
 
+function getCustomFieldValue(issue, fieldName) {
+  const fields = issue.custom_fields || issue.custom_field_values || [];
+
+  const field = fields.find(f =>
+    f.name === fieldName ||
+    f.custom_field_name === fieldName
+  );
+
+  return field?.value || null;
+}
+
+function parseTimeText(timeText) {
+  if (!timeText) return null;
+
+  const raw = String(timeText).trim().toLowerCase();
+
+  let match = raw.match(/^(\d{1,2})h(\d{2})$/);
+
+  if (!match) {
+    match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  }
+
+  if (!match) {
+    match = raw.match(/^(\d{1,2})h$/);
+  }
+
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = match[2] ? Number(match[2]) : 0;
+
+  if (hour < 0 || hour > 23) return null;
+  if (minute < 0 || minute > 59) return null;
+
+  return {
+    hour,
+    minute,
+    label: `${String(hour).padStart(2, '0')}h${String(minute).padStart(2, '0')}`
+  };
+}
+
+function parseAppointmentDateTime(issue) {
+  const date = issue.start_date || issue.due_date;
+  const timeValue = getCustomFieldValue(issue, ALERT_FIELD_NAME);
+
+  if (!date || !timeValue) return null;
+
+  const parsedTime = parseTimeText(timeValue);
+
+  if (!parsedTime) {
+    console.log(`Horário inválido na issue #${issue.id}: ${timeValue}`);
+    return null;
+  }
+
+  const dateTime = new Date(
+    `${date}T${String(parsedTime.hour).padStart(2, '0')}:${String(parsedTime.minute).padStart(2, '0')}:00-03:00`
+  );
+
+  return {
+    dateTime,
+    timeLabel: parsedTime.label
+  };
+}
+
+function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
+  const issueId = issue.id;
+  const subject = issue.subject || 'Sem assunto';
+  const project = issue.project?.name || issue.project || '';
+  const url = issue.url || `${REDMINE_URL}/issues/${issueId}`;
+  const date = issue.start_date || issue.due_date || '';
+
+  return [
+    `### Lembrete de compromisso`,
+    ``,
+    `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issueId}**.`,
+    ``,
+    project ? `**Projeto:** ${project}` : null,
+    `**Assunto:** ${subject}`,
+    date ? `**Data:** ${date}` : null,
+    `**Horário:** ${timeLabel}`,
+    ``,
+    `[Abrir tarefa no Redmine](${url})`
+  ].filter(Boolean).join('\n');
+}
+
+async function checkAppointmentAlert(issue) {
+  const alertMinutes = Number(ALERT_MINUTES_BEFORE || 10);
+  const appointment = parseAppointmentDateTime(issue);
+
+  if (!appointment) return;
+
+  const now = new Date();
+  const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
+
+  const diffMs = now.getTime() - alertAt.getTime();
+
+  if (diffMs < 0 || diffMs > Number(POLLING_INTERVAL_SECONDS) * 1000) {
+    return;
+  }
+
+  const alertKey = `${issue.id}-${appointment.dateTime.toISOString()}-${alertMinutes}`;
+
+  if (sentAppointmentAlerts.has(alertKey)) {
+    console.log(`Alerta da issue #${issue.id} já enviado.`);
+    return;
+  }
+
+  sentAppointmentAlerts.add(alertKey);
+
+  console.log(`Enviando alerta de compromisso da issue #${issue.id}.`);
+
+  const targets = await getResponsibleTargets(issue);
+
+  if (!targets.length) {
+    console.log(`Issue #${issue.id} sem responsável para alerta.`);
+    return;
+  }
+
+  const message = buildAppointmentMessage(
+    issue,
+    alertMinutes,
+    appointment.timeLabel
+  );
+
+  const botUser = await getMattermostBotUser();
+
+  const results = [];
+
+  for (const target of targets) {
+    if (!target.email) {
+      results.push({
+        name: target.name,
+        groupName: target.groupName || null,
+        type: target.type,
+        success: false,
+        stage: 'sem_email',
+        error: target.error || 'Responsável sem e-mail.'
+      });
+
+      continue;
+    }
+
+    const result = await notifyMattermostUser(target, message, botUser);
+    results.push(result);
+  }
+
+  console.log('Resultado dos alertas de compromisso:');
+  console.log(JSON.stringify(results, null, 2));
+}
+
 app.post('/redmine-webhook', async (req, res) => {
   console.log('Headers recebidos:');
   console.log(req.headers);
@@ -438,6 +591,8 @@ app.post('/redmine-webhook', async (req, res) => {
       true
     );
 
+    await checkAppointmentAlert(issue);
+
     return res.status(200).json(result);
 
   } catch (error) {
@@ -460,12 +615,26 @@ async function fetchRecentIssues() {
       params: {
         status_id: '*',
         sort: 'updated_on:desc',
-        limit: 50
+        limit: 100
       }
     }
   );
 
   return response.data.issues || [];
+}
+
+async function fetchIssueDetails(issueId) {
+  const response = await axios.get(
+    `${REDMINE_URL}/issues/${issueId}.json`,
+    {
+      headers: redmineHeaders,
+      params: {
+        include: 'journals'
+      }
+    }
+  );
+
+  return response.data.issue;
 }
 
 async function pollingRedmineIssues() {
@@ -476,8 +645,10 @@ async function pollingRedmineIssues() {
 
     console.log(`Polling encontrou ${issues.length} tarefas recentes.`);
 
-    for (const issue of issues) {
+    for (const issueSummary of issues) {
       try {
+        const issue = await fetchIssueDetails(issueSummary.id);
+
         await processIssueNotification(
           {
             ...issue,
@@ -487,8 +658,14 @@ async function pollingRedmineIssues() {
           'Polling',
           false
         );
+
+        await checkAppointmentAlert({
+          ...issue,
+          url: `${REDMINE_URL}/issues/${issue.id}`
+        });
+
       } catch (errorIssue) {
-        console.error(`Erro no polling da issue #${issue.id}:`);
+        console.error(`Erro no polling da issue #${issueSummary.id}:`);
         console.error(errorIssue.response?.data || errorIssue.message);
       }
     }
@@ -516,6 +693,8 @@ app.listen(PORT, () => {
     const intervalMs = Number(POLLING_INTERVAL_SECONDS) * 1000;
 
     console.log(`Polling habilitado a cada ${POLLING_INTERVAL_SECONDS} segundos.`);
+    console.log(`Alerta de compromisso habilitado: ${ALERT_MINUTES_BEFORE} minutos antes.`);
+    console.log(`Campo de horário: ${ALERT_FIELD_NAME}`);
 
     setTimeout(pollingRedmineIssues, 10000);
     setInterval(pollingRedmineIssues, intervalMs);
