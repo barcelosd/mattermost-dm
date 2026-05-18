@@ -451,15 +451,49 @@ function buildMessage(issue, action, source) {
 }
 
 async function notifyMattermostUser(target, message, botUser) {
-  const result = {
-    email: target.email,
-    name: target.name,
-    groupName: target.groupName || null,
-    type: target.type,
-    success: false,
-    stage: null,
-    error: null
-  };
+  try {
+    const mattermostUser = await getMattermostUserByEmail(target.email);
+
+    if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
+      return {
+        email: target.email,
+        name: target.name,
+        groupName: target.groupName || null,
+        type: target.type,
+        success: false,
+        stage: 'usuario_mattermost_desativado',
+        error: 'Usuário Mattermost encontrado, mas está desativado.'
+      };
+    }
+
+    const directChannel = await createDirectChannel(
+      botUser.id,
+      mattermostUser.id
+    );
+
+    await sendMattermostMessage(directChannel.id, message);
+
+    return {
+      email: target.email,
+      name: target.name,
+      groupName: target.groupName || null,
+      type: target.type,
+      success: true,
+      stage: 'entregue'
+    };
+
+  } catch (error) {
+    return {
+      email: target.email,
+      name: target.name,
+      groupName: target.groupName || null,
+      type: target.type,
+      success: false,
+      stage: 'erro_envio_mattermost',
+      error: error.response?.data || error.message
+    };
+  }
+}
 
   try {
     result.stage = 'buscar_usuario_mattermost';
@@ -582,8 +616,37 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
     results.push(result);
   }
 
-  console.log('Resultado das notificações:');
-  console.log(JSON.stringify(results, null, 2));
+const successResults = results.filter(r => r.success);
+const failedResults = results.filter(r => !r.success);
+
+console.log(
+  `Resultado das notificações: enviados=${successResults.length}, falhas=${failedResults.length}`
+);
+
+if (successResults.length > 0) {
+  console.log(
+    'Entregues:',
+    successResults.map(r => ({
+      email: r.email,
+      nome: r.name,
+      grupo: r.groupName || null,
+      etapa: r.stage
+    }))
+  );
+}
+
+if (failedResults.length > 0) {
+  console.error(
+    'Falhas:',
+    failedResults.map(r => ({
+      email: r.email,
+      nome: r.name,
+      grupo: r.groupName || null,
+      etapa: r.stage,
+      erro: r.error
+    }))
+  );
+}
 
   const sent = results.filter(r => r.success);
   const failed = results.filter(r => !r.success);
@@ -785,8 +848,37 @@ async function checkAppointmentAlert(issue) {
     results.push(result);
   }
 
-  console.log('Resultado dos alertas de compromisso:');
-  console.log(JSON.stringify(results, null, 2));
+  const successResults = results.filter(r => r.success);
+const failedResults = results.filter(r => !r.success);
+
+console.log(
+  `Resultado dos alertas: enviados=${successResults.length}, falhas=${failedResults.length}`
+);
+
+if (successResults.length > 0) {
+  console.log(
+    'Alertas entregues:',
+    successResults.map(r => ({
+      email: r.email,
+      nome: r.name,
+      grupo: r.groupName || null,
+      etapa: r.stage
+    }))
+  );
+}
+
+if (failedResults.length > 0) {
+  console.error(
+    'Falhas alertas:',
+    failedResults.map(r => ({
+      email: r.email,
+      nome: r.name,
+      grupo: r.groupName || null,
+      etapa: r.stage,
+      erro: r.error
+    }))
+  );
+}
 
   const sent = results.filter(r => r.success);
 
