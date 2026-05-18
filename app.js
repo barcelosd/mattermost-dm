@@ -305,7 +305,7 @@ async function getMattermostUserByEmail(email) {
     id: response.data.id,
     username: response.data.username,
     email: response.data.email,
-    delete_at: response.data.delete_at
+    ativo: response.data.delete_at === 0
   });
 
   return response.data;
@@ -481,7 +481,6 @@ async function notifyMattermostUser(target, message, botUser) {
       success: true,
       stage: 'entregue'
     };
-
   } catch (error) {
     return {
       email: target.email,
@@ -495,39 +494,35 @@ async function notifyMattermostUser(target, message, botUser) {
   }
 }
 
-  try {
-    result.stage = 'buscar_usuario_mattermost';
+function logNotificationResults(title, results) {
+  const sent = results.filter(r => r.success);
+  const failed = results.filter(r => !r.success);
 
-    const mattermostUser = await getMattermostUserByEmail(target.email);
+  console.log(`${title}: enviados=${sent.length}, falhas=${failed.length}`);
 
-    if (mattermostUser.delete_at && mattermostUser.delete_at > 0) {
-      result.stage = 'usuario_mattermost_desativado';
-      result.error = 'Usuário Mattermost encontrado, mas está desativado.';
-      return result;
-    }
-
-    result.stage = 'criar_dm';
-
-    const directChannel = await createDirectChannel(
-      botUser.id,
-      mattermostUser.id
+  if (sent.length > 0) {
+    console.log(
+      'Entregues:',
+      sent.map(r => ({
+        email: r.email,
+        nome: r.name,
+        grupo: r.groupName || null,
+        etapa: r.stage
+      }))
     );
+  }
 
-    result.stage = 'enviar_mensagem';
-
-    await sendMattermostMessage(directChannel.id, message);
-
-    result.success = true;
-    result.stage = 'entregue';
-
-    return result;
-  } catch (error) {
-    result.error = error.response?.data || error.message;
-
-    console.error('Falha ao notificar usuário:');
-    console.error(JSON.stringify(result, null, 2));
-
-    return result;
+  if (failed.length > 0) {
+    console.error(
+      'Falhas:',
+      failed.map(r => ({
+        email: r.email,
+        nome: r.name,
+        grupo: r.groupName || null,
+        etapa: r.stage,
+        erro: r.error
+      }))
+    );
   }
 }
 
@@ -616,37 +611,7 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
     results.push(result);
   }
 
-const successResults = results.filter(r => r.success);
-const failedResults = results.filter(r => !r.success);
-
-console.log(
-  `Resultado das notificações: enviados=${successResults.length}, falhas=${failedResults.length}`
-);
-
-if (successResults.length > 0) {
-  console.log(
-    'Entregues:',
-    successResults.map(r => ({
-      email: r.email,
-      nome: r.name,
-      grupo: r.groupName || null,
-      etapa: r.stage
-    }))
-  );
-}
-
-if (failedResults.length > 0) {
-  console.error(
-    'Falhas:',
-    failedResults.map(r => ({
-      email: r.email,
-      nome: r.name,
-      grupo: r.groupName || null,
-      etapa: r.stage,
-      erro: r.error
-    }))
-  );
-}
+  logNotificationResults('Resultado das notificações', results);
 
   const sent = results.filter(r => r.success);
   const failed = results.filter(r => !r.success);
@@ -680,7 +645,10 @@ function getCustomFieldValue(issue, fieldName) {
 function parseTimeText(timeText) {
   if (!timeText) return null;
 
-  const raw = String(timeText).trim().toLowerCase();
+  const raw = String(timeText)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
 
   let match = raw.match(/^(\d{1,2})h(\d{2})$/);
 
@@ -718,10 +686,7 @@ function parseAppointmentDateTime(issue) {
   const parsedTime = parseTimeText(timeValue);
 
   if (!parsedTime) {
-    console.log(
-      `Horário inválido na issue #${issue.id}: "${timeValue}"`
-    );
-
+    console.log(`Horário inválido na issue #${issue.id}: "${timeValue}"`);
     return null;
   }
 
@@ -739,10 +704,7 @@ function parseAppointmentDateTime(issue) {
     );
 
     if (isNaN(dateTime.getTime())) {
-      console.log(
-        `Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`
-      );
-
+      console.log(`Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`);
       return null;
     }
 
@@ -750,13 +712,8 @@ function parseAppointmentDateTime(issue) {
       dateTime,
       timeLabel: parsedTime.label
     };
-
   } catch (err) {
-    console.log(
-      `Erro parse data issue #${issue.id}:`,
-      err.message
-    );
-
+    console.log(`Erro parse data issue #${issue.id}:`, err.message);
     return null;
   }
 }
@@ -848,37 +805,7 @@ async function checkAppointmentAlert(issue) {
     results.push(result);
   }
 
-  const successResults = results.filter(r => r.success);
-const failedResults = results.filter(r => !r.success);
-
-console.log(
-  `Resultado dos alertas: enviados=${successResults.length}, falhas=${failedResults.length}`
-);
-
-if (successResults.length > 0) {
-  console.log(
-    'Alertas entregues:',
-    successResults.map(r => ({
-      email: r.email,
-      nome: r.name,
-      grupo: r.groupName || null,
-      etapa: r.stage
-    }))
-  );
-}
-
-if (failedResults.length > 0) {
-  console.error(
-    'Falhas alertas:',
-    failedResults.map(r => ({
-      email: r.email,
-      nome: r.name,
-      grupo: r.groupName || null,
-      etapa: r.stage,
-      erro: r.error
-    }))
-  );
-}
+  logNotificationResults('Resultado dos alertas de compromisso', results);
 
   const sent = results.filter(r => r.success);
 
