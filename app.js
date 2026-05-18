@@ -977,13 +977,17 @@ async function pollingAppointmentAlerts() {
   try {
     const issues = await fetchTodayIssuesForAlerts();
 
-    console.log(`Alertas verificando ${issues.length} tarefas de hoje.`);
+    if (LOG_SKIPPED_EVENTS === 'true') {
+  console.log(`Alertas verificando ${issues.length} tarefas de hoje.`);
+}
 
     for (const issueSummary of issues) {
       try {
-        if (shouldIgnoreIssueByStatus(issueSummary)) {
-          continue;
-        }
+        const horarioResumo = getCustomFieldValue(issueSummary, ALERT_FIELD_NAME);
+
+if (!horarioResumo) {
+  continue;
+}
 
         const issue = await fetchIssueDetails(issueSummary.id);
 
