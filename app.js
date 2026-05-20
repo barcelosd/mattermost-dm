@@ -693,17 +693,19 @@ function parseAppointmentDateTime(issue) {
   try {
     const [year, month, day] = date.split('-').map(Number);
 
-    const dateTime = new Date(
+    // Horário informado no Redmine é horário do Brasil (-03:00).
+    // Convertemos manualmente para UTC para o Render comparar corretamente.
+    const dateTime = new Date(Date.UTC(
       year,
       month - 1,
       day,
-      parsedTime.hour,
+      parsedTime.hour + 3,
       parsedTime.minute,
       0,
       0
-    );
+    ));
 
-    if (isNaN(dateTime.getTime())) {
+    if (Number.isNaN(dateTime.getTime())) {
       console.log(`Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`);
       return null;
     }
