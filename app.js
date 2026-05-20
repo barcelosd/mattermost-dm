@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
+const { google } = require('googleapis');
 
 const app = express();
 app.use(express.text({ type: '*/*' }));
@@ -13,17 +14,27 @@ const {
   REDMINE_API_KEY,
   MATTERMOST_URL,
   MATTERMOST_TOKEN,
+
   POLLING_ENABLED = 'true',
   POLLING_INTERVAL_SECONDS = 300,
   POLLING_LIMIT = 20,
+
   ALERT_MINUTES_BEFORE = 10,
   ALERT_FIELD_NAME = 'Horário',
   ALERT_POLLING_INTERVAL_SECONDS = 60,
   ALERT_TIMEZONE_OFFSET = '-03:00',
+
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido',
   LOG_SKIPPED_EVENTS = 'false',
+
   REDIS_URL,
-  REDIS_TTL_DAYS = 90
+  REDIS_TTL_DAYS = 90,
+
+  GOOGLE_CLIENT_EMAIL,
+  GOOGLE_PRIVATE_KEY,
+  GOOGLE_CALENDAR_ID,
+  GOOGLE_MEET_FIELD_NAME = 'Google Meet',
+  GOOGLE_MEET_STATUS_NAME = 'Aguardando Data'
 } = process.env;
 
 const redis = REDIS_URL
@@ -61,6 +72,7 @@ const redmineHeaders = {
 const issueAssigneeCache = new Map();
 const sentAppointmentAlertsMemory = new Set();
 const notifiedEventsMemory = new Set();
+const meetMemory = new Map();
 
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
@@ -93,6 +105,10 @@ function shouldIgnoreIssueByStatus(issue) {
     .filter(Boolean);
 
   return ignored.includes(normalizeText(statusName));
+}
+
+function isMeetStatus(issue) {
+  return normalizeText(getStatusName(issue)) === normalizeText(GOOGLE_MEET_STATUS_NAME);
 }
 
 function getBrazilTodayDateString() {
@@ -206,6 +222,21 @@ function getAppointmentAlertKey(issue, appointmentDate, alertMinutes) {
   return `redmine:appointment:${issue.id}:${appointmentDate.toISOString()}:${alertMinutes}`;
 }
 
+async function redisGet(key) {
+  if (redis) return await redis.get(key);
+  return meetMemory.get(key);
+}
+
+async function redisSet(key, value) {
+  if (redis) {
+    const ttlSeconds = Number(REDIS_TTL_DAYS) * 24 * 60 * 60;
+    await redis.set(key, value, 'EX', ttlSeconds);
+    return;
+  }
+
+  meetMemory.set(key, value);
+}
+
 async function wasAlreadyNotified(key) {
   if (!key) return false;
 
@@ -280,6 +311,35 @@ async function getRedmineGroup(groupId) {
     console.error(error.response?.data || error.message);
     return null;
   }
+}
+
+async function getRedmineProject(projectId) {
+  try {
+    const response = await axios.get(
+      `${REDMINE_URL}/projects/${projectId}.json`,
+      { headers: redmineHeaders }
+    );
+
+    return response.data.project;
+  } catch {
+    return null;
+  }
+}
+
+async function getProjectDisplayName(issue) {
+  const project = issue.project;
+
+  if (!project?.id) {
+    return project?.name || '';
+  }
+
+  const fullProject = await getRedmineProject(project.id);
+
+  if (fullProject?.parent?.name) {
+    return fullProject.parent.name;
+  }
+
+  return fullProject?.name || project.name || '';
 }
 
 async function getMattermostBotUser() {
@@ -426,6 +486,315 @@ async function getResponsibleTargets(issue) {
   return targets;
 }
 
+function getCustomFieldValue(issue, fieldName) {
+  const fields = issue.custom_fields || issue.custom_field_values || [];
+
+  const field = fields.find(f =>
+    f.name === fieldName ||
+    f.custom_field_name === fieldName
+  );
+
+  return field?.value || null;
+}
+
+function getCustomFieldId(issue, fieldName) {
+  const fields = issue.custom_fields || issue.custom_field_values || [];
+
+  const field = fields.find(f =>
+    f.name === fieldName ||
+    f.custom_field_name === fieldName
+  );
+
+  return field?.id || field?.custom_field_id || null;
+}
+
+async function updateRedmineCustomField(issue, fieldName, value) {
+  const fieldId = getCustomFieldId(issue, fieldName);
+
+  if (!fieldId) {
+    console.error(`Campo personalizado não encontrado na issue #${issue.id}: ${fieldName}`);
+    return false;
+  }
+
+  await axios.put(
+    `${REDMINE_URL}/issues/${issue.id}.json`,
+    {
+      issue: {
+        custom_fields: [
+          {
+            id: fieldId,
+            value
+          }
+        ]
+      }
+    },
+    { headers: redmineHeaders }
+  );
+
+  console.log(`Campo "${fieldName}" atualizado na issue #${issue.id}.`);
+  return true;
+}
+
+function parseTimeText(timeText) {
+  if (!timeText) return null;
+
+  const raw = String(timeText)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '');
+
+  let match = raw.match(/^(\d{1,2})h(\d{2})$/);
+
+  if (!match) {
+    match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  }
+
+  if (!match) {
+    match = raw.match(/^(\d{1,2})h$/);
+  }
+
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = match[2] ? Number(match[2]) : 0;
+
+  if (hour < 0 || hour > 23) return null;
+  if (minute < 0 || minute > 59) return null;
+
+  return {
+    hour,
+    minute,
+    label: `${String(hour).padStart(2, '0')}h${String(minute).padStart(2, '0')}`
+  };
+}
+
+function parseTimezoneOffsetToMinutes(offset) {
+  const match = String(offset || '-03:00').match(/^([+-])(\d{2}):(\d{2})$/);
+
+  if (!match) return -180;
+
+  const sign = match[1] === '+' ? 1 : -1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3]);
+
+  return sign * ((hours * 60) + minutes);
+}
+
+function createDateFromRedmineDateTime(date, parsedTime) {
+  const [year, month, day] = String(date).split('-').map(Number);
+  const offsetMinutes = parseTimezoneOffsetToMinutes(ALERT_TIMEZONE_OFFSET);
+
+  const utcMs = Date.UTC(
+    year,
+    month - 1,
+    day,
+    parsedTime.hour,
+    parsedTime.minute,
+    0,
+    0
+  ) - (offsetMinutes * 60 * 1000);
+
+  const dateTime = new Date(utcMs);
+
+  if (Number.isNaN(dateTime.getTime())) {
+    return null;
+  }
+
+  return dateTime;
+}
+
+function parseAppointmentDateTime(issue) {
+  const date = issue.start_date || issue.due_date;
+  const timeValue = getCustomFieldValue(issue, ALERT_FIELD_NAME);
+
+  if (!date || !timeValue) {
+    return null;
+  }
+
+  const parsedTime = parseTimeText(timeValue);
+
+  if (!parsedTime) {
+    console.log(`Horário inválido na issue #${issue.id}: "${timeValue}"`);
+    return null;
+  }
+
+  const dateTime = createDateFromRedmineDateTime(date, parsedTime);
+
+  if (!dateTime) {
+    console.log(`Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`);
+    return null;
+  }
+
+  return {
+    dateTime,
+    timeLabel: parsedTime.label
+  };
+}
+
+function getEstimatedMinutes(issue) {
+  const estimated = issue.estimated_hours;
+
+  if (estimated === null || estimated === undefined || estimated === '') {
+    return null;
+  }
+
+  const hours = Number(String(estimated).replace(',', '.'));
+
+  if (Number.isNaN(hours) || hours <= 0) {
+    return null;
+  }
+
+  return Math.round(hours * 60);
+}
+
+function extractMeetLink(event) {
+  if (event.hangoutLink) {
+    return event.hangoutLink;
+  }
+
+  const entryPoints = event.conferenceData?.entryPoints || [];
+  const video = entryPoints.find(e => e.entryPointType === 'video');
+
+  return video?.uri || null;
+}
+
+function googleCalendarIsConfigured() {
+  return Boolean(
+    GOOGLE_CLIENT_EMAIL &&
+    GOOGLE_PRIVATE_KEY &&
+    GOOGLE_CALENDAR_ID
+  );
+}
+
+function getGoogleCalendarClient() {
+  const privateKey = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+
+  const auth = new google.auth.JWT({
+    email: GOOGLE_CLIENT_EMAIL,
+    key: privateKey,
+    scopes: ['https://www.googleapis.com/auth/calendar']
+  });
+
+  return google.calendar({
+    version: 'v3',
+    auth
+  });
+}
+
+async function processGoogleMeet(issue) {
+  if (!googleCalendarIsConfigured()) {
+    logSkipped('Google Calendar não configurado.');
+    return;
+  }
+
+  if (!isMeetStatus(issue)) {
+    return;
+  }
+
+  const appointment = parseAppointmentDateTime(issue);
+  const estimatedMinutes = getEstimatedMinutes(issue);
+
+  if (!appointment || !estimatedMinutes) {
+    console.log(`Meet não criado issue #${issue.id}: data, horário ou tempo estimado ausente.`);
+    return;
+  }
+
+  const issueId = issue.id;
+  const projectName = await getProjectDisplayName(issue);
+  const subject = issue.subject || 'Sem assunto';
+  const summary = `#${issueId} - ${projectName} - ${subject} - ${appointment.timeLabel}`;
+
+  const startDate = appointment.dateTime;
+  const endDate = new Date(startDate.getTime() + estimatedMinutes * 60 * 1000);
+
+  const signature = JSON.stringify({
+    summary,
+    start: startDate.toISOString(),
+    end: endDate.toISOString()
+  });
+
+  const eventIdKey = `redmine:meet:event:${issueId}`;
+  const signatureKey = `redmine:meet:signature:${issueId}`;
+  const linkKey = `redmine:meet:link:${issueId}`;
+
+  const oldEventId = await redisGet(eventIdKey);
+  const oldSignature = await redisGet(signatureKey);
+  const oldLink = await redisGet(linkKey);
+  const currentFieldLink = getCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME);
+
+  if (oldEventId && oldSignature === signature) {
+    if (oldLink && !currentFieldLink) {
+      await updateRedmineCustomField(issue, GOOGLE_MEET_FIELD_NAME, oldLink);
+    }
+
+    return;
+  }
+
+  const calendar = getGoogleCalendarClient();
+
+  const eventBody = {
+    summary,
+    description: [
+      `Tarefa Redmine: #${issueId}`,
+      `${REDMINE_URL}/issues/${issueId}`
+    ].join('\n'),
+    start: {
+      dateTime: startDate.toISOString()
+    },
+    end: {
+      dateTime: endDate.toISOString()
+    }
+  };
+
+  let event;
+
+  if (oldEventId) {
+    const response = await calendar.events.patch({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId: oldEventId,
+      requestBody: eventBody,
+      conferenceDataVersion: 1
+    });
+
+    event = response.data;
+    console.log(`Google Meet atualizado para issue #${issueId}.`);
+  } else {
+    const response = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      conferenceDataVersion: 1,
+      requestBody: {
+        ...eventBody,
+        conferenceData: {
+          createRequest: {
+            requestId: `redmine-${issueId}-${Date.now()}`,
+            conferenceSolutionKey: {
+              type: 'hangoutsMeet'
+            }
+          }
+        }
+      }
+    });
+
+    event = response.data;
+    console.log(`Google Meet criado para issue #${issueId}.`);
+  }
+
+  const meetLink = extractMeetLink(event) || oldLink;
+
+  if (!meetLink) {
+    console.error(`Meet criado/atualizado, mas link não retornou para issue #${issueId}.`);
+    return;
+  }
+
+  await redisSet(eventIdKey, event.id);
+  await redisSet(signatureKey, signature);
+  await redisSet(linkKey, meetLink);
+
+  if (currentFieldLink !== meetLink) {
+    await updateRedmineCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
+  }
+}
+
 function buildMessage(issue, action, source) {
   const issueId = issue.id;
   const subject = issue.subject || 'Sem assunto';
@@ -433,6 +802,7 @@ function buildMessage(issue, action, source) {
   const priority = issue.priority?.name || issue.priority || '';
   const project = issue.project?.name || issue.project || '';
   const url = issue.url || `${REDMINE_URL}/issues/${issueId}`;
+  const meetLink = getCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME);
 
   return [
     `### Notificação do Redmine`,
@@ -445,6 +815,7 @@ function buildMessage(issue, action, source) {
     `**Assunto:** ${subject}`,
     status ? `**Status:** ${status}` : null,
     priority ? `**Prioridade:** ${priority}` : null,
+    meetLink ? `**Google Meet:** ${meetLink}` : null,
     ``,
     `[Abrir tarefa no Redmine](${url})`
   ].filter(Boolean).join('\n');
@@ -540,6 +911,8 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
     };
   }
 
+  await processGoogleMeet(issue);
+
   const eventKey = getEventKey(issue, source, journalFromPayload);
 
   if (await wasAlreadyNotified(eventKey)) {
@@ -631,101 +1004,13 @@ async function processIssueNotification(issue, action, source, forceNotify = fal
   };
 }
 
-function getCustomFieldValue(issue, fieldName) {
-  const fields = issue.custom_fields || issue.custom_field_values || [];
-
-  const field = fields.find(f =>
-    f.name === fieldName ||
-    f.custom_field_name === fieldName
-  );
-
-  return field?.value || null;
-}
-
-function parseTimeText(timeText) {
-  if (!timeText) return null;
-
-  const raw = String(timeText)
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, '');
-
-  let match = raw.match(/^(\d{1,2})h(\d{2})$/);
-
-  if (!match) {
-    match = raw.match(/^(\d{1,2}):(\d{2})$/);
-  }
-
-  if (!match) {
-    match = raw.match(/^(\d{1,2})h$/);
-  }
-
-  if (!match) return null;
-
-  const hour = Number(match[1]);
-  const minute = match[2] ? Number(match[2]) : 0;
-
-  if (hour < 0 || hour > 23) return null;
-  if (minute < 0 || minute > 59) return null;
-
-  return {
-    hour,
-    minute,
-    label: `${String(hour).padStart(2, '0')}h${String(minute).padStart(2, '0')}`
-  };
-}
-
-function parseAppointmentDateTime(issue) {
-  const date = issue.start_date || issue.due_date;
-  const timeValue = getCustomFieldValue(issue, ALERT_FIELD_NAME);
-
-  if (!date || !timeValue) {
-    return null;
-  }
-
-  const parsedTime = parseTimeText(timeValue);
-
-  if (!parsedTime) {
-    console.log(`Horário inválido na issue #${issue.id}: "${timeValue}"`);
-    return null;
-  }
-
-  try {
-    const [year, month, day] = date.split('-').map(Number);
-
-    // Horário informado no Redmine é horário do Brasil (-03:00).
-    // Convertemos manualmente para UTC para o Render comparar corretamente.
-    const dateTime = new Date(Date.UTC(
-      year,
-      month - 1,
-      day,
-      parsedTime.hour + 3,
-      parsedTime.minute,
-      0,
-      0
-    ));
-
-    if (Number.isNaN(dateTime.getTime())) {
-      console.log(`Data inválida issue #${issue.id}: date=${date} hora=${timeValue}`);
-      return null;
-    }
-
-    return {
-      dateTime,
-      timeLabel: parsedTime.label
-    };
-  } catch (err) {
-    console.log(`Erro parse data issue #${issue.id}:`, err.message);
-    return null;
-  }
-}
-
 function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   const issueId = issue.id;
   const subject = issue.subject || 'Sem assunto';
   const project = issue.project?.name || issue.project || '';
   const url = issue.url || `${REDMINE_URL}/issues/${issueId}`;
   const date = issue.start_date || issue.due_date || '';
+  const meetLink = getCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME);
 
   return [
     `### Lembrete de compromisso`,
@@ -736,6 +1021,7 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
     `**Assunto:** ${subject}`,
     date ? `**Data:** ${date}` : null,
     `**Horário:** ${timeLabel}`,
+    meetLink ? `**Google Meet:** ${meetLink}` : null,
     ``,
     `[Abrir tarefa no Redmine](${url})`
   ].filter(Boolean).join('\n');
@@ -979,17 +1265,13 @@ async function pollingAppointmentAlerts() {
   try {
     const issues = await fetchTodayIssuesForAlerts();
 
-    if (LOG_SKIPPED_EVENTS === 'true') {
-  console.log(`Alertas verificando ${issues.length} tarefas de hoje.`);
-}
+    console.log(`Alertas verificando ${issues.length} tarefas de hoje.`);
 
     for (const issueSummary of issues) {
       try {
-        const horarioResumo = getCustomFieldValue(issueSummary, ALERT_FIELD_NAME);
-
-if (!horarioResumo) {
-  continue;
-}
+        if (shouldIgnoreIssueByStatus(issueSummary)) {
+          continue;
+        }
 
         const issue = await fetchIssueDetails(issueSummary.id);
 
@@ -998,6 +1280,7 @@ if (!horarioResumo) {
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
 
+        await processGoogleMeet(issueWithUrl);
         await checkAppointmentAlert(issueWithUrl);
       } catch (errorIssue) {
         console.error(`Erro alerta issue #${issueSummary.id}:`);
