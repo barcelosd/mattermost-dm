@@ -75,6 +75,7 @@ const notifiedEventsMemory = new Set();
 const meetMemory = new Map();
 
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
+let pollingStarted = false;
 
 function logSkipped(message) {
   if (LOG_SKIPPED_EVENTS === 'true') {
@@ -201,36 +202,21 @@ function getAssigneeCacheKey(issue) {
     assignee.lastname || ''
   ].join('|');
 }
-function getEventKey(issue, source, journalFromPayload = null) {
-  const issueId = issue.id;
 
-  const journal =
-    journalFromPayload ||
-    getLastJournal(issue);
-
-  // Sempre prioriza journal.id
-  if (journal?.id) {
-    return `redmine:event:${issueId}:journal:${journal.id}`;
-  }
-
-  // fallback
-  return `redmine:event:${issueId}:updated:${issue.updated_on}`;
-}
-
-{
+function getEventKey(issue, source = '', journalFromPayload = null) {
   const issueId = issue.id;
   const journal = journalFromPayload || getLastJournal(issue);
 
   if (journal?.id) {
-    return `redmine:notified:journal:${issueId}:${journal.id}`;
+    return `redmine:event:${issueId}:journal:${journal.id}`;
   }
 
   if (issue.updated_on) {
-    return `redmine:notified:updated:${issueId}:${issue.updated_on}`;
+    return `redmine:event:${issueId}:updated:${issue.updated_on}`;
   }
 
   const assigneeKey = getAssigneeCacheKey(issue);
-  return `redmine:notified:fallback:${issueId}:${source}:${assigneeKey}`;
+  return `redmine:event:${issueId}:fallback:${source}:${assigneeKey}`;
 }
 
 function getAppointmentAlertKey(issue, appointmentDate, alertMinutes) {
@@ -1240,16 +1226,13 @@ async function pollingRedmineIssues() {
         }
 
         const issue = await fetchIssueDetails(issueSummary.id);
+        const lastJournal = getLastJournal(issue);
+        const eventKey = getEventKey(issue, 'Polling', lastJournal);
 
-        const eventKey = getEventKey(issue);
-
-if (await wasAlreadyNotified(eventKey)) {
-  logSkipped(
-    `Issue #${issue.id} ignorada no polling. Evento já processado.`
-  );
-
-  continue;
-}
+        if (await wasAlreadyNotified(eventKey)) {
+          logSkipped(`Issue #${issue.id} ignorada no polling. Evento já processado.`);
+          continue;
+        }
 
         if (shouldIgnoreIssueByStatus(issue)) {
           logSkipped(`Issue #${issue.id} ignorada por status: ${getStatusName(issue)}`);
@@ -1260,8 +1243,6 @@ if (await wasAlreadyNotified(eventKey)) {
           ...issue,
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
-
-        const lastJournal = getLastJournal(issueWithUrl);
 
         await processIssueNotification(
           issueWithUrl,
@@ -1331,8 +1312,6 @@ app.get('/polling-now', async (req, res) => {
 app.get('/', (req, res) => {
   res.send('API Redmine → Mattermost funcionando.');
 });
-
-let pollingStarted = false;
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
