@@ -201,8 +201,23 @@ function getAssigneeCacheKey(issue) {
     assignee.lastname || ''
   ].join('|');
 }
-
 function getEventKey(issue, source, journalFromPayload = null) {
+  const issueId = issue.id;
+
+  const journal =
+    journalFromPayload ||
+    getLastJournal(issue);
+
+  // Sempre prioriza journal.id
+  if (journal?.id) {
+    return `redmine:event:${issueId}:journal:${journal.id}`;
+  }
+
+  // fallback
+  return `redmine:event:${issueId}:updated:${issue.updated_on}`;
+}
+
+{
   const issueId = issue.id;
   const journal = journalFromPayload || getLastJournal(issue);
 
@@ -1225,6 +1240,16 @@ async function pollingRedmineIssues() {
         }
 
         const issue = await fetchIssueDetails(issueSummary.id);
+
+        const eventKey = getEventKey(issue);
+
+if (await wasAlreadyNotified(eventKey)) {
+  logSkipped(
+    `Issue #${issue.id} ignorada no polling. Evento já processado.`
+  );
+
+  continue;
+}
 
         if (shouldIgnoreIssueByStatus(issue)) {
           logSkipped(`Issue #${issue.id} ignorada por status: ${getStatusName(issue)}`);
