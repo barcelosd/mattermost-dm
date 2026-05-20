@@ -34,7 +34,10 @@ const {
   GOOGLE_PRIVATE_KEY,
   GOOGLE_CALENDAR_ID,
   GOOGLE_MEET_FIELD_NAME = 'Google Meet',
-  GOOGLE_MEET_STATUS_NAME = 'Aguardando Data'
+  GOOGLE_MEET_STATUS_NAME = 'Aguardando Data',
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN
 } = process.env;
 
 const redis = REDIS_URL
@@ -661,19 +664,37 @@ function extractMeetLink(event) {
 
 function googleCalendarIsConfigured() {
   return Boolean(
-    GOOGLE_CLIENT_EMAIL &&
-    GOOGLE_PRIVATE_KEY &&
+    GOOGLE_CLIENT_ID &&
+    GOOGLE_CLIENT_SECRET &&
+    GOOGLE_REFRESH_TOKEN &&
     GOOGLE_CALENDAR_ID
   );
 }
 
 function getGoogleCalendarClient() {
-  const privateKey = GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+  const auth = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET
+  );
 
-  const auth = new google.auth.JWT({
-    email: GOOGLE_CLIENT_EMAIL,
-    key: privateKey,
-    scopes: ['https://www.googleapis.com/auth/calendar']
+  auth.setCredentials({
+    refresh_token: GOOGLE_REFRESH_TOKEN
+  });
+
+  return google.calendar({
+    version: 'v3',
+    auth
+  });
+}
+
+function getGoogleCalendarClient() {
+  const auth = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+
+  auth.setCredentials({
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN
   });
 
   return google.calendar({
