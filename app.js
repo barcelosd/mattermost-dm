@@ -754,7 +754,7 @@ function getGoogleCalendarClient() {
   });
 }
 
-async function processGoogleMeet(issue) {async function processGoogleMeet(issue) {
+async function processGoogleMeet(issue) {
   if (!googleCalendarIsConfigured()) {
     logSkipped('Google Calendar não configurado.');
     return;
