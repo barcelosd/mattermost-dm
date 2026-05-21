@@ -805,7 +805,7 @@ async function checkAppointmentAlert(issue) {
 }
 
 function getBrazilDateParts(date = new Date()) {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
+  const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Sao_Paulo',
     year: 'numeric',
     month: '2-digit',
@@ -817,7 +817,6 @@ function getBrazilDateParts(date = new Date()) {
   });
 
   const parts = formatter.formatToParts(date);
-
   const get = type => parts.find(p => p.type === type)?.value;
 
   return {
@@ -835,10 +834,32 @@ function getBrazilDateString(date = new Date()) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
-function getTomorrowBrazilDateString() {
+function getNextBusinessSummaryDateString() {
   const now = new Date();
-  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  return getBrazilDateString(tomorrow);
+  const p = getBrazilDateParts(now);
+
+  const weekdayMap = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6
+  };
+
+  const weekday = weekdayMap[p.weekday];
+
+  const target = new Date(now);
+
+  // Sexta-feira resume segunda-feira
+  if (weekday === 5) {
+    target.setDate(target.getDate() + 3);
+  } else {
+    target.setDate(target.getDate() + 1);
+  }
+
+  return getBrazilDateString(target);
 }
 
 function isDailySummaryTime() {
@@ -851,21 +872,13 @@ function isDailySummaryTime() {
     Wed: 3,
     Thu: 4,
     Fri: 5,
-    Sat: 6,
-    dom: 0,
-    seg: 1,
-    ter: 2,
-    qua: 3,
-    qui: 4,
-    sex: 5,
-    sáb: 6
+    Sat: 6
   };
 
-  const weekdayNumber = weekdayMap[p.weekday];
+  const weekday = weekdayMap[p.weekday];
 
-  const allowedDay =
-    weekdayNumber >= 0 &&
-    weekdayNumber <= 4;
+  // Segunda a sexta às 17h45
+  const allowedDay = weekday >= 1 && weekday <= 5;
 
   return (
     allowedDay &&
@@ -914,7 +927,7 @@ async function processDailySummary() {
     return;
   }
 
-  const tomorrow = getTomorrowBrazilDateString();
+  const tomorrow = getNextBusinessSummaryDateString();
   const summaryKey = `redmine:daily-summary:${tomorrow}`;
 
   if (await wasAlreadyNotified(summaryKey)) {
