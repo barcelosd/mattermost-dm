@@ -30,6 +30,7 @@ const {
   REDIS_URL,
   REDIS_TTL_DAYS = 90,
 
+  GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   GOOGLE_CLIENT_EMAIL,
   GOOGLE_PRIVATE_KEY,
   GOOGLE_CALENDAR_ID,
@@ -317,17 +318,67 @@ async function getRedmineGroup(groupId) {
   }
 }
 
-async function getRedmineProject(projectId) {
-  try {
-    const response = await axios.get(
-      `${REDMINE_URL}/projects/${projectId}.json`,
-      { headers: redmineHeaders }
-    );
+function setCustomFieldValue(issue, fieldName, value) {
+  const fields = issue.custom_fields || issue.custom_field_values || [];
 
-    return response.data.project;
-  } catch {
-    return null;
+  const field = fields.find(f =>
+    f.name === fieldName ||
+    f.custom_field_name === fieldName
+  );
+
+  if (field) {
+    field.value = value;
   }
+}
+
+function getProjectCustomFieldValue(project, fieldName) {
+  const fields = project?.custom_fields || [];
+
+  const field = fields.find(f =>
+    f.name === fieldName ||
+    f.custom_field_name === fieldName
+  );
+
+  return field?.value || null;
+}
+
+async function getMeetProjectName(issue) {
+  if (!issue.project?.id) {
+    return issue.project?.name || '';
+  }
+
+  const project = await getRedmineProject(issue.project.id);
+
+  const nomeFantasia = getProjectCustomFieldValue(
+    project,
+    GOOGLE_MEET_PROJECT_FIELD_NAME
+  );
+
+  if (nomeFantasia) {
+    return nomeFantasia;
+  }
+
+  if (project?.parent?.name) {
+    return project.parent.name;
+  }
+
+  return project?.name || issue.project?.name || '';
+}
+
+async function findGoogleEventForIssue(calendar, issueId) {
+  const response = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    q: `#${issueId}`,
+    singleEvents: false,
+    showDeleted: false,
+    maxResults: 10
+  });
+
+  const events = response.data.items || [];
+
+  return events.find(event =>
+    event.summary?.startsWith(`#${issueId} -`)
+  ) || null;
 }
 
 async function getProjectDisplayName(issue) {
@@ -703,7 +754,7 @@ function getGoogleCalendarClient() {
   });
 }
 
-async function processGoogleMeet(issue) {
+async function processGoogleMeet(issue) {async function processGoogleMeet(issue) {
   if (!googleCalendarIsConfigured()) {
     logSkipped('Google Calendar não configurado.');
     return;
@@ -722,8 +773,9 @@ async function processGoogleMeet(issue) {
   }
 
   const issueId = issue.id;
-  const projectName = await getProjectDisplayName(issue);
+  const projectName = await getMeetProjectName(issue);
   const subject = issue.subject || 'Sem assunto';
+
   const summary = `#${issueId} - ${projectName} - ${subject} - ${appointment.timeLabel}`;
 
   const startDate = appointment.dateTime;
@@ -739,20 +791,31 @@ async function processGoogleMeet(issue) {
   const signatureKey = `redmine:meet:signature:${issueId}`;
   const linkKey = `redmine:meet:link:${issueId}`;
 
-  const oldEventId = await redisGet(eventIdKey);
+  let oldEventId = await redisGet(eventIdKey);
   const oldSignature = await redisGet(signatureKey);
   const oldLink = await redisGet(linkKey);
   const currentFieldLink = getCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME);
 
+  const calendar = getGoogleCalendarClient();
+
+  if (!oldEventId) {
+    const existingEvent = await findGoogleEventForIssue(calendar, issueId);
+
+    if (existingEvent?.id) {
+      oldEventId = existingEvent.id;
+      await redisSet(eventIdKey, oldEventId);
+      console.log(`Evento existente localizado para issue #${issueId}: ${oldEventId}`);
+    }
+  }
+
   if (oldEventId && oldSignature === signature) {
     if (oldLink && !currentFieldLink) {
       await updateRedmineCustomField(issue, GOOGLE_MEET_FIELD_NAME, oldLink);
+      setCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME, oldLink);
     }
 
     return;
   }
-
-  const calendar = getGoogleCalendarClient();
 
   const eventBody = {
     summary,
@@ -765,6 +828,11 @@ async function processGoogleMeet(issue) {
     },
     end: {
       dateTime: endDate.toISOString()
+    },
+    extendedProperties: {
+      private: {
+        redmineIssueId: String(issueId)
+      }
     }
   };
 
@@ -801,7 +869,7 @@ async function processGoogleMeet(issue) {
     console.log(`Google Meet criado para issue #${issueId}.`);
   }
 
-  const meetLink = extractMeetLink(event) || oldLink;
+  const meetLink = extractMeetLink(event) || oldLink || currentFieldLink;
 
   if (!meetLink) {
     console.error(`Meet criado/atualizado, mas link não retornou para issue #${issueId}.`);
@@ -815,6 +883,8 @@ async function processGoogleMeet(issue) {
   if (currentFieldLink !== meetLink) {
     await updateRedmineCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
   }
+
+  setCustomFieldValue(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
 }
 
 function buildMessage(issue, action, source) {
