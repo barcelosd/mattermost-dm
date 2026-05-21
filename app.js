@@ -1317,23 +1317,56 @@ async function pollingRedmineIssues() {
         }
 
         const issue = await fetchIssueDetails(issueSummary.id);
-        const lastJournal = getLastJournal(issue);
-        const eventKey = getEventKey(issue, 'Polling', lastJournal);
 
-        if (await wasAlreadyNotified(eventKey)) {
-          logSkipped(`Issue #${issue.id} ignorada no polling. Evento já processado.`);
-          continue;
-        }
+const issueWithUrl = {
+  ...issue,
+  url: `${REDMINE_URL}/issues/${issue.id}`
+};
 
+// Primeiro atualiza/cria o Google Meet, mesmo que a notificação já tenha sido enviada
+await processGoogleMeet(issueWithUrl);
+
+const lastJournal = getLastJournal(issueWithUrl);
+const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
+
+if (await wasAlreadyNotified(eventKey)) {
+  logSkipped(`Issue #${issue.id} ignorada no polling para notificação. Meet já foi verificado.`);
+  continue;
+}
         if (shouldIgnoreIssueByStatus(issue)) {
           logSkipped(`Issue #${issue.id} ignorada por status: ${getStatusName(issue)}`);
           continue;
         }
 
-        const issueWithUrl = {
-          ...issue,
-          url: `${REDMINE_URL}/issues/${issue.id}`
-        };
+        const issue = await fetchIssueDetails(issueSummary.id);
+
+const issueWithUrl = {
+  ...issue,
+  url: `${REDMINE_URL}/issues/${issue.id}`
+};
+
+await processGoogleMeet(issueWithUrl);
+
+const lastJournal = getLastJournal(issueWithUrl);
+const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
+
+if (await wasAlreadyNotified(eventKey)) {
+  logSkipped(`Issue #${issue.id} ignorada no polling para notificação. Meet já foi verificado.`);
+  continue;
+}
+
+if (shouldIgnoreIssueByStatus(issueWithUrl)) {
+  logSkipped(`Issue #${issue.id} ignorada por status: ${getStatusName(issueWithUrl)}`);
+  continue;
+}
+
+await processIssueNotification(
+  issueWithUrl,
+  'Responsável alterado ou verificação periódica',
+  'Polling',
+  false,
+  lastJournal
+);
 
         await processIssueNotification(
           issueWithUrl,
