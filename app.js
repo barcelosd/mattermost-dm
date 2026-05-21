@@ -455,17 +455,13 @@ function parseTimeText(timeText) {
 }
 
 function createDateFromRedmineDateTime(date, time) {
-  const [year, month, day] =
-    date.split('-').map(Number);
+  const [year, month, day] = date.split('-').map(Number);
 
-  return new Date(
-    year,
-    month - 1,
-    day,
-    time.hour,
-    time.minute,
-    0
-  );
+  const localDateTime =
+    `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(time.hour).padStart(2, '0')}:${String(time.minute).padStart(2, '0')}:00-03:00`;
+
+  return new Date(localDateTime);
+}
 }
 
 function parseAppointmentDateTime(issue) {
@@ -607,15 +603,15 @@ async function processGoogleMeet(issue) {
     description:
       `${REDMINE_URL}/issues/${issue.id}`,
 
-    start: {
-      dateTime:
-        startDate.toISOString()
-    },
+start: {
+  dateTime: startDate.toISOString(),
+  timeZone: 'America/Sao_Paulo'
+},
 
-    end: {
-      dateTime:
-        endDate.toISOString()
-    }
+end: {
+  dateTime: endDate.toISOString(),
+  timeZone: 'America/Sao_Paulo'
+}
   };
 
   if (event?.id) {
