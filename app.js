@@ -582,9 +582,18 @@ async function processGoogleMeet(issue) {
     return;
   }
 
-  if (normalizeText(issue.status?.name) !== normalizeText(GOOGLE_MEET_STATUS_NAME)) {
-    return;
-  }
+  const hasMeetStatus =
+  normalizeText(issue.status?.name) === normalizeText(GOOGLE_MEET_STATUS_NAME);
+
+const hasDate = Boolean(issue.start_date || issue.due_date);
+const hasTime = Boolean(getCustomFieldValue(issue, ALERT_FIELD_NAME));
+const hasEstimatedTime = Boolean(getEstimatedMinutes(issue));
+
+if (!hasMeetStatus || !hasDate || !hasTime || !hasEstimatedTime) {
+  await deleteGoogleMeet(issue.id);
+  return;
+}
+
 
   const appointment = parseAppointmentDateTime(issue);
 
@@ -729,7 +738,10 @@ async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) {
     return;
   }
-
+  if (normalizeText(issue.status?.name) === normalizeText(GOOGLE_MEET_STATUS_NAME)) {
+  await processGoogleMeet(issue);
+  return;
+}
   await processGoogleMeet(issue);
 
   const eventKey = getEventKey(issue, source, journal);
@@ -766,42 +778,94 @@ async function checkAppointmentAlert(issue) {
     return;
   }
 
-  const alertMinutes = Number(ALERT_MINUTES_BEFORE);
-  const alertAt = new Date(
-    appointment.dateTime.getTime() - alertMinutes * 60000
+  const alertMinutesList = [
+    Number(ALERT_MINUTES_BEFORE),
+    Number(ALERT_EXTRA_MINUTES_BEFORE)
+  ].filter((v, i, arr) =>
+    v > 0 && arr.indexOf(v) === i
   );
 
-  const now = new Date();
-  const diffMs = now.getTime() - alertAt.getTime();
-  const windowMs = Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
+  for (const alertMinutes of alertMinutesList) {
+    const alertAt = new Date(
+      appointment.dateTime.getTime() - alertMinutes * 60000
+    );
 
-  if (diffMs < 0 || diffMs > windowMs) {
-    return;
-  }
+    const now = new Date();
+    const diffMs = now.getTime() - alertAt.getTime();
+    const windowMs = Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000;
 
-  const alertKey =
-    `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
+    if (diffMs < 0 || diffMs > windowMs) {
+      continue;
+    }
 
-  if (await wasAppointmentAlertSent(alertKey)) {
-    return;
-  }
+    const alertKey =
+      `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
 
-  const targets = await getResponsibleTargets(issue);
+    if (await wasAppointmentAlertSent(alertKey)) {
+      continue;
+    }
 
-  if (!targets.length) {
+    const targets = await getResponsibleTargets(issue);
+
+    if (!targets.length) {
+      await markAppointmentAlertSent(alertKey);
+      continue;
+    }
+
+    const message = buildAppointmentMessage(
+      issue,
+      alertMinutes,
+      appointment.timeLabel
+    );
+
+    await notifyTargets(targets, message);
+
     await markAppointmentAlertSent(alertKey);
+  }
+}
+
+async function deleteGoogleMeet(issueId) {
+  if (!googleCalendarIsConfigured()) {
     return;
   }
 
-  const message = buildAppointmentMessage(
-    issue,
-    alertMinutes,
-    appointment.timeLabel
-  );
+  const eventIdKey = `redmine:meet:event:${issueId}`;
+  const signatureKey = `redmine:meet:signature:${issueId}`;
 
-  await notifyTargets(targets, message);
+  const eventId = await redisGet(eventIdKey);
 
-  await markAppointmentAlertSent(alertKey);
+  if (!eventId) {
+    return;
+  }
+
+  try {
+    const calendar = getGoogleCalendarClient();
+
+    await calendar.events.delete({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId
+    });
+
+    console.log(`Meet excluído issue #${issueId}.`);
+
+    await redisSet(eventIdKey, '');
+    await redisSet(signatureKey, '');
+
+  } catch (error) {
+    const status = error.response?.status;
+
+    if (status === 404 || status === 410) {
+      console.log(`Meet issue #${issueId} já não existe no Google Calendar.`);
+      await redisSet(eventIdKey, '');
+      await redisSet(signatureKey, '');
+      return;
+    }
+
+    console.error(
+      `Erro ao excluir Meet issue #${issueId}:`,
+      error.response?.data || error.message
+    );
+  }
 }
 
 function getBrazilDateParts(date = new Date()) {
@@ -1110,6 +1174,20 @@ app.post('/redmine-webhook', async (req, res) => {
     const payload = getPayloadData(req.body);
     const issue = payload.issue;
     const action = payload.action || 'updated';
+    const deletedActions = ['deleted', 'destroyed', 'destroy'];
+
+if (deletedActions.includes(String(action).toLowerCase())) {
+  const issueId = payload.issue?.id || payload.id;
+
+  if (issueId) {
+    await deleteGoogleMeet(issueId);
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: 'Tarefa excluída. Meet removido, se existia.'
+  });
+}
     const journal = payload.journal || null;
 
     if (!issue) {
