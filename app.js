@@ -795,6 +795,7 @@ async function fetchRecentIssues() {
     }
   );
 
+  
   return response.data.issues || [];
 }
 
