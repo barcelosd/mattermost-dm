@@ -24,9 +24,9 @@ const {
   POLLING_INTERVAL_SECONDS = 300,
   POLLING_LIMIT = 20,
 
- ALERT_MINUTES_BEFORE = 10,
- ALERT_EXTRA_MINUTES_BEFORE = 2,
- ALERT_FIELD_NAME = 'Horário',
+  ALERT_MINUTES_BEFORE = 10,
+  ALERT_EXTRA_MINUTES_BEFORE = 2,
+  ALERT_FIELD_NAME = 'Horário',
   ALERT_POLLING_INTERVAL_SECONDS = 60,
   ALERT_TIMEZONE_OFFSET = '-03:00',
 
@@ -782,8 +782,8 @@ async function checkAppointmentAlert(issue) {
   const alertMinutesList = [
     Number(ALERT_MINUTES_BEFORE),
     Number(ALERT_EXTRA_MINUTES_BEFORE)
-  ].filter((v, i, arr) =>
-    v > 0 && arr.indexOf(v) === i
+  ].filter((value, index, array) =>
+    value > 0 && array.indexOf(value) === index
   );
 
   for (const alertMinutes of alertMinutesList) {
