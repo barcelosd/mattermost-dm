@@ -50,7 +50,6 @@ async function redisGet(key) { return redis ? redis.get(key) : (memory.values.ge
 async function redisDel(key) { if (redis) { await redis.del(key); } else { memory.values.delete(key); } }
 async function redisSetAdd(key, value) { if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); } }
 async function redisSetRemove(key, value) { if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); } }
-async function redisSetMembers(key) { return redis ? redis.smembers(key) : Array.from(memory.meetIssues); }
 async function wasAlreadyNotified(key) { return redis ? (await redis.get(key)) === '1' : memory.notified.has(key); }
 async function markAsNotified(key) {
   const ttl = Number(REDIS_TTL_DAYS) * 86400;
@@ -121,9 +120,13 @@ async function getRedmineGroup(groupId) {
   } catch { return null; }
 }
 function isRedmineUserActive(user) { return user && user.mail && (!user.status || Number(user.status) === 1); }
+
 async function getResponsibleTargets(issue) {
   const assignee = issue.assignee || issue.assigned_to;
-  if (!assignee) return [];
+  if (!assignee) {
+    console.log(`[RAIO-X] Tarefa #${issue.id} ignorada nas notificações: Sem responsável atribuído.`);
+    return [];
+  }
   if (typeof assignee.id === 'string' && assignee.id.includes('@')) return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
   try {
     const user = await getRedmineUser(assignee.id);
@@ -139,6 +142,7 @@ async function getResponsibleTargets(issue) {
   });
   return (await Promise.all(usersPromises)).filter(Boolean);
 }
+
 async function getMattermostBotUser() {
   const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, { headers: mattermostHeaders });
   return response.data;
@@ -162,9 +166,9 @@ async function notifyTargets(targets, message) {
       if (mmUser.delete_at && mmUser.delete_at > 0) continue;
       const channel = await createDirectChannel(botUser.id, mmUser.id);
       await sendMattermostMessage(channel.id, message);
-      console.log(`Mensagem enviada para ${target.email}`);
+      console.log(`[SUCESSO] Mensagem Mattermost enviada para ${target.email}`);
     } catch (error) {
-      console.error(`Erro enviando Mattermost para ${target.email}:`, error.response?.data || error.message);
+      console.error(`[ERRO] Falha enviando Mattermost para ${target.email}:`, error.response?.data || error.message);
     }
   }
 }
@@ -191,6 +195,7 @@ async function findGoogleEventForIssue(calendar, issueId) {
   return response.data.items?.find(event => event.summary?.startsWith(`#${issueId}`)) || null;
 }
 function extractMeetLink(event) { return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null; }
+
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
   const calendar = getGoogleCalendarClient();
@@ -204,7 +209,7 @@ async function deleteGoogleMeet(issueId) {
       await redisSetRemove('redmine:meet:issues', String(issueId)); return;
     }
     await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
-    console.log(`Meet excluído issue #${issueId}.`);
+    console.log(`[CALENDÁRIO] Meet excluído para a issue #${issueId}.`);
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
     await redisSetRemove('redmine:meet:issues', String(issueId));
@@ -212,12 +217,19 @@ async function deleteGoogleMeet(issueId) {
     if (error.response?.status === 404 || error.response?.status === 410) await redisSetRemove('redmine:meet:issues', String(issueId));
   }
 }
+
 async function processGoogleMeet(issue) {
   if (!googleCalendarIsConfigured()) return;
+  
+  const isMeet = isMeetStatus(issue);
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
-  if (!isMeetStatus(issue) || !appointment || !estimatedMinutes) {
+  if (!isMeet || !appointment || !estimatedMinutes) {
+    // Apenas loga se o status for realmente meet, pra não floodar o terminal atoa
+    if (isMeet) {
+      console.log(`[RAIO-X] Agenda do Meet abortada para #${issue.id}. Motivos da falha: Tem Data/Hora válida? ${!!appointment} | Tem "Tempo Estimado" preenchido? ${!!estimatedMinutes}`);
+    }
     await deleteGoogleMeet(issue.id);
     return;
   }
@@ -241,6 +253,8 @@ async function processGoogleMeet(issue) {
     event = await findGoogleEventForIssue(calendar, issue.id);
     eventId = event?.id || null;
   }
+  
+  // Se já existe e a assinatura é igual (nada mudou), ignora a requisição
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
     if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) {
@@ -256,27 +270,31 @@ async function processGoogleMeet(issue) {
     extendedProperties: { private: { redmineIssueId: String(issue.id) } }
   };
 
-  if (eventId) {
-    const response = await calendar.events.patch({ calendarId: GOOGLE_CALENDAR_ID, eventId, conferenceDataVersion: 1, requestBody });
-    event = response.data;
-    console.log(`Meet atualizado issue #${issue.id}`);
-  } else {
-    const response = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID, conferenceDataVersion: 1,
-      requestBody: { ...requestBody, conferenceData: { createRequest: { requestId: `redmine-${issue.id}-${Date.now()}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } } }
-    });
-    event = response.data;
-    console.log(`Meet criado issue #${issue.id}`);
-  }
+  try {
+    if (eventId) {
+      const response = await calendar.events.patch({ calendarId: GOOGLE_CALENDAR_ID, eventId, conferenceDataVersion: 1, requestBody });
+      event = response.data;
+      console.log(`[SUCESSO] Agenda do Meet atualizada para issue #${issue.id}`);
+    } else {
+      const response = await calendar.events.insert({
+        calendarId: GOOGLE_CALENDAR_ID, conferenceDataVersion: 1,
+        requestBody: { ...requestBody, conferenceData: { createRequest: { requestId: `redmine-${issue.id}-${Date.now()}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } } }
+      });
+      event = response.data;
+      console.log(`[SUCESSO] Agenda do Meet criada para issue #${issue.id}`);
+    }
 
-  const meetLink = extractMeetLink(event);
-  if (meetLink) {
-    await updateRedmineCustomField(issue, 'Google Meet', meetLink);
-    await redisSet(`redmine:meet:link:${issue.id}`, meetLink);
+    const meetLink = extractMeetLink(event);
+    if (meetLink) {
+      await updateRedmineCustomField(issue, 'Google Meet', meetLink);
+      await redisSet(`redmine:meet:link:${issue.id}`, meetLink);
+    }
+    await redisSet(`redmine:meet:event:${issue.id}`, event.id);
+    await redisSetAdd('redmine:meet:issues', String(issue.id));
+    await redisSet(signatureKey, signature);
+  } catch (error) {
+    console.error(`[ERRO] Falha ao criar/atualizar no Google Calendar para #${issue.id}:`, error.response?.data || error.message);
   }
-  await redisSet(`redmine:meet:event:${issue.id}`, event.id);
-  await redisSetAdd('redmine:meet:issues', String(issue.id));
-  await redisSet(signatureKey, signature);
 }
 
 // ---------------------------------------------------------
@@ -295,9 +313,9 @@ function buildNotificationMessage(issue, action, source) {
 function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   return [
-    `### Lembrete de compromisso`, ``, `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issue.id}**.`, ``,
+    `### ⏰ Lembrete de Reunião`, ``, `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issue.id}**.`, ``,
     `**Projeto:** ${issue.project?.name || ''}`, `**Assunto:** ${issue.subject}`, `**Horário:** ${timeLabel}`,
-    meetLink ? `**Google Meet:** ${meetLink}` : null, ``, `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
+    meetLink ? `**Link do Google Meet:** ${meetLink}` : null, ``, `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
 }
 
@@ -309,10 +327,12 @@ async function checkAppointmentAlert(issue) {
   const alertMinutesList = [Number(ALERT_MINUTES_BEFORE), Number(ALERT_EXTRA_MINUTES_BEFORE)].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
   
   for (const alertMinutes of alertMinutesList) {
+    // Momento exato que o alerta deve ser disparado
     const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
     const diffMs = new Date().getTime() - alertAt.getTime();
     const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
 
+    // Se o momento atual ainda não atingiu o horário do alerta, ou já passou muito tempo, ignora
     if (diffMs < 0 || diffMs > windowMs) continue;
 
     const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
@@ -325,14 +345,17 @@ async function checkAppointmentAlert(issue) {
 
     const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     await notifyTargets(targets, message);
-    console.log(`Alerta de ${alertMinutes} min enviado para issue #${issue.id}.`);
+    console.log(`[ALERTA] Lembrete de ${alertMinutes} min enviado para issue #${issue.id}.`);
     await markAppointmentAlertSent(alertKey);
   }
 }
 
 async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
+  
   await processGoogleMeet(issue);
+  
+  // Regra original: Se for meet, não manda notificação "comum" (deixa apenas pros alertas de horário)
   if (isMeetStatus(issue)) return;
   
   const eventKey = getEventKey(issue, source, journal);
@@ -359,29 +382,30 @@ async function fetchRecentIssues() {
   return response.data.issues || [];
 }
 
-async function fetchIssueDetails(issueId) {
-  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, {
+async function fetchIssuesByDate(dateStr) {
+  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
     headers: redmineHeaders,
-    params: { include: 'journals' }
+    params: { status_id: '*', sort: 'start_date:asc', limit: 100 }
   });
-  return response.data.issue;
+  return (response.data.issues || []).filter(issue => issue.start_date === dateStr || issue.due_date === dateStr);
 }
 
 async function pollingRedmineIssues() {
-  console.log(`[${dayjs().format('HH:mm:ss')}] Iniciando Polling no Redmine...`);
+  console.log(`[${dayjs().format('HH:mm:ss')}] Iniciando Polling de Tarefas Atualizadas...`);
   try {
     const issues = await fetchRecentIssues();
+    
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
+      
       if (updatedAt < lastPollingTimestamp) continue;
       
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
         
-        // AGORA SIM - As funções vitais estão sendo chamadas!
+        // Avalia se precisa criar/atualizar no calendar sempre que a tarefa muda
         await processGoogleMeet(issueWithUrl);
-        await checkAppointmentAlert(issueWithUrl);
 
         const lastJournal = getLastJournal(issueWithUrl);
         const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
@@ -390,13 +414,39 @@ async function pollingRedmineIssues() {
           await processIssueNotification(issueWithUrl, 'Atualização (via Polling)', 'Polling', lastJournal);
         }
       } catch (errorIssue) {
-        console.error(`Erro processando issue #${issueSummary.id}:`, errorIssue.response?.data || errorIssue.message);
+        console.error(`[ERRO] Processando issue #${issueSummary.id}:`, errorIssue.response?.data || errorIssue.message);
       }
     }
     lastPollingTimestamp = Date.now();
   } catch (error) {
-    console.error('Erro geral no polling de issues:', error.response?.data || error.message);
+    console.error('[ERRO] Falha no polling de issues atualizadas:', error.response?.data || error.message);
   }
+}
+
+// NOVO: Polling exclusivo para verificar alertas de horário (Roda a cada 60s)
+async function pollingAppointmentAlerts() {
+  try {
+    const today = dayjs().format('YYYY-MM-DD');
+    const issues = await fetchIssuesByDate(today);
+
+    for (const issueSummary of issues) {
+      try {
+        const issue = await fetchIssueDetails(issueSummary.id);
+        const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
+        await checkAppointmentAlert(issueWithUrl);
+      } catch (err) {}
+    }
+  } catch (error) {
+    console.error('[ERRO] Falha verificando alertas de horário:', error.response?.data || error.message);
+  }
+}
+
+async function fetchIssueDetails(issueId) {
+  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, {
+    headers: redmineHeaders,
+    params: { include: 'journals' }
+  });
+  return response.data.issue;
 }
 
 // ---------------------------------------------------------
@@ -406,18 +456,24 @@ const app = express();
 
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
-  res.json({ success: true, message: 'Polling engatilhado manualmente.' });
+  await pollingAppointmentAlerts();
+  res.json({ success: true, message: 'Pollling de atualizações e alertas forçados.' });
 });
 
 app.get('/', (req, res) => {
-  res.send('API Bot funcionando via Polling.');
+  res.send('API Bot funcionando via Polling duplo (Atualizações e Alertas).');
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativos.`);
+  console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativados.`);
   
   if (String(POLLING_ENABLED) === 'true') {
+    // Inicia verificação geral de alterações (A cada 5 mins)
     setTimeout(pollingRedmineIssues, 5000);
     setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
+
+    // Inicia verificação dos alertas de horário (A cada 60 segundos)
+    setTimeout(pollingAppointmentAlerts, 10000);
+    setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
   }
 });
