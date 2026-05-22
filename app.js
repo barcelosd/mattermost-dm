@@ -50,6 +50,7 @@ async function redisGet(key) { return redis ? redis.get(key) : (memory.values.ge
 async function redisDel(key) { if (redis) { await redis.del(key); } else { memory.values.delete(key); } }
 async function redisSetAdd(key, value) { if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); } }
 async function redisSetRemove(key, value) { if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); } }
+async function redisSetMembers(key) { return redis ? redis.smembers(key) : Array.from(memory.meetIssues); }
 async function wasAlreadyNotified(key) { return redis ? (await redis.get(key)) === '1' : memory.notified.has(key); }
 async function markAsNotified(key) {
   const ttl = Number(REDIS_TTL_DAYS) * 86400;
@@ -87,30 +88,16 @@ function getCustomFieldId(issue, fieldName) {
   return field?.id || field?.custom_field_id || null;
 }
 
-// CORREÇÃO: Função mais flexível para ler o horário
 function parseAppointmentDateTime(issue) {
   const date = issue.start_date || issue.due_date;
   const timeValueRaw = getCustomFieldValue(issue, ALERT_FIELD_NAME);
 
-  if (!date) {
-    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: Sem Data de Início ou Conclusão.`);
-    return null;
-  }
-  
-  if (!timeValueRaw) {
-    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: Campo "${ALERT_FIELD_NAME}" está vazio.`);
-    return null;
-  }
+  if (!date || !timeValueRaw) return null;
 
-  // Limpa espaços acidentais que o usuário possa ter digitado (ex: " 14:30 ")
   const timeValue = String(timeValueRaw).trim().toLowerCase().replace(/\s+/g, '');
-  
   let parsedTime = dayjs(timeValue, ['HH:mm', 'HHhmm', 'HHh'], false);
 
-  if (!parsedTime.isValid()) {
-    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: O horário "${timeValueRaw}" não está num formato válido (use HH:mm).`);
-    return null;
-  }
+  if (!parsedTime.isValid()) return null;
 
   const dateTime = dayjs.tz(`${date} ${parsedTime.format('HH:mm')}`, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").toDate();
   return { dateTime, timeLabel: parsedTime.format('HH[h]mm') };
@@ -349,19 +336,24 @@ async function checkAppointmentAlert(issue) {
 
     const targets = await getResponsibleTargets(issue);
     if (!targets.length) {
-      await markAppointmentAlertSent(alertKey); continue;
+      console.log(`[RAIO-X ALERTA] Alerta de ${alertMinutes}m cancelado para #${issue.id} (sem responsáveis).`);
+      await markAppointmentAlertSent(alertKey); 
+      continue;
     }
 
     const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     await notifyTargets(targets, message);
-    console.log(`[ALERTA] Lembrete de ${alertMinutes} min enviado para issue #${issue.id}.`);
+    console.log(`[ALERTA ENVIADO] Lembrete de ${alertMinutes} min disparado no Mattermost para issue #${issue.id}!`);
     await markAppointmentAlertSent(alertKey);
   }
 }
 
 async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
+  
   await processGoogleMeet(issue);
+  
+  // Regra original: Se for status de Meet, não gera notificação genérica de alteração/criação
   if (isMeetStatus(issue)) return;
   
   const eventKey = getEventKey(issue, source, journal);
@@ -376,7 +368,7 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 7. POLLING
+// 7. POLLING DE ATUALIZAÇÕES
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
@@ -386,14 +378,6 @@ async function fetchRecentIssues() {
     params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
   });
   return response.data.issues || [];
-}
-
-async function fetchIssuesByDate(dateStr) {
-  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-    headers: redmineHeaders,
-    params: { status_id: '*', sort: 'start_date:asc', limit: 100 }
-  });
-  return (response.data.issues || []).filter(issue => issue.start_date === dateStr || issue.due_date === dateStr);
 }
 
 async function pollingRedmineIssues() {
@@ -423,19 +407,38 @@ async function pollingRedmineIssues() {
   } catch (error) {}
 }
 
+// ---------------------------------------------------------
+// 8. POLLING EXCLUSIVO PARA ALERTAS (10 E 2 MINUTOS)
+// ---------------------------------------------------------
 async function pollingAppointmentAlerts() {
   try {
-    const today = dayjs().format('YYYY-MM-DD');
-    const issues = await fetchIssuesByDate(today);
+    // Pega as tarefas que já sabemos que são Meet (Cache)
+    const meetIssueIds = await redisSetMembers('redmine:meet:issues');
+    
+    // Pega as 20 tarefas abertas mais recentes
+    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+      headers: redmineHeaders,
+      params: { status_id: 'open', sort: 'updated_on:desc', limit: 20 }
+    });
+    const recentIssues = response.data.issues || [];
+    
+    // Junta tudo numa lista única sem repetir IDs
+    const issuesToCheck = new Set(meetIssueIds);
+    recentIssues.forEach(i => issuesToCheck.add(String(i.id)));
 
-    for (const issueSummary of issues) {
+    for (const issueId of issuesToCheck) {
       try {
-        const issue = await fetchIssueDetails(issueSummary.id);
+        const issue = await fetchIssueDetails(issueId);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
+        
         await checkAppointmentAlert(issueWithUrl);
-      } catch (err) {}
+      } catch (err) {
+        console.error(`[ERRO] Falha verificando alerta da tarefa #${issueId}:`, err.message);
+      }
     }
-  } catch (error) {}
+  } catch (error) {
+    console.error('[ERRO FATAL] Falha geral na rotina de alertas:', error.message);
+  }
 }
 
 async function fetchIssueDetails(issueId) {
@@ -447,7 +450,7 @@ async function fetchIssueDetails(issueId) {
 }
 
 // ---------------------------------------------------------
-// 8. SERVIDOR
+// 9. SERVIDOR
 // ---------------------------------------------------------
 const app = express();
 
@@ -458,15 +461,16 @@ app.get('/polling-now', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('API Bot funcionando via Polling duplo (Atualizações e Alertas).');
+  res.send('API Bot funcionando via Polling. Lógica de Alertas Corrigida.');
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativados.`);
+  console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativados (a cada 60s).`);
   
   if (String(POLLING_ENABLED) === 'true') {
     setTimeout(pollingRedmineIssues, 5000);
     setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
+    
     setTimeout(pollingAppointmentAlerts, 10000);
     setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
   }
