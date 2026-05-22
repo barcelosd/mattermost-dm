@@ -62,7 +62,7 @@ async function markAppointmentAlertSent(key) {
 }
 
 // ---------------------------------------------------------
-// 3. UTILITÁRIOS
+// 3. UTILITÁRIOS E DATAS
 // ---------------------------------------------------------
 function normalizeText(value) { return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
 function isMeetStatus(issue) { return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME); }
@@ -86,15 +86,36 @@ function getCustomFieldId(issue, fieldName) {
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   return field?.id || field?.custom_field_id || null;
 }
+
+// CORREÇÃO: Função mais flexível para ler o horário
 function parseAppointmentDateTime(issue) {
   const date = issue.start_date || issue.due_date;
-  const timeValue = getCustomFieldValue(issue, ALERT_FIELD_NAME);
-  if (!date || !timeValue) return null;
-  let parsedTime = dayjs(timeValue, ['HH[h]mm', 'HH:mm', 'HH[h]'], true);
-  if (!parsedTime.isValid()) return null;
+  const timeValueRaw = getCustomFieldValue(issue, ALERT_FIELD_NAME);
+
+  if (!date) {
+    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: Sem Data de Início ou Conclusão.`);
+    return null;
+  }
+  
+  if (!timeValueRaw) {
+    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: Campo "${ALERT_FIELD_NAME}" está vazio.`);
+    return null;
+  }
+
+  // Limpa espaços acidentais que o usuário possa ter digitado (ex: " 14:30 ")
+  const timeValue = String(timeValueRaw).trim().toLowerCase().replace(/\s+/g, '');
+  
+  let parsedTime = dayjs(timeValue, ['HH:mm', 'HHhmm', 'HHh'], false);
+
+  if (!parsedTime.isValid()) {
+    if (isMeetStatus(issue)) console.log(`[RAIO-X] Tarefa #${issue.id}: O horário "${timeValueRaw}" não está num formato válido (use HH:mm).`);
+    return null;
+  }
+
   const dateTime = dayjs.tz(`${date} ${parsedTime.format('HH:mm')}`, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").toDate();
   return { dateTime, timeLabel: parsedTime.format('HH[h]mm') };
 }
+
 function getEstimatedMinutes(issue) {
   const hours = Number(String(issue.estimated_hours || 0).replace(',', '.'));
   return (!hours || Number.isNaN(hours)) ? null : Math.round(hours * 60);
@@ -123,10 +144,7 @@ function isRedmineUserActive(user) { return user && user.mail && (!user.status |
 
 async function getResponsibleTargets(issue) {
   const assignee = issue.assignee || issue.assigned_to;
-  if (!assignee) {
-    console.log(`[RAIO-X] Tarefa #${issue.id} ignorada nas notificações: Sem responsável atribuído.`);
-    return [];
-  }
+  if (!assignee) return [];
   if (typeof assignee.id === 'string' && assignee.id.includes('@')) return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
   try {
     const user = await getRedmineUser(assignee.id);
@@ -167,9 +185,7 @@ async function notifyTargets(targets, message) {
       const channel = await createDirectChannel(botUser.id, mmUser.id);
       await sendMattermostMessage(channel.id, message);
       console.log(`[SUCESSO] Mensagem Mattermost enviada para ${target.email}`);
-    } catch (error) {
-      console.error(`[ERRO] Falha enviando Mattermost para ${target.email}:`, error.response?.data || error.message);
-    }
+    } catch (error) {}
   }
 }
 
@@ -226,10 +242,6 @@ async function processGoogleMeet(issue) {
   const estimatedMinutes = getEstimatedMinutes(issue);
 
   if (!isMeet || !appointment || !estimatedMinutes) {
-    // Apenas loga se o status for realmente meet, pra não floodar o terminal atoa
-    if (isMeet) {
-      console.log(`[RAIO-X] Agenda do Meet abortada para #${issue.id}. Motivos da falha: Tem Data/Hora válida? ${!!appointment} | Tem "Tempo Estimado" preenchido? ${!!estimatedMinutes}`);
-    }
     await deleteGoogleMeet(issue.id);
     return;
   }
@@ -254,7 +266,6 @@ async function processGoogleMeet(issue) {
     eventId = event?.id || null;
   }
   
-  // Se já existe e a assinatura é igual (nada mudou), ignora a requisição
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
     if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) {
@@ -327,12 +338,10 @@ async function checkAppointmentAlert(issue) {
   const alertMinutesList = [Number(ALERT_MINUTES_BEFORE), Number(ALERT_EXTRA_MINUTES_BEFORE)].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
   
   for (const alertMinutes of alertMinutesList) {
-    // Momento exato que o alerta deve ser disparado
     const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
     const diffMs = new Date().getTime() - alertAt.getTime();
     const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
 
-    // Se o momento atual ainda não atingiu o horário do alerta, ou já passou muito tempo, ignora
     if (diffMs < 0 || diffMs > windowMs) continue;
 
     const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
@@ -352,10 +361,7 @@ async function checkAppointmentAlert(issue) {
 
 async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
-  
   await processGoogleMeet(issue);
-  
-  // Regra original: Se for meet, não manda notificação "comum" (deixa apenas pros alertas de horário)
   if (isMeetStatus(issue)) return;
   
   const eventKey = getEventKey(issue, source, journal);
@@ -397,14 +403,12 @@ async function pollingRedmineIssues() {
     
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
-      
       if (updatedAt < lastPollingTimestamp) continue;
       
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
         
-        // Avalia se precisa criar/atualizar no calendar sempre que a tarefa muda
         await processGoogleMeet(issueWithUrl);
 
         const lastJournal = getLastJournal(issueWithUrl);
@@ -413,17 +417,12 @@ async function pollingRedmineIssues() {
         if (!(await wasAlreadyNotified(eventKey))) {
           await processIssueNotification(issueWithUrl, 'Atualização (via Polling)', 'Polling', lastJournal);
         }
-      } catch (errorIssue) {
-        console.error(`[ERRO] Processando issue #${issueSummary.id}:`, errorIssue.response?.data || errorIssue.message);
-      }
+      } catch (errorIssue) {}
     }
     lastPollingTimestamp = Date.now();
-  } catch (error) {
-    console.error('[ERRO] Falha no polling de issues atualizadas:', error.response?.data || error.message);
-  }
+  } catch (error) {}
 }
 
-// NOVO: Polling exclusivo para verificar alertas de horário (Roda a cada 60s)
 async function pollingAppointmentAlerts() {
   try {
     const today = dayjs().format('YYYY-MM-DD');
@@ -436,9 +435,7 @@ async function pollingAppointmentAlerts() {
         await checkAppointmentAlert(issueWithUrl);
       } catch (err) {}
     }
-  } catch (error) {
-    console.error('[ERRO] Falha verificando alertas de horário:', error.response?.data || error.message);
-  }
+  } catch (error) {}
 }
 
 async function fetchIssueDetails(issueId) {
@@ -468,11 +465,8 @@ app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativados.`);
   
   if (String(POLLING_ENABLED) === 'true') {
-    // Inicia verificação geral de alterações (A cada 5 mins)
     setTimeout(pollingRedmineIssues, 5000);
     setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
-
-    // Inicia verificação dos alertas de horário (A cada 60 segundos)
     setTimeout(pollingAppointmentAlerts, 10000);
     setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
   }
