@@ -199,25 +199,35 @@ async function findGoogleEventForIssue(calendar, issueId) {
 }
 function extractMeetLink(event) { return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null; }
 
+// OTIMIZAÇÃO CRÍTICA: Garante a exclusão do Meet e limpa o Redis em qualquer situação
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
   const calendar = getGoogleCalendarClient();
   let eventId = await redisGet(`redmine:meet:event:${issueId}`);
+  
   try {
     if (!eventId) {
       const event = await findGoogleEventForIssue(calendar, issueId);
       eventId = event?.id || null;
     }
-    if (!eventId) {
-      await redisSetRemove('redmine:meet:issues', String(issueId)); return;
+    if (eventId) {
+      await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
+      console.log(`[CALENDÁRIO] Meet excluído com sucesso para a tarefa #${issueId}.`);
+    } else {
+      console.log(`[CALENDÁRIO] Nenhum evento pendente no Google Calendar para a tarefa #${issueId}.`);
     }
-    await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
-    console.log(`[CALENDÁRIO] Meet excluído para a issue #${issueId}.`);
+  } catch (error) {
+    if (error.response?.status === 404 || error.response?.status === 410) {
+      console.log(`[CALENDÁRIO] O evento para #${issueId} já havia sido removido manualmente do Google.`);
+    } else {
+      console.error(`[ERRO CALENDÁRIO] Falha ao remover evento #${issueId}:`, error.message);
+    }
+  } finally {
+    // Bloco Executado Sempre: Evita que tarefas deletadas fiquem presas no cache gerando loops
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
+    await redisDel(`redmine:meet:link:${issueId}`);
     await redisSetRemove('redmine:meet:issues', String(issueId));
-  } catch (error) {
-    if (error.response?.status === 404 || error.response?.status === 410) await redisSetRemove('redmine:meet:issues', String(issueId));
   }
 }
 
@@ -228,6 +238,7 @@ async function processGoogleMeet(issue) {
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
+  // Se perdeu qualquer uma das condições obrigatórias, remove do calendário imediatamente
   if (!isMeet || !appointment || !estimatedMinutes) {
     await deleteGoogleMeet(issue.id);
     return;
@@ -350,10 +361,7 @@ async function checkAppointmentAlert(issue) {
 
 async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
-  
   await processGoogleMeet(issue);
-  
-  // Regra original: Se for status de Meet, não gera notificação genérica de alteração/criação
   if (isMeetStatus(issue)) return;
   
   const eventKey = getEventKey(issue, source, journal);
@@ -401,28 +409,29 @@ async function pollingRedmineIssues() {
         if (!(await wasAlreadyNotified(eventKey))) {
           await processIssueNotification(issueWithUrl, 'Atualização (via Polling)', 'Polling', lastJournal);
         }
-      } catch (errorIssue) {}
+      } catch (errorIssue) {
+        if (errorIssue.response?.status === 404) {
+          await deleteGoogleMeet(issueSummary.id);
+        }
+      }
     }
     lastPollingTimestamp = Date.now();
   } catch (error) {}
 }
 
 // ---------------------------------------------------------
-// 8. POLLING EXCLUSIVO PARA ALERTAS (10 E 2 MINUTOS)
+// 8. POLLING DE ALERTAS DE HORÁRIO (COM CORREÇÃO DE EXCLUSÃO)
 // ---------------------------------------------------------
 async function pollingAppointmentAlerts() {
   try {
-    // Pega as tarefas que já sabemos que são Meet (Cache)
     const meetIssueIds = await redisSetMembers('redmine:meet:issues');
     
-    // Pega as 20 tarefas abertas mais recentes
     const response = await axios.get(`${REDMINE_URL}/issues.json`, {
       headers: redmineHeaders,
       params: { status_id: 'open', sort: 'updated_on:desc', limit: 20 }
     });
     const recentIssues = response.data.issues || [];
     
-    // Junta tudo numa lista única sem repetir IDs
     const issuesToCheck = new Set(meetIssueIds);
     recentIssues.forEach(i => issuesToCheck.add(String(i.id)));
 
@@ -431,9 +440,18 @@ async function pollingAppointmentAlerts() {
         const issue = await fetchIssueDetails(issueId);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
         
+        // CORREÇÃO: Força a reavaliação das condições. Se perdeu horário/status, limpa o calendário
+        await processGoogleMeet(issueWithUrl);
         await checkAppointmentAlert(issueWithUrl);
+        
       } catch (err) {
-        console.error(`[ERRO] Falha verificando alerta da tarefa #${issueId}:`, err.message);
+        // CORREÇÃO DO ERRO 404: Se a tarefa sumiu do Redmine, limpa o Google Calendar imediatamente!
+        if (err.response?.status === 404) {
+          console.log(`[RAIO-X] Identificado que a tarefa #${issueId} foi removida do Redmine. Deletando Meet correspondente...`);
+          await deleteGoogleMeet(issueId);
+        } else {
+          console.error(`[ERRO] Falha verificando alerta da tarefa #${issueId}:`, err.message);
+        }
       }
     }
   } catch (error) {
@@ -461,7 +479,7 @@ app.get('/polling-now', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('API Bot funcionando via Polling. Lógica de Alertas Corrigida.');
+  res.send('API Bot funcionando via Polling duplo (Atualizações e Alertas).');
 });
 
 app.listen(PORT, () => {
