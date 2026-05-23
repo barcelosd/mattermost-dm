@@ -108,6 +108,26 @@ function getEstimatedMinutes(issue) {
   return (!hours || Number.isNaN(hours)) ? null : Math.round(hours * 60);
 }
 
+// Lógica de tempo para o Resumo Diário
+function isDailySummaryTime() {
+  if (DAILY_SUMMARY_ENABLED !== 'true') return false;
+  const now = dayjs().tz('America/Sao_Paulo');
+  const day = now.day(); // 0 = Domingo, 6 = Sábado
+  if (day === 0 || day === 6) return false;
+  return now.hour() === Number(DAILY_SUMMARY_HOUR) && now.minute() === Number(DAILY_SUMMARY_MINUTE);
+}
+
+function getNextBusinessSummaryDateString() {
+  let target = dayjs().tz('America/Sao_Paulo');
+  // Se hoje for sexta (5), soma 3 dias para ir pra segunda-feira. Se não, soma 1.
+  if (target.day() === 5) {
+    target = target.add(3, 'day');
+  } else {
+    target = target.add(1, 'day');
+  }
+  return target.format('YYYY-MM-DD');
+}
+
 // ---------------------------------------------------------
 // 4. MATTERMOST E REDMINE (API)
 // ---------------------------------------------------------
@@ -212,7 +232,7 @@ async function deleteGoogleMeet(issueId) {
       await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
     }
   } catch (error) {
-    // Ignora erros de "já deletado" no Google
+    // Ignora
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
@@ -289,9 +309,7 @@ async function processGoogleMeet(issue) {
     await redisSet(`redmine:meet:event:${issue.id}`, event.id);
     await redisSetAdd('redmine:meet:issues', String(issue.id));
     await redisSet(signatureKey, signature);
-  } catch (error) {
-    console.error(`[ERRO CALENDÁRIO] Falha #${issue.id}:`, error.message);
-  }
+  } catch (error) {}
 }
 
 // ---------------------------------------------------------
@@ -314,6 +332,16 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
     `**Projeto:** ${issue.project?.name || ''}`, `**Assunto:** ${issue.subject}`, `**Horário:** ${timeLabel}`,
     meetLink ? `**Link do Google Meet:** ${meetLink}` : null, ``, `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
+}
+
+async function buildDailySummaryLine(issue) {
+  const projectName = await getMeetProjectName(issue);
+  const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME) || '';
+  const meetLink = getCustomFieldValue(issue, 'Google Meet');
+  return {
+    sort: `${issue.start_date || issue.due_date || ''} ${horario}`,
+    text: `- **${horario}**: #${issue.id} - ${projectName} - ${issue.subject}${meetLink ? ` *(Meet: ${meetLink})*` : ''}`
+  };
 }
 
 async function checkAppointmentAlert(issue) {
@@ -362,17 +390,21 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 7. FUNÇÕES DE POLLING (SECA)
+// 7. POLLING DE ATUALIZAÇÕES
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
+async function fetchRecentIssues() {
+  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+    headers: redmineHeaders,
+    params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
+  });
+  return response.data.issues || [];
+}
+
 async function pollingRedmineIssues() {
   try {
-    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-      headers: redmineHeaders,
-      params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
-    });
-    const issues = response.data.issues || [];
+    const issues = await fetchRecentIssues();
     
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
@@ -398,6 +430,9 @@ async function pollingRedmineIssues() {
   } catch (error) {}
 }
 
+// ---------------------------------------------------------
+// 8. POLLING DE ALERTAS DE HORÁRIO
+// ---------------------------------------------------------
 async function fetchIssuesByDate(dateStr) {
   const response = await axios.get(`${REDMINE_URL}/issues.json`, {
     headers: redmineHeaders,
@@ -421,6 +456,65 @@ async function pollingAppointmentAlerts() {
   } catch (error) {}
 }
 
+// ---------------------------------------------------------
+// 9. RESUMO DIÁRIO E FAXINA
+// ---------------------------------------------------------
+async function processDailySummary() {
+  if (!isDailySummaryTime()) return;
+
+  const targetDate = getNextBusinessSummaryDateString();
+  const summaryKey = `redmine:daily-summary:${targetDate}`;
+
+  if (await wasAlreadyNotified(summaryKey)) return;
+  console.log(`[RESUMO DIÁRIO] Iniciando geração do resumo para o dia ${targetDate}...`);
+
+  try {
+    const issueSummaries = await fetchIssuesByDate(targetDate);
+    const groupedByEmail = new Map();
+
+    for (const issueSummary of issueSummaries) {
+      if (shouldIgnoreIssueByStatus(issueSummary)) continue;
+
+      const issue = await fetchIssueDetails(issueSummary.id);
+      const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
+      if (!horario) continue;
+
+      const targets = await getResponsibleTargets(issue);
+      if (!targets.length) continue;
+
+      const line = await buildDailySummaryLine(issue);
+
+      for (const target of targets) {
+        if (!groupedByEmail.has(target.email)) {
+          groupedByEmail.set(target.email, { target, lines: [] });
+        }
+        groupedByEmail.get(target.email).lines.push(line);
+      }
+    }
+
+    if (groupedByEmail.size === 0) {
+      console.log(`[RESUMO DIÁRIO] Nenhuma tarefa com horário encontrada para ${targetDate}.`);
+    }
+
+    for (const { target, lines } of groupedByEmail.values()) {
+      lines.sort((a, b) => a.sort.localeCompare(b.sort));
+      
+      const message = [
+        `### 📅 Resumo de Compromissos (Próximo Dia Útil)`, ``,
+        `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`, ``,
+        ...lines.map(l => l.text)
+      ].join('\n');
+
+      await notifyTargets([target], message);
+      console.log(`[RESUMO DIÁRIO] Enviado com sucesso para ${target.email}`);
+    }
+
+    await markAsNotified(summaryKey);
+  } catch (error) {
+    console.error(`[ERRO RESUMO DIÁRIO]:`, error.message);
+  }
+}
+
 async function reconcileDeletedMeets() {
   try {
     const meetIssueIds = await redisSetMembers('redmine:meet:issues');
@@ -428,9 +522,7 @@ async function reconcileDeletedMeets() {
       try {
         await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders });
       } catch (err) {
-        if (err.response?.status === 404) {
-          await deleteGoogleMeet(issueId);
-        }
+        if (err.response?.status === 404) await deleteGoogleMeet(issueId);
       }
     }
   } catch (error) {}
@@ -445,54 +537,37 @@ async function fetchIssueDetails(issueId) {
 }
 
 // ---------------------------------------------------------
-// 10. SMART SCHEDULER & SERVIDOR (A MÁGICA DE ECONOMIA)
+// 10. SMART SCHEDULER & SERVIDOR
 // ---------------------------------------------------------
-
-// Função que olha para o relógio e decide o intervalo ideal
 function getDynamicInterval(baseIntervalSeconds) {
   const now = dayjs().tz('America/Sao_Paulo');
-  const day = now.day(); // 0 = Domingo, 6 = Sábado
+  const day = now.day();
   const hour = now.hour();
   const minute = now.minute();
 
   const ONE_HOUR_MS = 60 * 60 * 1000;
-  const LUNCH_BREAK_MS = 5 * 60 * 1000; // <-- ALTERADO PARA 5 MINUTOS
+  const LUNCH_BREAK_MS = 5 * 60 * 1000;
   const BASE_MS = Number(baseIntervalSeconds) * 1000;
 
-  // 1. Finais de semana (1h)
   if (day === 0 || day === 6) return ONE_HOUR_MS;
-
-  // 2. Madrugada e Noite: 00h às 07h59 e 19h às 23h59 (1h)
   if (hour < 8 || hour >= 19) return ONE_HOUR_MS;
-
-  // 3. Pausa do Almoço: 12h às 13h29 (5 minutos)
   if (hour === 12 || (hour === 13 && minute < 30)) return LUNCH_BREAK_MS;
 
-  // 4. Horário Comercial: 08h às 11h59 e 13h30 às 18h59 (Usa o valor do .env)
   return BASE_MS;
 }
 
-// Motor que executa a tarefa e recalcula o tempo até a próxima
 function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
   async function run() {
-    try {
-      await taskFn();
-    } catch (err) {
-      console.error(`[ERRO] Falha no ${taskName}:`, err.message);
-    } finally {
+    try { await taskFn(); } catch (err) {} 
+    finally {
       const nextInterval = getDynamicInterval(baseIntervalSeconds);
-      
-      // Loga de forma amigável quando entra em modo de economia
       if (nextInterval > (baseIntervalSeconds * 1000)) {
         const nextTime = dayjs().add(nextInterval, 'ms').tz('America/Sao_Paulo').format('HH:mm:ss');
-        console.log(`[MODO ECONOMIA] ${taskName} em repouso. Próxima checagem: ${nextTime}`);
+        console.log(`[MODO ECONOMIA] ${taskName} dormindo até ${nextTime}`);
       }
-
       setTimeout(run, nextInterval);
     }
   }
-  
-  // Dá um respiro de 5 segundos ao iniciar o servidor e dá o primeiro gatilho
   setTimeout(run, 5000);
 }
 
@@ -501,23 +576,23 @@ const app = express();
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
+  await processDailySummary(); // Força o resumo manual (só roda se for no horário exato)
   await reconcileDeletedMeets();
-  res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
+  res.json({ success: true, message: 'Processo forçado.' });
 });
 
-app.get('/', (req, res) => {
-  res.send('API Bot - Agendador Inteligente Ativado.');
-});
+app.get('/', (req, res) => { res.send('API Bot - Resumo Diário Restaurado.'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
   
   if (String(POLLING_ENABLED) === 'true') {
-    // Liga o Agendador Inteligente para Atualizações e Alertas
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Polling de Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Polling de Alertas');
-    
-    // A Faxina de deletados sempre roda de 15 em 15 mins (Mas entra em repouso de 1h junto com os outros)
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina de Excluídos');
+
+    // MÁGICA DO RESUMO DIÁRIO: Roda de 60 em 60 segundos independente do Modo Economia
+    // Como ele só lê o horário do relógio, custa 0 processamento/memória testar isso.
+    setInterval(processDailySummary, 60000);
   }
 });
