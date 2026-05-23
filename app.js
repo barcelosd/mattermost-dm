@@ -171,7 +171,6 @@ async function notifyTargets(targets, message) {
       if (mmUser.delete_at && mmUser.delete_at > 0) continue;
       const channel = await createDirectChannel(botUser.id, mmUser.id);
       await sendMattermostMessage(channel.id, message);
-      console.log(`[SUCESSO] Mensagem Mattermost enviada para ${target.email}`);
     } catch (error) {}
   }
 }
@@ -199,7 +198,6 @@ async function findGoogleEventForIssue(calendar, issueId) {
 }
 function extractMeetLink(event) { return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null; }
 
-// OTIMIZAÇÃO CRÍTICA: Garante a exclusão do Meet e limpa o Redis em qualquer situação
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
   const calendar = getGoogleCalendarClient();
@@ -212,18 +210,10 @@ async function deleteGoogleMeet(issueId) {
     }
     if (eventId) {
       await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
-      console.log(`[CALENDÁRIO] Meet excluído com sucesso para a tarefa #${issueId}.`);
-    } else {
-      console.log(`[CALENDÁRIO] Nenhum evento pendente no Google Calendar para a tarefa #${issueId}.`);
     }
   } catch (error) {
-    if (error.response?.status === 404 || error.response?.status === 410) {
-      console.log(`[CALENDÁRIO] O evento para #${issueId} já havia sido removido manualmente do Google.`);
-    } else {
-      console.error(`[ERRO CALENDÁRIO] Falha ao remover evento #${issueId}:`, error.message);
-    }
+    // Ignora erros de "já deletado" no Google
   } finally {
-    // Bloco Executado Sempre: Evita que tarefas deletadas fiquem presas no cache gerando loops
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
     await redisDel(`redmine:meet:link:${issueId}`);
@@ -238,7 +228,6 @@ async function processGoogleMeet(issue) {
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
-  // Se perdeu qualquer uma das condições obrigatórias, remove do calendário imediatamente
   if (!isMeet || !appointment || !estimatedMinutes) {
     await deleteGoogleMeet(issue.id);
     return;
@@ -252,6 +241,7 @@ async function processGoogleMeet(issue) {
   
   const signatureKey = `redmine:meet:signature:${issue.id}`;
   const oldSignature = await redisGet(signatureKey);
+  
   const calendar = getGoogleCalendarClient();
   let eventId = await redisGet(`redmine:meet:event:${issue.id}`);
   let event = null;
@@ -283,14 +273,12 @@ async function processGoogleMeet(issue) {
     if (eventId) {
       const response = await calendar.events.patch({ calendarId: GOOGLE_CALENDAR_ID, eventId, conferenceDataVersion: 1, requestBody });
       event = response.data;
-      console.log(`[SUCESSO] Agenda do Meet atualizada para issue #${issue.id}`);
     } else {
       const response = await calendar.events.insert({
         calendarId: GOOGLE_CALENDAR_ID, conferenceDataVersion: 1,
         requestBody: { ...requestBody, conferenceData: { createRequest: { requestId: `redmine-${issue.id}-${Date.now()}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } } }
       });
       event = response.data;
-      console.log(`[SUCESSO] Agenda do Meet criada para issue #${issue.id}`);
     }
 
     const meetLink = extractMeetLink(event);
@@ -302,7 +290,7 @@ async function processGoogleMeet(issue) {
     await redisSetAdd('redmine:meet:issues', String(issue.id));
     await redisSet(signatureKey, signature);
   } catch (error) {
-    console.error(`[ERRO] Falha ao criar/atualizar no Google Calendar para #${issue.id}:`, error.response?.data || error.message);
+    console.error(`[ERRO CALENDÁRIO] Falha #${issue.id}:`, error.message);
   }
 }
 
@@ -347,14 +335,12 @@ async function checkAppointmentAlert(issue) {
 
     const targets = await getResponsibleTargets(issue);
     if (!targets.length) {
-      console.log(`[RAIO-X ALERTA] Alerta de ${alertMinutes}m cancelado para #${issue.id} (sem responsáveis).`);
       await markAppointmentAlertSent(alertKey); 
       continue;
     }
 
     const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     await notifyTargets(targets, message);
-    console.log(`[ALERTA ENVIADO] Lembrete de ${alertMinutes} min disparado no Mattermost para issue #${issue.id}!`);
     await markAppointmentAlertSent(alertKey);
   }
 }
@@ -376,22 +362,17 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 7. POLLING DE ATUALIZAÇÕES
+// 7. FUNÇÕES DE POLLING (SECA)
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
-async function fetchRecentIssues() {
-  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-    headers: redmineHeaders,
-    params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
-  });
-  return response.data.issues || [];
-}
-
 async function pollingRedmineIssues() {
-  console.log(`[${dayjs().format('HH:mm:ss')}] Iniciando Polling de Tarefas Atualizadas...`);
   try {
-    const issues = await fetchRecentIssues();
+    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+      headers: redmineHeaders,
+      params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
+    });
+    const issues = response.data.issues || [];
     
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
@@ -407,56 +388,52 @@ async function pollingRedmineIssues() {
         const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
         
         if (!(await wasAlreadyNotified(eventKey))) {
-          await processIssueNotification(issueWithUrl, 'Atualização (via Polling)', 'Polling', lastJournal);
+          await processIssueNotification(issueWithUrl, 'Atualização', 'Polling', lastJournal);
         }
       } catch (errorIssue) {
-        if (errorIssue.response?.status === 404) {
-          await deleteGoogleMeet(issueSummary.id);
-        }
+        if (errorIssue.response?.status === 404) await deleteGoogleMeet(issueSummary.id);
       }
     }
     lastPollingTimestamp = Date.now();
   } catch (error) {}
 }
 
-// ---------------------------------------------------------
-// 8. POLLING DE ALERTAS DE HORÁRIO (COM CORREÇÃO DE EXCLUSÃO)
-// ---------------------------------------------------------
+async function fetchIssuesByDate(dateStr) {
+  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+    headers: redmineHeaders,
+    params: { status_id: '*', sort: 'start_date:asc', limit: 100 }
+  });
+  return (response.data.issues || []).filter(issue => issue.start_date === dateStr || issue.due_date === dateStr);
+}
+
 async function pollingAppointmentAlerts() {
   try {
-    const meetIssueIds = await redisSetMembers('redmine:meet:issues');
-    
-    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-      headers: redmineHeaders,
-      params: { status_id: 'open', sort: 'updated_on:desc', limit: 20 }
-    });
-    const recentIssues = response.data.issues || [];
-    
-    const issuesToCheck = new Set(meetIssueIds);
-    recentIssues.forEach(i => issuesToCheck.add(String(i.id)));
+    const today = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
+    const issues = await fetchIssuesByDate(today);
 
-    for (const issueId of issuesToCheck) {
+    for (const issueSummary of issues) {
       try {
-        const issue = await fetchIssueDetails(issueId);
+        const issue = await fetchIssueDetails(issueSummary.id);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
-        
-        // CORREÇÃO: Força a reavaliação das condições. Se perdeu horário/status, limpa o calendário
-        await processGoogleMeet(issueWithUrl);
         await checkAppointmentAlert(issueWithUrl);
-        
+      } catch (err) {}
+    }
+  } catch (error) {}
+}
+
+async function reconcileDeletedMeets() {
+  try {
+    const meetIssueIds = await redisSetMembers('redmine:meet:issues');
+    for (const issueId of meetIssueIds) {
+      try {
+        await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders });
       } catch (err) {
-        // CORREÇÃO DO ERRO 404: Se a tarefa sumiu do Redmine, limpa o Google Calendar imediatamente!
         if (err.response?.status === 404) {
-          console.log(`[RAIO-X] Identificado que a tarefa #${issueId} foi removida do Redmine. Deletando Meet correspondente...`);
           await deleteGoogleMeet(issueId);
-        } else {
-          console.error(`[ERRO] Falha verificando alerta da tarefa #${issueId}:`, err.message);
         }
       }
     }
-  } catch (error) {
-    console.error('[ERRO FATAL] Falha geral na rotina de alertas:', error.message);
-  }
+  } catch (error) {}
 }
 
 async function fetchIssueDetails(issueId) {
@@ -468,28 +445,79 @@ async function fetchIssueDetails(issueId) {
 }
 
 // ---------------------------------------------------------
-// 9. SERVIDOR
+// 10. SMART SCHEDULER & SERVIDOR (A MÁGICA DE ECONOMIA)
 // ---------------------------------------------------------
+
+// Função que olha para o relógio e decide o intervalo ideal
+function getDynamicInterval(baseIntervalSeconds) {
+  const now = dayjs().tz('America/Sao_Paulo');
+  const day = now.day(); // 0 = Domingo, 6 = Sábado
+  const hour = now.hour();
+  const minute = now.minute();
+
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const LUNCH_BREAK_MS = 5 * 60 * 1000; // <-- ALTERADO PARA 5 MINUTOS
+  const BASE_MS = Number(baseIntervalSeconds) * 1000;
+
+  // 1. Finais de semana (1h)
+  if (day === 0 || day === 6) return ONE_HOUR_MS;
+
+  // 2. Madrugada e Noite: 00h às 07h59 e 19h às 23h59 (1h)
+  if (hour < 8 || hour >= 19) return ONE_HOUR_MS;
+
+  // 3. Pausa do Almoço: 12h às 13h29 (5 minutos)
+  if (hour === 12 || (hour === 13 && minute < 30)) return LUNCH_BREAK_MS;
+
+  // 4. Horário Comercial: 08h às 11h59 e 13h30 às 18h59 (Usa o valor do .env)
+  return BASE_MS;
+}
+
+// Motor que executa a tarefa e recalcula o tempo até a próxima
+function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
+  async function run() {
+    try {
+      await taskFn();
+    } catch (err) {
+      console.error(`[ERRO] Falha no ${taskName}:`, err.message);
+    } finally {
+      const nextInterval = getDynamicInterval(baseIntervalSeconds);
+      
+      // Loga de forma amigável quando entra em modo de economia
+      if (nextInterval > (baseIntervalSeconds * 1000)) {
+        const nextTime = dayjs().add(nextInterval, 'ms').tz('America/Sao_Paulo').format('HH:mm:ss');
+        console.log(`[MODO ECONOMIA] ${taskName} em repouso. Próxima checagem: ${nextTime}`);
+      }
+
+      setTimeout(run, nextInterval);
+    }
+  }
+  
+  // Dá um respiro de 5 segundos ao iniciar o servidor e dá o primeiro gatilho
+  setTimeout(run, 5000);
+}
+
 const app = express();
 
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
-  res.json({ success: true, message: 'Pollling de atualizações e alertas forçados.' });
+  await reconcileDeletedMeets();
+  res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
 app.get('/', (req, res) => {
-  res.send('API Bot funcionando via Polling duplo (Atualizações e Alertas).');
+  res.send('API Bot - Agendador Inteligente Ativado.');
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}. Ciclos de polling ativados (a cada 60s).`);
+  console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
   
   if (String(POLLING_ENABLED) === 'true') {
-    setTimeout(pollingRedmineIssues, 5000);
-    setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
+    // Liga o Agendador Inteligente para Atualizações e Alertas
+    startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Polling de Atualizações');
+    startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Polling de Alertas');
     
-    setTimeout(pollingAppointmentAlerts, 10000);
-    setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
+    // A Faxina de deletados sempre roda de 15 em 15 mins (Mas entra em repouso de 1h junto com os outros)
+    startSmartPolling(reconcileDeletedMeets, 900, 'Faxina de Excluídos');
   }
 });
