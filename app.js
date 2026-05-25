@@ -108,18 +108,16 @@ function getEstimatedMinutes(issue) {
   return (!hours || Number.isNaN(hours)) ? null : Math.round(hours * 60);
 }
 
-// Lógica de tempo para o Resumo Diário
 function isDailySummaryTime() {
   if (DAILY_SUMMARY_ENABLED !== 'true') return false;
   const now = dayjs().tz('America/Sao_Paulo');
-  const day = now.day(); // 0 = Domingo, 6 = Sábado
+  const day = now.day(); 
   if (day === 0 || day === 6) return false;
   return now.hour() === Number(DAILY_SUMMARY_HOUR) && now.minute() === Number(DAILY_SUMMARY_MINUTE);
 }
 
 function getNextBusinessSummaryDateString() {
   let target = dayjs().tz('America/Sao_Paulo');
-  // Se hoje for sexta (5), soma 3 dias para ir pra segunda-feira. Se não, soma 1.
   if (target.day() === 5) {
     target = target.add(3, 'day');
   } else {
@@ -369,6 +367,7 @@ async function checkAppointmentAlert(issue) {
 
     const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     await notifyTargets(targets, message);
+    console.log(`[ALERTA ENVIADO] Lembrete de ${alertMinutes} min disparado no Mattermost para issue #${issue.id}!`);
     await markAppointmentAlertSent(alertKey);
   }
 }
@@ -390,7 +389,7 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 7. POLLING DE ATUALIZAÇÕES
+// 7. POLLING DE ATUALIZAÇÕES E BUSCAS DE API
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
@@ -430,15 +429,28 @@ async function pollingRedmineIssues() {
   } catch (error) {}
 }
 
-// ---------------------------------------------------------
-// 8. POLLING DE ALERTAS DE HORÁRIO
-// ---------------------------------------------------------
+// CORREÇÃO CRÍTICA: Filtra direto na API pela data exata para não cair no limite de 100 antigas
 async function fetchIssuesByDate(dateStr) {
-  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-    headers: redmineHeaders,
-    params: { status_id: '*', sort: 'start_date:asc', limit: 100 }
-  });
-  return (response.data.issues || []).filter(issue => issue.start_date === dateStr || issue.due_date === dateStr);
+  try {
+    const [resStart, resDue] = await Promise.all([
+      axios.get(`${REDMINE_URL}/issues.json`, {
+        headers: redmineHeaders,
+        params: { status_id: '*', start_date: dateStr, limit: 100 }
+      }).catch(() => ({ data: { issues: [] } })),
+      
+      axios.get(`${REDMINE_URL}/issues.json`, {
+        headers: redmineHeaders,
+        params: { status_id: '*', due_date: dateStr, limit: 100 }
+      }).catch(() => ({ data: { issues: [] } }))
+    ]);
+
+    const combined = [...(resStart.data.issues || []), ...(resDue.data.issues || [])];
+    const unique = Array.from(new Map(combined.map(i => [i.id, i])).values());
+    
+    return unique;
+  } catch (error) {
+    return [];
+  }
 }
 
 async function pollingAppointmentAlerts() {
@@ -466,7 +478,6 @@ async function processDailySummary() {
   const summaryKey = `redmine:daily-summary:${targetDate}`;
 
   if (await wasAlreadyNotified(summaryKey)) return;
-  console.log(`[RESUMO DIÁRIO] Iniciando geração do resumo para o dia ${targetDate}...`);
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
@@ -492,13 +503,8 @@ async function processDailySummary() {
       }
     }
 
-    if (groupedByEmail.size === 0) {
-      console.log(`[RESUMO DIÁRIO] Nenhuma tarefa com horário encontrada para ${targetDate}.`);
-    }
-
     for (const { target, lines } of groupedByEmail.values()) {
       lines.sort((a, b) => a.sort.localeCompare(b.sort));
-      
       const message = [
         `### 📅 Resumo de Compromissos (Próximo Dia Útil)`, ``,
         `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`, ``,
@@ -510,9 +516,7 @@ async function processDailySummary() {
     }
 
     await markAsNotified(summaryKey);
-  } catch (error) {
-    console.error(`[ERRO RESUMO DIÁRIO]:`, error.message);
-  }
+  } catch (error) {}
 }
 
 async function reconcileDeletedMeets() {
@@ -537,23 +541,50 @@ async function fetchIssueDetails(issueId) {
 }
 
 // ---------------------------------------------------------
-// 10. SMART SCHEDULER & SERVIDOR
+// 10. SMART SCHEDULER (COM CORTE PRECISO DE HORÁRIO)
 // ---------------------------------------------------------
 function getDynamicInterval(baseIntervalSeconds) {
   const now = dayjs().tz('America/Sao_Paulo');
   const day = now.day();
   const hour = now.hour();
   const minute = now.minute();
+  const second = now.second();
+  const msSinceMidnight = (hour * 3600 + minute * 60 + second) * 1000;
 
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const LUNCH_BREAK_MS = 5 * 60 * 1000;
   const BASE_MS = Number(baseIntervalSeconds) * 1000;
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
-  if (hour < 8 || hour >= 19) return ONE_HOUR_MS;
-  if (hour === 12 || (hour === 13 && minute < 30)) return LUNCH_BREAK_MS;
 
-  return BASE_MS;
+  // Marcos de horários de expediente (em milissegundos)
+  const shift1Start = 8 * 3600 * 1000;       // 08:00
+  const shift1End = 12 * 3600 * 1000;        // 12:00
+  const shift2Start = 13.5 * 3600 * 1000;    // 13:30
+  const shift2End = 19 * 3600 * 1000;        // 19:00
+
+  let targetInterval = BASE_MS;
+
+  // Define o sono inicial (fora de hora = 1h | Almoço = 5m)
+  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
+    targetInterval = ONE_HOUR_MS;
+  } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
+    targetInterval = LUNCH_BREAK_MS;
+  }
+
+  // A MÁGICA: Corta o sono exatamente no segundo que o turno recomeça!
+  const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
+  for (const boundary of boundaries) {
+    if (msSinceMidnight < boundary) {
+      const msUntilBoundary = boundary - msSinceMidnight;
+      if (targetInterval > msUntilBoundary) {
+        targetInterval = msUntilBoundary; // "Acorde exatamente nesta hora"
+      }
+      break; 
+    }
+  }
+
+  return Math.max(targetInterval, BASE_MS);
 }
 
 function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
@@ -563,7 +594,7 @@ function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
       const nextInterval = getDynamicInterval(baseIntervalSeconds);
       if (nextInterval > (baseIntervalSeconds * 1000)) {
         const nextTime = dayjs().add(nextInterval, 'ms').tz('America/Sao_Paulo').format('HH:mm:ss');
-        console.log(`[MODO ECONOMIA] ${taskName} dormindo até ${nextTime}`);
+        console.log(`[ECONOMIA] ${taskName} em repouso. Desperta pontualmente às ${nextTime}`);
       }
       setTimeout(run, nextInterval);
     }
@@ -576,23 +607,22 @@ const app = express();
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
-  await processDailySummary(); // Força o resumo manual (só roda se for no horário exato)
+  await processDailySummary(); 
   await reconcileDeletedMeets();
-  res.json({ success: true, message: 'Processo forçado.' });
+  res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Resumo Diário Restaurado.'); });
+app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima Ativada.'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
   
   if (String(POLLING_ENABLED) === 'true') {
-    startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Polling de Atualizações');
-    startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Polling de Alertas');
-    startSmartPolling(reconcileDeletedMeets, 900, 'Faxina de Excluídos');
+    startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
+    startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
+    startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
 
-    // MÁGICA DO RESUMO DIÁRIO: Roda de 60 em 60 segundos independente do Modo Economia
-    // Como ele só lê o horário do relógio, custa 0 processamento/memória testar isso.
+    // Resumo Diário é barato e deve olhar o relógio a cada minuto, independente do modo economia
     setInterval(processDailySummary, 60000);
   }
 });
