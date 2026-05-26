@@ -9,13 +9,9 @@ const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 
-// Ferramentas do sistema para apagar arquivos de trava
-const fs = require('fs');
-const path = require('path');
-
-// Importações do WhatsApp
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+// Importações do NOVO Motor do WhatsApp (Mais leve, sem Chrome)
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -44,93 +40,67 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP (COM ANTITRAVA FORÇA BRUTA)
+// 1.5 INICIALIZAÇÃO DO WHATSAPP (VIA SOCKETS - LEVE)
 // ---------------------------------------------------------
+let waSocket = null;
 
-// Função que varre o disco e apaga travas fantasmas à força
-function clearChromeLocks() {
-  const basePath = '/opt/render/project/src/.wwebjs_auth';
+async function initWhatsApp() {
+  // Aproveitamos a mesma pasta do disco do Render
+  const { state, saveCreds } = await useMultiFileAuthState('/opt/render/project/src/.wwebjs_auth');
   
-  // Se a pasta base ainda não existir, não faz nada
-  if (!fs.existsSync(basePath)) return;
+  waSocket = makeWASocket({
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: 'silent' }), // Desliga os logs internos chatos para economizar memória
+    browser: ["Bot NewNorte", "Chrome", "1.0.0"]
+  });
 
-  const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
-
-  function cleanLocks(dir) {
-    try {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const fullPath = path.join(dir, file);
-        try {
-          // lstatSync consegue ler atalhos quebrados (symlinks)
-          const stat = fs.lstatSync(fullPath);
-          if (stat.isDirectory()) {
-            cleanLocks(fullPath); // Entra nas subpastas
-          } else if (lockFiles.includes(file)) {
-            // Remove na força bruta!
-            fs.rmSync(fullPath, { force: true });
-            console.log(`[SISTEMA] Trava fantasma removida: ${fullPath}`);
-          }
-        } catch (e) {}
+  waSocket.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+    
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      if (shouldReconnect) {
+        console.log('[WHATSAPP] Conexão caiu. Reconectando levemente...');
+        initWhatsApp();
+      } else {
+        console.log('[WHATSAPP] Desconectado permanentemente (Logout).');
       }
-    } catch (err) {}
-  }
+    } else if (connection === 'open') {
+      console.log('[WHATSAPP] Conectado com sucesso via WebSockets!');
+    }
+  });
 
-  console.log('[SISTEMA] Varrendo disco em busca de travas antigas do Chrome...');
-  cleanLocks(basePath);
+  // Salva as credenciais no disco automaticamente
+  waSocket.ev.on('creds.update', saveCreds);
+
+  // Escuta os comandos (como o !id)
+  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message) return;
+    
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+    const comando = text?.trim().toLowerCase();
+
+    if (comando === '!id') {
+      try {
+        const chatId = msg.key.remoteJid;
+        await waSocket.sendMessage(chatId, { 
+          text: `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chatId}*\n\n_Copie esse código inteiro e cole no Redmine._` 
+        });
+      } catch (error) {
+        console.error('[ERRO WHATSAPP] Falha ao enviar ID:', error.message);
+      }
+    }
+  });
 }
 
-const whatsappClient = new Client({
-  authStrategy: new LocalAuth({ dataPath: '/opt/render/project/src/.wwebjs_auth' }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox', 
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',       // <- MÁGICA 1: Desliga o pré-carregamento de processos
-      '--single-process'   // <- MÁGICA 2: Força o Chrome a rodar em 1 única thread
-    ]
-  }
-});
-
-whatsappClient.on('qr', (qr) => {
-  console.log('\n==================================================');
-  console.log('[WHATSAPP] Escaneie o QR Code abaixo com o seu celular:');
-  qrcode.generate(qr, { small: true });
-  console.log('==================================================\n');
-});
-
-whatsappClient.on('ready', () => {
-  console.log('[WHATSAPP] Conectado e pronto para disparar mensagens!');
-});
-
-whatsappClient.on('message_create', async msg => {
-  const comando = msg.body.trim().toLowerCase();
-
-  if (comando === '!id') {
-    try {
-      const chat = await msg.getChat();
-      await msg.reply(
-        `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chat.id._serialized}*\n\n_Copie esse código inteiro e cole no Redmine._`
-      );
-    } catch (error) {
-      console.error('[ERRO WHATSAPP] Falha ao buscar ID do chat:', error.message);
-    }
-  }
-});
-
-// A mágica acontece aqui: Limpa a sujeira ANTES de iniciar o WhatsApp
-clearChromeLocks();
-whatsappClient.initialize();
-
-
+// Inicia o serviço
+initWhatsApp();
 
 // ---------------------------------------------------------
-// 2. CACHE
+// 2. CACHE E REDIS
 // ---------------------------------------------------------
 const redis = REDIS_URL ? new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableReadyCheck: false }) : null;
 const memory = { values: new Map(), meetIssues: new Set(), notified: new Set(), alerts: new Set() };
@@ -315,7 +285,6 @@ async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
   const calendar = getGoogleCalendarClient();
   let eventId = await redisGet(`redmine:meet:event:${issueId}`);
-  
   try {
     if (!eventId) {
       const event = await findGoogleEventForIssue(calendar, issueId);
@@ -325,7 +294,6 @@ async function deleteGoogleMeet(issueId) {
       await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
     }
   } catch (error) {
-    // Ignora
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
@@ -336,7 +304,6 @@ async function deleteGoogleMeet(issueId) {
 
 async function processGoogleMeet(issue) {
   if (!googleCalendarIsConfigured()) return;
-  
   const isMeet = isMeetStatus(issue);
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
@@ -354,7 +321,6 @@ async function processGoogleMeet(issue) {
   
   const signatureKey = `redmine:meet:signature:${issue.id}`;
   const oldSignature = await redisGet(signatureKey);
-  
   const calendar = getGoogleCalendarClient();
   let eventId = await redisGet(`redmine:meet:event:${issue.id}`);
   let event = null;
@@ -393,7 +359,6 @@ async function processGoogleMeet(issue) {
       });
       event = response.data;
     }
-
     const meetLink = extractMeetLink(event);
     if (meetLink) {
       await updateRedmineCustomField(issue, 'Google Meet', meetLink);
@@ -474,8 +439,8 @@ async function checkAppointmentAlert(issue) {
       await notifyTargets(targets, message);
     }
 
-    // 2. Notifica no WhatsApp
-    if (whatsappClient.info) {
+    // 2. Notifica no WhatsApp via WebSockets
+    if (waSocket) {
       const project = await getRedmineProject(issue.project?.id);
       const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
       
@@ -483,7 +448,9 @@ async function checkAppointmentAlert(issue) {
         try {
           const cleanGroupId = String(groupId).trim();
           const whatsAppMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
-          await whatsappClient.sendMessage(cleanGroupId, whatsAppMsg);
+          
+          // O Baileys envia usando um objeto { text: ... }
+          await waSocket.sendMessage(cleanGroupId, { text: whatsAppMsg });
           console.log(`[WHATSAPP] Alerta de ${alertMinutes}m enviado para o grupo ${cleanGroupId}`);
         } catch (err) {
           console.error(`[ERRO WHATSAPP] Falha ao enviar para ${groupId}:`, err.message);
@@ -527,20 +494,15 @@ async function fetchRecentIssues() {
 async function pollingRedmineIssues() {
   try {
     const issues = await fetchRecentIssues();
-    
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
       if (updatedAt < lastPollingTimestamp) continue;
-      
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
-        
         await processGoogleMeet(issueWithUrl);
-
         const lastJournal = getLastJournal(issueWithUrl);
         const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
-        
         if (!(await wasAlreadyNotified(eventKey))) {
           await processIssueNotification(issueWithUrl, 'Atualização', 'Polling', lastJournal);
         }
@@ -555,20 +517,11 @@ async function pollingRedmineIssues() {
 async function fetchIssuesByDate(dateStr) {
   try {
     const [resStart, resDue] = await Promise.all([
-      axios.get(`${REDMINE_URL}/issues.json`, {
-        headers: redmineHeaders,
-        params: { status_id: '*', start_date: dateStr, limit: 100 }
-      }).catch(() => ({ data: { issues: [] } })),
-      
-      axios.get(`${REDMINE_URL}/issues.json`, {
-        headers: redmineHeaders,
-        params: { status_id: '*', due_date: dateStr, limit: 100 }
-      }).catch(() => ({ data: { issues: [] } }))
+      axios.get(`${REDMINE_URL}/issues.json`, { headers: redmineHeaders, params: { status_id: '*', start_date: dateStr, limit: 100 } }).catch(() => ({ data: { issues: [] } })),
+      axios.get(`${REDMINE_URL}/issues.json`, { headers: redmineHeaders, params: { status_id: '*', due_date: dateStr, limit: 100 } }).catch(() => ({ data: { issues: [] } }))
     ]);
-
     const combined = [...(resStart.data.issues || []), ...(resDue.data.issues || [])];
     const unique = Array.from(new Map(combined.map(i => [i.id, i])).values());
-    
     return unique;
   } catch (error) { return []; }
 }
@@ -577,7 +530,6 @@ async function pollingAppointmentAlerts() {
   try {
     const today = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
     const issues = await fetchIssuesByDate(today);
-
     for (const issueSummary of issues) {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
@@ -593,28 +545,21 @@ async function pollingAppointmentAlerts() {
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
-
   const targetDate = getNextBusinessSummaryDateString();
   const summaryKey = `redmine:daily-summary:${targetDate}`;
-
   if (await wasAlreadyNotified(summaryKey)) return;
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     const groupedByEmail = new Map();
-
     for (const issueSummary of issueSummaries) {
       if (shouldIgnoreIssueByStatus(issueSummary)) continue;
-
       const issue = await fetchIssueDetails(issueSummary.id);
       const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
       if (!horario) continue;
-
       const targets = await getResponsibleTargets(issue);
       if (!targets.length) continue;
-
       const line = await buildDailySummaryLine(issue);
-
       for (const target of targets) {
         if (!groupedByEmail.has(target.email)) {
           groupedByEmail.set(target.email, { target, lines: [] });
@@ -622,18 +567,11 @@ async function processDailySummary() {
         groupedByEmail.get(target.email).lines.push(line);
       }
     }
-
     for (const { target, lines } of groupedByEmail.values()) {
       lines.sort((a, b) => a.sort.localeCompare(b.sort));
-      const message = [
-        `### 📅 Resumo de Compromissos (Próximo Dia Útil)`, ``,
-        `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`, ``,
-        ...lines.map(l => l.text)
-      ].join('\n');
-
+      const message = [`### 📅 Resumo de Compromissos (Próximo Dia Útil)`, ``, `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`, ``, ...lines.map(l => l.text)].join('\n');
       await notifyTargets([target], message);
     }
-
     await markAsNotified(summaryKey);
   } catch (error) {}
 }
@@ -642,20 +580,14 @@ async function reconcileDeletedMeets() {
   try {
     const meetIssueIds = await redisSetMembers('redmine:meet:issues');
     for (const issueId of meetIssueIds) {
-      try {
-        await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders });
-      } catch (err) {
-        if (err.response?.status === 404) await deleteGoogleMeet(issueId);
-      }
+      try { await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders }); } 
+      catch (err) { if (err.response?.status === 404) await deleteGoogleMeet(issueId); }
     }
   } catch (error) {}
 }
 
 async function fetchIssueDetails(issueId) {
-  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, {
-    headers: redmineHeaders,
-    params: { include: 'journals' }
-  });
+  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders, params: { include: 'journals' } });
   return response.data.issue;
 }
 
@@ -676,31 +608,23 @@ function getDynamicInterval(baseIntervalSeconds) {
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
 
-  // Corte de horários para acordar sempre 15 min ANTES dos turnos de reuniões
-  const shift1Start = 7.75 * 3600 * 1000;    // 07:45
-  const shift1End = 12 * 3600 * 1000;        // 12:00
-  const shift2Start = 13.25 * 3600 * 1000;   // 13:15 
-  const shift2End = 19 * 3600 * 1000;        // 19:00 
+  const shift1Start = 7.75 * 3600 * 1000; 
+  const shift1End = 12 * 3600 * 1000;
+  const shift2Start = 13.25 * 3600 * 1000; 
+  const shift2End = 19 * 3600 * 1000; 
 
   let targetInterval = BASE_MS;
-
-  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
-    targetInterval = ONE_HOUR_MS;
-  } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
-    targetInterval = LUNCH_BREAK_MS;
-  }
+  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) { targetInterval = ONE_HOUR_MS; } 
+  else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) { targetInterval = LUNCH_BREAK_MS; }
 
   const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
   for (const boundary of boundaries) {
     if (msSinceMidnight < boundary) {
       const msUntilBoundary = boundary - msSinceMidnight;
-      if (targetInterval > msUntilBoundary) {
-        targetInterval = msUntilBoundary;
-      }
+      if (targetInterval > msUntilBoundary) targetInterval = msUntilBoundary;
       break; 
     }
   }
-
   return Math.max(targetInterval, BASE_MS);
 }
 
@@ -729,7 +653,7 @@ app.get('/polling-now', async (req, res) => {
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima e WhatsApp Ativos.'); });
+app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima e WhatsApp Ativos (Motor Leve).'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
@@ -738,8 +662,6 @@ app.listen(PORT, () => {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
-    
-    // Resumo Diário
     setInterval(processDailySummary, 60000);
   }
 });
