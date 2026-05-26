@@ -557,22 +557,22 @@ function getDynamicInterval(baseIntervalSeconds) {
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
 
-  // Marcos de horários de expediente (em milissegundos)
-  const shift1Start = 8 * 3600 * 1000;       // 08:00
-  const shift1End = 12 * 3600 * 1000;        // 12:00
-  const shift2Start = 13.5 * 3600 * 1000;    // 13:30
-  const shift2End = 19 * 3600 * 1000;        // 19:00
+  // CORREÇÃO: O bot acorda 15 minutos ANTES do turno para pegar os alertas!
+  const shift1Start = 7.75 * 3600 * 1000;    // 07:45 (Prepara para as reuniões das 08:00)
+  const shift1End = 12 * 3600 * 1000;        // 12:00 (Fim do turno da manhã)
+  const shift2Start = 13.25 * 3600 * 1000;   // 13:15 (Prepara para as reuniões das 13:30)
+  const shift2End = 19 * 3600 * 1000;        // 19:00 (Fim do expediente)
 
   let targetInterval = BASE_MS;
 
-  // Define o sono inicial (fora de hora = 1h | Almoço = 5m)
+  // Define o sono inicial
   if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
     targetInterval = ONE_HOUR_MS;
   } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
     targetInterval = LUNCH_BREAK_MS;
   }
 
-  // A MÁGICA: Corta o sono exatamente no segundo que o turno recomeça!
+  // Corta o sono exatamente no segundo que o turno recomeça!
   const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
   for (const boundary of boundaries) {
     if (msSinceMidnight < boundary) {
