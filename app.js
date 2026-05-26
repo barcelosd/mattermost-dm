@@ -406,24 +406,46 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   
-  // Cabeçalho profissional e amigável para o cliente (Sem jargões técnicos)
+  // Tratamento para o campo multi-seleção "Público Alvo"
+  const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
+  let publicoAlvoText = '';
+  
+  if (publicoAlvoRaw) {
+    if (Array.isArray(publicoAlvoRaw)) {
+      // Se for um array (múltiplas seleções), remove itens vazios e junta com " / "
+      publicoAlvoText = publicoAlvoRaw.filter(Boolean).join(' / ');
+    } else {
+      // Se por acaso vier como string única, apenas limpa os espaços
+      publicoAlvoText = String(publicoAlvoRaw).trim();
+    }
+  }
+
+  // Cabeçalho profissional e amigável para o cliente
   let msg = `🔔 *Lembrete de Compromisso | NewNorte*\n\n`;
   msg += `Olá! Passando para lembrar que a nossa reunião começará em *${alertMinutes} minutos*.\n\n`;
   
-  // Informações limpas e essenciais para o cliente
-  msg += `📌 *Pauta:* ${issue.subject}\n`;
+  // Informações da reunião (Pauta alterada para Assunto)
+  msg += `📌 *Assunto:* ${issue.subject}\n`;
+  
+  // Exibe o Público Alvo logo abaixo do Assunto (se o campo estiver preenchido)
+  if (publicoAlvoText) {
+    msg += `👥 *Público Alvo:* ${publicoAlvoText}\n`;
+  }
+  
   msg += `⏰ *Horário:* ${timeLabel}\n`;
   
-  // Link direto para a reunião (Se houver)
+  // Link do Meet destacado para o cliente entrar direto
   if (meetLink) {
     msg += `\n💻 *Para entrar na sala virtual, clique no link abaixo:*\n👉 ${meetLink}\n`;
   }
   
-  // Fechamento humanizado
-  msg += `\nEstamos te aguardando. Até já! 🚀`;
+  msg += `\nEstamos te aguardando. Até já! 🚀\n\n`;
   
-  // Apenas texto puro no rodapé para identificação da equipe (Sem links do Redmine)
-  msg += `\n\n_${issue.project?.name || 'Atendimento'} | ID: #${issue.id}_`;
+  // Nova observação sobre o tempo de tolerância do técnico
+  msg += `⏳ O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado. Após esse período, a sala será encerrada e será necessário entrar em contato conosco para reagendamento do treinamento.`;
+  
+  // Referência de texto discreta no rodapé para controle interno
+  msg += `\n\n_${issue.project?.name || 'Atendimento'} | Ref: #${issue.id}_`;
   
   return msg;
 }
