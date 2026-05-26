@@ -9,6 +9,10 @@ const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 
+// Ferramentas do sistema para apagar arquivos de trava
+const fs = require('fs');
+const path = require('path');
+
 // Importações do WhatsApp
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
@@ -40,12 +44,42 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP
+// 1.5 INICIALIZAÇÃO DO WHATSAPP (COM ANTITRAVA)
 // ---------------------------------------------------------
+
+// Função que apaga arquivos de trava antigos do Chrome antes de ligar
+function clearChromeLocks() {
+  const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+  const dirs = [
+    '/opt/render/project/src/.wwebjs_auth/session',
+    '/opt/render/project/src/.wwebjs_auth/session/Default'
+  ];
+
+  dirs.forEach(dir => {
+    lockFiles.forEach(file => {
+      const targetPath = path.join(dir, file);
+      if (fs.existsSync(targetPath)) {
+        try {
+          fs.unlinkSync(targetPath);
+          console.log(`[SISTEMA] Arquivo de trava removido com sucesso: ${file}`);
+        } catch (err) {}
+      }
+    });
+  });
+}
+
 const whatsappClient = new Client({
-  authStrategy: new LocalAuth(),
+  authStrategy: new LocalAuth({ dataPath: '/opt/render/project/src/.wwebjs_auth' }),
   puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    headless: true,
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--no-first-run'
+    ]
   }
 });
 
@@ -60,7 +94,6 @@ whatsappClient.on('ready', () => {
   console.log('[WHATSAPP] Conectado e pronto para disparar mensagens!');
 });
 
-// Escuta qualquer mensagem (inclusive as enviadas pelo próprio número do bot)
 whatsappClient.on('message_create', async msg => {
   const comando = msg.body.trim().toLowerCase();
 
@@ -68,7 +101,7 @@ whatsappClient.on('message_create', async msg => {
     try {
       const chat = await msg.getChat();
       await msg.reply(
-        `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chat.id._serialized}*\n\n_Copie esse código inteiro (terminado em @g.us ou @c.us) e cole no Redmine._`
+        `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chat.id._serialized}*\n\n_Copie esse código inteiro e cole no Redmine._`
       );
     } catch (error) {
       console.error('[ERRO WHATSAPP] Falha ao buscar ID do chat:', error.message);
@@ -76,7 +109,11 @@ whatsappClient.on('message_create', async msg => {
   }
 });
 
+// A mágica acontece aqui: Limpa a sujeira ANTES de iniciar o WhatsApp
+clearChromeLocks();
 whatsappClient.initialize();
+
+
 
 // ---------------------------------------------------------
 // 2. CACHE
