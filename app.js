@@ -8,6 +8,7 @@ const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
+const qrcode = require('qrcode-terminal');
 
 // Importações do NOVO Motor do WhatsApp (Mais leve, sem Chrome)
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
@@ -45,26 +46,36 @@ const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Conten
 let waSocket = null;
 
 async function initWhatsApp() {
-  // Aproveitamos a mesma pasta do disco do Render
   const { state, saveCreds } = await useMultiFileAuthState('/opt/render/project/src/.wwebjs_auth');
   
   waSocket = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
-    logger: pino({ level: 'silent' }), // Desliga os logs internos chatos para economizar memória
+    printQRInTerminal: false, // Desligamos o nativo para desenharmos nós mesmos
+    logger: pino({ level: 'silent' }), 
     browser: ["Bot NewNorte", "Chrome", "1.0.0"]
   });
 
   waSocket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
     
+    // Desenha o QR Code no console quando estiver disponível
+    if (qr) {
+      console.log('\n==================================================');
+      console.log('[WHATSAPP] Escaneie o QR Code abaixo com o seu celular:');
+      qrcode.generate(qr, { small: true });
+      console.log('==================================================\n');
+    }
+
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      
       if (shouldReconnect) {
-        console.log('[WHATSAPP] Conexão caiu. Reconectando levemente...');
-        initWhatsApp();
+        console.log(`[WHATSAPP] Conexão caiu (Timeout/Erro). Tentando de novo em 5s...`);
+        // Adicionado um pequeno freio para não estressar o servidor
+        setTimeout(initWhatsApp, 5000); 
       } else {
-        console.log('[WHATSAPP] Desconectado permanentemente (Logout).');
+        console.log('[WHATSAPP] Desconectado permanentemente (Logout). Apague o disco para novo QR.');
       }
     } else if (connection === 'open') {
       console.log('[WHATSAPP] Conectado com sucesso via WebSockets!');
