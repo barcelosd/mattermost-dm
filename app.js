@@ -405,13 +405,26 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
 
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
-  let msg = `⏰ *Lembrete de Reunião*\n\n`;
-  msg += `Faltam *${alertMinutes} minutos* para a reunião da tarefa #${issue.id}.\n\n`;
-  msg += `*Projeto:* ${issue.project?.name || ''}\n`;
-  msg += `*Assunto:* ${issue.subject}\n`;
-  msg += `*Horário:* ${timeLabel}\n`;
-  if (meetLink) msg += `\n*Google Meet:* ${meetLink}\n`;
-  msg += `\n🔗 Abrir Tarefa:\n${REDMINE_URL}/issues/${issue.id}`;
+  
+  // Cabeçalho profissional e amigável para o cliente (Sem jargões técnicos)
+  let msg = `🔔 *Lembrete de Compromisso | NewNorte*\n\n`;
+  msg += `Olá! Passando para lembrar que a nossa reunião começará em *${alertMinutes} minutos*.\n\n`;
+  
+  // Informações limpas e essenciais para o cliente
+  msg += `📌 *Pauta:* ${issue.subject}\n`;
+  msg += `⏰ *Horário:* ${timeLabel}\n`;
+  
+  // Link direto para a reunião (Se houver)
+  if (meetLink) {
+    msg += `\n💻 *Para entrar na sala virtual, clique no link abaixo:*\n👉 ${meetLink}\n`;
+  }
+  
+  // Fechamento humanizado
+  msg += `\nEstamos te aguardando. Até já! 🚀`;
+  
+  // Apenas texto puro no rodapé para identificação da equipe (Sem links do Redmine)
+  msg += `\n\n_${issue.project?.name || 'Atendimento'} | ID: #${issue.id}_`;
+  
   return msg;
 }
 
