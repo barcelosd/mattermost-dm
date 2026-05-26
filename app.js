@@ -33,7 +33,7 @@ const {
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   MEET_STATUS_NAME = 'Aguardando Data',
-  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp' // NOVO CAMPO
+  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
 } = process.env;
 
 const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': 'application/json' };
@@ -45,7 +45,7 @@ const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Conten
 const whatsappClient = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox'] // Essencial para rodar no Render sem quebrar
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   }
 });
 
@@ -60,10 +60,19 @@ whatsappClient.on('ready', () => {
   console.log('[WHATSAPP] Conectado e pronto para disparar mensagens!');
 });
 
-whatsappClient.on('message', async msg => {
-  // O Comando Mágico para descobrir o ID do grupo
-  if (msg.body === '!id') {
-    await msg.reply(`🤖 *Bot NewNorte*\n\nO ID deste grupo é:\n*${msg.from}*\n\n_Copie esse código inteiro (incluindo o @g.us) e cole no campo "${WHATSAPP_GROUP_FIELD_NAME}" do seu projeto no Redmine._`);
+// Escuta qualquer mensagem (inclusive as enviadas pelo próprio número do bot)
+whatsappClient.on('message_create', async msg => {
+  const comando = msg.body.trim().toLowerCase();
+
+  if (comando === '!id') {
+    try {
+      const chat = await msg.getChat();
+      await msg.reply(
+        `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chat.id._serialized}*\n\n_Copie esse código inteiro (terminado em @g.us ou @c.us) e cole no Redmine._`
+      );
+    } catch (error) {
+      console.error('[ERRO WHATSAPP] Falha ao buscar ID do chat:', error.message);
+    }
   }
 });
 
@@ -265,6 +274,7 @@ async function deleteGoogleMeet(issueId) {
       await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
     }
   } catch (error) {
+    // Ignora
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
@@ -366,7 +376,6 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   ].filter(Boolean).join('\n');
 }
 
-// FORMATO ESPECÍFICO PARA O WHATSAPP (Sem Markdown complexo do Mattermost)
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   let msg = `⏰ *Lembrete de Reunião*\n\n`;
@@ -408,14 +417,14 @@ async function checkAppointmentAlert(issue) {
 
     const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     
-    // 1. Notifica a equipe individualmente no Mattermost
+    // 1. Notifica no Mattermost
     const targets = await getResponsibleTargets(issue);
     if (targets.length > 0) {
       await notifyTargets(targets, message);
     }
 
-    // 2. NOVA LÓGICA: Notifica no Grupo do WhatsApp
-    if (whatsappClient.info) { // Só tenta enviar se o WhatsApp estiver conectado
+    // 2. Notifica no WhatsApp
+    if (whatsappClient.info) {
       const project = await getRedmineProject(issue.project?.id);
       const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
       
@@ -431,7 +440,6 @@ async function checkAppointmentAlert(issue) {
       }
     }
 
-    // Marca como enviado mesmo se não tiver ninguém (para não ficar repetindo no loop)
     await markAppointmentAlertSent(alertKey);
   }
 }
@@ -617,6 +625,7 @@ function getDynamicInterval(baseIntervalSeconds) {
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
 
+  // Corte de horários para acordar sempre 15 min ANTES dos turnos de reuniões
   const shift1Start = 7.75 * 3600 * 1000;    // 07:45
   const shift1End = 12 * 3600 * 1000;        // 12:00
   const shift2Start = 13.25 * 3600 * 1000;   // 13:15 
@@ -678,6 +687,8 @@ app.listen(PORT, () => {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
+    
+    // Resumo Diário
     setInterval(processDailySummary, 60000);
   }
 });
