@@ -44,28 +44,40 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP (COM ANTITRAVA)
+// 1.5 INICIALIZAÇÃO DO WHATSAPP (COM ANTITRAVA FORÇA BRUTA)
 // ---------------------------------------------------------
 
-// Função que apaga arquivos de trava antigos do Chrome antes de ligar
+// Função que varre o disco e apaga travas fantasmas à força
 function clearChromeLocks() {
-  const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
-  const dirs = [
-    '/opt/render/project/src/.wwebjs_auth/session',
-    '/opt/render/project/src/.wwebjs_auth/session/Default'
-  ];
+  const basePath = '/opt/render/project/src/.wwebjs_auth';
+  
+  // Se a pasta base ainda não existir, não faz nada
+  if (!fs.existsSync(basePath)) return;
 
-  dirs.forEach(dir => {
-    lockFiles.forEach(file => {
-      const targetPath = path.join(dir, file);
-      if (fs.existsSync(targetPath)) {
+  const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+
+  function cleanLocks(dir) {
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const fullPath = path.join(dir, file);
         try {
-          fs.unlinkSync(targetPath);
-          console.log(`[SISTEMA] Arquivo de trava removido com sucesso: ${file}`);
-        } catch (err) {}
+          // lstatSync consegue ler atalhos quebrados (symlinks)
+          const stat = fs.lstatSync(fullPath);
+          if (stat.isDirectory()) {
+            cleanLocks(fullPath); // Entra nas subpastas
+          } else if (lockFiles.includes(file)) {
+            // Remove na força bruta!
+            fs.rmSync(fullPath, { force: true });
+            console.log(`[SISTEMA] Trava fantasma removida: ${fullPath}`);
+          }
+        } catch (e) {}
       }
-    });
-  });
+    } catch (err) {}
+  }
+
+  console.log('[SISTEMA] Varrendo disco em busca de travas antigas do Chrome...');
+  cleanLocks(basePath);
 }
 
 const whatsappClient = new Client({
