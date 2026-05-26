@@ -9,6 +9,10 @@ const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 
+// Importações do WhatsApp
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+
 dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
@@ -28,11 +32,42 @@ const {
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente, Arquivada, Aguardando Link,Reagendar,Aguardando',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
-  MEET_STATUS_NAME = 'Aguardando Data'
+  MEET_STATUS_NAME = 'Aguardando Data',
+  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp' // NOVO CAMPO
 } = process.env;
 
 const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': 'application/json' };
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
+
+// ---------------------------------------------------------
+// 1.5 INICIALIZAÇÃO DO WHATSAPP
+// ---------------------------------------------------------
+const whatsappClient = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: ['--no-sandbox', '--disable-setuid-sandbox'] // Essencial para rodar no Render sem quebrar
+  }
+});
+
+whatsappClient.on('qr', (qr) => {
+  console.log('\n==================================================');
+  console.log('[WHATSAPP] Escaneie o QR Code abaixo com o seu celular:');
+  qrcode.generate(qr, { small: true });
+  console.log('==================================================\n');
+});
+
+whatsappClient.on('ready', () => {
+  console.log('[WHATSAPP] Conectado e pronto para disparar mensagens!');
+});
+
+whatsappClient.on('message', async msg => {
+  // O Comando Mágico para descobrir o ID do grupo
+  if (msg.body === '!id') {
+    await msg.reply(`🤖 *Bot NewNorte*\n\nO ID deste grupo é:\n*${msg.from}*\n\n_Copie esse código inteiro (incluindo o @g.us) e cole no campo "${WHATSAPP_GROUP_FIELD_NAME}" do seu projeto no Redmine._`);
+  }
+});
+
+whatsappClient.initialize();
 
 // ---------------------------------------------------------
 // 2. CACHE
@@ -91,14 +126,10 @@ function getCustomFieldId(issue, fieldName) {
 function parseAppointmentDateTime(issue) {
   const date = issue.start_date || issue.due_date;
   const timeValueRaw = getCustomFieldValue(issue, ALERT_FIELD_NAME);
-
   if (!date || !timeValueRaw) return null;
-
   const timeValue = String(timeValueRaw).trim().toLowerCase().replace(/\s+/g, '');
   let parsedTime = dayjs(timeValue, ['HH:mm', 'HHhmm', 'HHh'], false);
-
   if (!parsedTime.isValid()) return null;
-
   const dateTime = dayjs.tz(`${date} ${parsedTime.format('HH:mm')}`, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").toDate();
   return { dateTime, timeLabel: parsedTime.format('HH[h]mm') };
 }
@@ -127,13 +158,20 @@ function getNextBusinessSummaryDateString() {
 }
 
 // ---------------------------------------------------------
-// 4. MATTERMOST E REDMINE (API)
+// 4. INTEGRAÇÕES API
 // ---------------------------------------------------------
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
   if (!fieldId) return;
   await axios.put(`${REDMINE_URL}/issues/${issue.id}.json`, { issue: { custom_fields: [{ id: fieldId, value }] } }, { headers: redmineHeaders });
   setCustomFieldValue(issue, fieldName, value);
+}
+async function getRedmineProject(projectId) {
+  if (!projectId) return null;
+  try {
+    const response = await axios.get(`${REDMINE_URL}/projects/${projectId}.json`, { headers: redmineHeaders });
+    return response.data.project;
+  } catch { return null; }
 }
 async function getRedmineUser(userId) {
   const response = await axios.get(`${REDMINE_URL}/users/${userId}.json`, { headers: redmineHeaders });
@@ -204,11 +242,8 @@ function getGoogleCalendarClient() {
 }
 async function getMeetProjectName(issue) {
   if (!issue.project?.id) return '';
-  try {
-    const response = await axios.get(`${REDMINE_URL}/projects/${issue.project.id}.json`, { headers: redmineHeaders });
-    const project = response.data.project;
-    return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) || project?.parent?.name || project?.name || issue.project?.name || '';
-  } catch { return issue.project?.name || ''; }
+  const project = await getRedmineProject(issue.project.id);
+  return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) || project?.parent?.name || project?.name || issue.project?.name || '';
 }
 async function findGoogleEventForIssue(calendar, issueId) {
   const response = await calendar.events.list({ calendarId: GOOGLE_CALENDAR_ID, q: `#${issueId}`, maxResults: 10, singleEvents: false, showDeleted: false });
@@ -230,7 +265,6 @@ async function deleteGoogleMeet(issueId) {
       await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
     }
   } catch (error) {
-    // Ignora
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
@@ -332,6 +366,19 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   ].filter(Boolean).join('\n');
 }
 
+// FORMATO ESPECÍFICO PARA O WHATSAPP (Sem Markdown complexo do Mattermost)
+function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
+  const meetLink = getCustomFieldValue(issue, 'Google Meet');
+  let msg = `⏰ *Lembrete de Reunião*\n\n`;
+  msg += `Faltam *${alertMinutes} minutos* para a reunião da tarefa #${issue.id}.\n\n`;
+  msg += `*Projeto:* ${issue.project?.name || ''}\n`;
+  msg += `*Assunto:* ${issue.subject}\n`;
+  msg += `*Horário:* ${timeLabel}\n`;
+  if (meetLink) msg += `\n*Google Meet:* ${meetLink}\n`;
+  msg += `\n🔗 Abrir Tarefa:\n${REDMINE_URL}/issues/${issue.id}`;
+  return msg;
+}
+
 async function buildDailySummaryLine(issue) {
   const projectName = await getMeetProjectName(issue);
   const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME) || '';
@@ -359,15 +406,32 @@ async function checkAppointmentAlert(issue) {
     const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
     if (await wasAppointmentAlertSent(alertKey)) continue;
 
+    const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
+    
+    // 1. Notifica a equipe individualmente no Mattermost
     const targets = await getResponsibleTargets(issue);
-    if (!targets.length) {
-      await markAppointmentAlertSent(alertKey); 
-      continue;
+    if (targets.length > 0) {
+      await notifyTargets(targets, message);
     }
 
-    const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
-    await notifyTargets(targets, message);
-    console.log(`[ALERTA ENVIADO] Lembrete de ${alertMinutes} min disparado no Mattermost para issue #${issue.id}!`);
+    // 2. NOVA LÓGICA: Notifica no Grupo do WhatsApp
+    if (whatsappClient.info) { // Só tenta enviar se o WhatsApp estiver conectado
+      const project = await getRedmineProject(issue.project?.id);
+      const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
+      
+      if (groupId) {
+        try {
+          const cleanGroupId = String(groupId).trim();
+          const whatsAppMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
+          await whatsappClient.sendMessage(cleanGroupId, whatsAppMsg);
+          console.log(`[WHATSAPP] Alerta de ${alertMinutes}m enviado para o grupo ${cleanGroupId}`);
+        } catch (err) {
+          console.error(`[ERRO WHATSAPP] Falha ao enviar para ${groupId}:`, err.message);
+        }
+      }
+    }
+
+    // Marca como enviado mesmo se não tiver ninguém (para não ficar repetindo no loop)
     await markAppointmentAlertSent(alertKey);
   }
 }
@@ -429,7 +493,6 @@ async function pollingRedmineIssues() {
   } catch (error) {}
 }
 
-// CORREÇÃO CRÍTICA: Filtra direto na API pela data exata para não cair no limite de 100 antigas
 async function fetchIssuesByDate(dateStr) {
   try {
     const [resStart, resDue] = await Promise.all([
@@ -448,9 +511,7 @@ async function fetchIssuesByDate(dateStr) {
     const unique = Array.from(new Map(combined.map(i => [i.id, i])).values());
     
     return unique;
-  } catch (error) {
-    return [];
-  }
+  } catch (error) { return []; }
 }
 
 async function pollingAppointmentAlerts() {
@@ -512,7 +573,6 @@ async function processDailySummary() {
       ].join('\n');
 
       await notifyTargets([target], message);
-      console.log(`[RESUMO DIÁRIO] Enviado com sucesso para ${target.email}`);
     }
 
     await markAsNotified(summaryKey);
@@ -541,7 +601,7 @@ async function fetchIssueDetails(issueId) {
 }
 
 // ---------------------------------------------------------
-// 10. SMART SCHEDULER (COM CORTE PRECISO DE HORÁRIO)
+// 10. SMART SCHEDULER
 // ---------------------------------------------------------
 function getDynamicInterval(baseIntervalSeconds) {
   const now = dayjs().tz('America/Sao_Paulo');
@@ -557,28 +617,25 @@ function getDynamicInterval(baseIntervalSeconds) {
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
 
-  // CORREÇÃO: O bot acorda 15 minutos ANTES do turno para pegar os alertas!
-  const shift1Start = 7.75 * 3600 * 1000;    // 07:45 (Prepara para as reuniões das 08:00)
-  const shift1End = 12 * 3600 * 1000;        // 12:00 (Fim do turno da manhã)
-  const shift2Start = 13.25 * 3600 * 1000;   // 13:15 (Prepara para as reuniões das 13:30)
-  const shift2End = 19 * 3600 * 1000;        // 19:00 (Fim do expediente)
+  const shift1Start = 7.75 * 3600 * 1000;    // 07:45
+  const shift1End = 12 * 3600 * 1000;        // 12:00
+  const shift2Start = 13.25 * 3600 * 1000;   // 13:15 
+  const shift2End = 19 * 3600 * 1000;        // 19:00 
 
   let targetInterval = BASE_MS;
 
-  // Define o sono inicial
   if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
     targetInterval = ONE_HOUR_MS;
   } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
     targetInterval = LUNCH_BREAK_MS;
   }
 
-  // Corta o sono exatamente no segundo que o turno recomeça!
   const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
   for (const boundary of boundaries) {
     if (msSinceMidnight < boundary) {
       const msUntilBoundary = boundary - msSinceMidnight;
       if (targetInterval > msUntilBoundary) {
-        targetInterval = msUntilBoundary; // "Acorde exatamente nesta hora"
+        targetInterval = msUntilBoundary;
       }
       break; 
     }
@@ -612,7 +669,7 @@ app.get('/polling-now', async (req, res) => {
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima Ativada.'); });
+app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima e WhatsApp Ativos.'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
@@ -621,8 +678,6 @@ app.listen(PORT, () => {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
-
-    // Resumo Diário é barato e deve olhar o relógio a cada minuto, independente do modo economia
     setInterval(processDailySummary, 60000);
   }
 });
