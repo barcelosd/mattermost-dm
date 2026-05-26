@@ -90,7 +90,9 @@ const whatsappClient = new Client({
       '--disable-dev-shm-usage',
       '--disable-accelerated-2d-canvas',
       '--disable-gpu',
-      '--no-first-run'
+      '--no-first-run',
+      '--no-zygote',       // <- MÁGICA 1: Desliga o pré-carregamento de processos
+      '--single-process'   // <- MÁGICA 2: Força o Chrome a rodar em 1 única thread
     ]
   }
 });
