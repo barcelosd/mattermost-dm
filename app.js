@@ -32,6 +32,7 @@ const {
   DAILY_SUMMARY_ENABLED = 'true', DAILY_SUMMARY_HOUR = 17, DAILY_SUMMARY_MINUTE = 45,
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente, Arquivada, Aguardando Link,Reagendar,Aguardando',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
+  GOOGLE_DRIVE_CLIENTES_FOLDER_ID, // <-- Nova variável para a pasta raiz no Drive
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   MEET_STATUS_NAME = 'Aguardando Data',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
@@ -50,7 +51,7 @@ async function initWhatsApp() {
   
   waSocket = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // Desligamos o nativo para desenharmos nós mesmos
+    printQRInTerminal: false,
     logger: pino({ level: 'silent' }), 
     browser: ["Bot NewNorte", "Chrome", "1.0.0"]
   });
@@ -58,7 +59,6 @@ async function initWhatsApp() {
   waSocket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
     
-    // Desenha o QR Code no console quando estiver disponível
     if (qr) {
       console.log('\n==================================================');
       console.log('[WHATSAPP] Escaneie o QR Code abaixo com o seu celular:');
@@ -71,8 +71,7 @@ async function initWhatsApp() {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       
       if (shouldReconnect) {
-        console.log(`[WHATSAPP] Conexão caiu (Timeout/Erro). Tentando de novo em 5s...`);
-        // Adicionado um pequeno freio para não estressar o servidor
+        console.log(`[WHATSAPP] Conexão caiu. Tentando de novo em 5s...`);
         setTimeout(initWhatsApp, 5000); 
       } else {
         console.log('[WHATSAPP] Desconectado permanentemente (Logout). Apague o disco para novo QR.');
@@ -82,10 +81,8 @@ async function initWhatsApp() {
     }
   });
 
-  // Salva as credenciais no disco automaticamente
   waSocket.ev.on('creds.update', saveCreds);
 
-  // Escuta os comandos (como o !id)
   waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     const msg = messages[0];
@@ -107,7 +104,6 @@ async function initWhatsApp() {
   });
 }
 
-// Inicia o serviço
 initWhatsApp();
 
 // ---------------------------------------------------------
@@ -199,7 +195,7 @@ function getNextBusinessSummaryDateString() {
 }
 
 // ---------------------------------------------------------
-// 4. INTEGRAÇÕES API
+// 4. INTEGRAÇÕES API (REDMINE E MATTERMOST)
 // ---------------------------------------------------------
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
@@ -330,6 +326,11 @@ async function processGoogleMeet(issue) {
   const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
   const signature = JSON.stringify({ summary, start: startDate.toISOString(), end: endDate.toISOString() });
   
+  // ---> GATILHO GOOGLE DRIVE: Cria a pasta do cliente se não existir
+  if (projectName) {
+    await getOrCreateClientFolder(projectName);
+  }
+
   const signatureKey = `redmine:meet:signature:${issue.id}`;
   const oldSignature = await redisGet(signatureKey);
   const calendar = getGoogleCalendarClient();
@@ -382,7 +383,63 @@ async function processGoogleMeet(issue) {
 }
 
 // ---------------------------------------------------------
-// 6. ALERTAS E REGRAS DE NEGÓCIO
+// 6. GOOGLE DRIVE (GESTÃO DE PASTAS DE CLIENTES)
+// ---------------------------------------------------------
+function getGoogleDriveClient() {
+  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  return google.drive({ version: 'v3', auth });
+}
+
+async function getOrCreateClientFolder(projectName) {
+  if (!projectName) return null;
+  
+  const parentId = process.env.GOOGLE_DRIVE_CLIENTES_FOLDER_ID;
+  if (!parentId) {
+    console.error('[ERRO DRIVE] ID da pasta raiz "Clientes" não configurado (GOOGLE_DRIVE_CLIENTES_FOLDER_ID).');
+    return null;
+  }
+
+  const drive = getGoogleDriveClient();
+
+  try {
+    // Busca se já existe uma pasta com o Nome Fantasia dentro da pasta raiz configurada
+    const response = await drive.files.list({
+      q: `name = '${projectName}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: 'files(id, name)',
+      maxResults: 1
+    });
+
+    const existingFolder = response.data.files?.[0];
+
+    if (existingFolder) {
+      // Pasta já existe, apenas retorna o ID silenciosamente
+      return existingFolder.id;
+    }
+
+    // Se não existir, cria a nova pasta
+    const fileMetadata = {
+      name: projectName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId]
+    };
+
+    const folder = await drive.files.create({
+      resource: fileMetadata,
+      fields: 'id'
+    });
+
+    console.log(`[DRIVE] Nova pasta criada para o cliente: ${projectName} (ID: ${folder.data.id})`);
+    return folder.data.id;
+
+  } catch (error) {
+    console.error(`[ERRO DRIVE] Falha ao gerenciar pasta do cliente ${projectName}:`, error.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------
+// 7. ALERTAS E REGRAS DE NEGÓCIO
 // ---------------------------------------------------------
 function buildNotificationMessage(issue, action, source) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
@@ -412,39 +469,30 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   
   if (publicoAlvoRaw) {
     if (Array.isArray(publicoAlvoRaw)) {
-      // Se for um array (múltiplas seleções), remove itens vazios e junta com " / "
       publicoAlvoText = publicoAlvoRaw.filter(Boolean).join(' / ');
     } else {
-      // Se por acaso vier como string única, apenas limpa os espaços
       publicoAlvoText = String(publicoAlvoRaw).trim();
     }
   }
 
-  // Cabeçalho profissional e amigável para o cliente
+  // Mensagem otimizada para o cliente final
   let msg = `🔔 *Lembrete de Compromisso | NewNorte*\n\n`;
   msg += `Olá! Passando para lembrar que a nossa reunião começará em *${alertMinutes} minutos*.\n\n`;
   
-  // Informações da reunião (Pauta alterada para Assunto)
   msg += `📌 *Assunto:* ${issue.subject}\n`;
   
-  // Exibe o Público Alvo logo abaixo do Assunto (se o campo estiver preenchido)
   if (publicoAlvoText) {
     msg += `👥 *Público Alvo:* ${publicoAlvoText}\n`;
   }
   
   msg += `⏰ *Horário:* ${timeLabel}\n`;
   
-  // Link do Meet destacado para o cliente entrar direto
   if (meetLink) {
     msg += `\n💻 *Para entrar na sala virtual, clique no link abaixo:*\n👉 ${meetLink}\n`;
   }
   
   msg += `\nEstamos te aguardando. Até já! 🚀\n\n`;
-  
-  // Nova observação sobre o tempo de tolerância do técnico
   msg += `⏳ O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado. Após esse período, a sala será encerrada e será necessário entrar em contato conosco para reagendamento do treinamento.`;
-  
-  // Referência de texto discreta no rodapé para controle interno
   msg += `\n\n_${issue.project?.name || 'Atendimento'} | Ref: #${issue.id}_`;
   
   return msg;
@@ -477,15 +525,14 @@ async function checkAppointmentAlert(issue) {
     const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
     if (await wasAppointmentAlertSent(alertKey)) continue;
 
-    const message = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
-    
-    // 1. Notifica no Mattermost
+    // 1. Notifica no Mattermost com a mensagem padrão da equipe
+    const mattermostMessage = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     const targets = await getResponsibleTargets(issue);
     if (targets.length > 0) {
-      await notifyTargets(targets, message);
+      await notifyTargets(targets, mattermostMessage);
     }
 
-    // 2. Notifica no WhatsApp via WebSockets
+    // 2. Notifica no WhatsApp via WebSockets com a mensagem amigável para o cliente
     if (waSocket) {
       const project = await getRedmineProject(issue.project?.id);
       const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
@@ -495,7 +542,6 @@ async function checkAppointmentAlert(issue) {
           const cleanGroupId = String(groupId).trim();
           const whatsAppMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
           
-          // O Baileys envia usando um objeto { text: ... }
           await waSocket.sendMessage(cleanGroupId, { text: whatsAppMsg });
           console.log(`[WHATSAPP] Alerta de ${alertMinutes}m enviado para o grupo ${cleanGroupId}`);
         } catch (err) {
@@ -525,7 +571,7 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 7. POLLING DE ATUALIZAÇÕES E BUSCAS DE API
+// 8. POLLING DE ATUALIZAÇÕES E BUSCAS DE API
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
