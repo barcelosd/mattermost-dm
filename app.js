@@ -33,7 +33,7 @@ const {
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente, Arquivada, Aguardando Link,Reagendar,Aguardando',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
   GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
-  GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID, // <-- Nova variável para a pasta de gravações
+  GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   MEET_STATUS_NAME = 'Aguardando Data',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
@@ -383,7 +383,7 @@ async function processGoogleMeet(issue) {
 }
 
 // ---------------------------------------------------------
-// 6. GOOGLE DRIVE (GESTÃO DE PASTAS E GRAVAÇÕES DO MEET)
+// 6. GOOGLE DRIVE (GESTÃO DE PASTAS E ESTRUTURA DE CLIENTES)
 // ---------------------------------------------------------
 function getGoogleDriveClient() {
   const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
@@ -391,6 +391,28 @@ function getGoogleDriveClient() {
   return google.drive({ version: 'v3', auth });
 }
 
+// Função auxiliar para validar e criar subpastas internas
+async function getOrCreateSubfolder(drive, subfolderName, parentFolderId) {
+  const response = await drive.files.list({
+    q: `name = '${subfolderName}' and '${parentFolderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: 'files(id, name)',
+    maxResults: 1
+  });
+
+  const existingFolder = response.data.files?.[0];
+  if (existingFolder) return existingFolder.id;
+
+  const fileMetadata = {
+    name: subfolderName,
+    mimeType: 'application/vnd.google-apps.folder',
+    parents: [parentFolderId]
+  };
+
+  const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
+  return folder.data.id;
+}
+
+// Gerencia a pasta do cliente e garante a estrutura interna ("Treinamentos" e "Arquivos")
 async function getOrCreateClientFolder(projectName) {
   if (!projectName) return null;
   
@@ -403,32 +425,40 @@ async function getOrCreateClientFolder(projectName) {
   const drive = getGoogleDriveClient();
 
   try {
-    const response = await drive.files.list({
+    let response = await drive.files.list({
       q: `name = '${projectName}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
       fields: 'files(id, name)',
       maxResults: 1
     });
 
-    const existingFolder = response.data.files?.[0];
-    if (existingFolder) return existingFolder.id;
+    let clientFolderId = response.data.files?.[0]?.id;
 
-    const fileMetadata = {
-      name: projectName,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [parentId]
-    };
+    if (!clientFolderId) {
+      const fileMetadata = {
+        name: projectName,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [parentId]
+      };
 
-    const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
-    console.log(`[DRIVE] Nova pasta criada para o cliente: ${projectName} (ID: ${folder.data.id})`);
-    return folder.data.id;
+      const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
+      clientFolderId = folder.data.id;
+      console.log(`[DRIVE] Nova pasta criada para o cliente: ${projectName} (ID: ${clientFolderId})`);
+    }
+
+    // Garante a existência das duas subpastas solicitadas
+    const treinamentosFolderId = await getOrCreateSubfolder(drive, 'Treinamentos', clientFolderId);
+    await getOrCreateSubfolder(drive, 'Arquivos', clientFolderId);
+
+    // Retorna os IDs estruturados
+    return { clientFolderId, treinamentosFolderId };
 
   } catch (error) {
-    console.error(`[ERRO DRIVE] Falha ao gerenciar pasta do cliente ${projectName}:`, error.message);
+    console.error(`[ERRO DRIVE] Falha ao gerenciar estrutura da pasta do cliente ${projectName}:`, error.message);
     return null;
   }
 }
 
-// ---> NOVA FUNÇÃO: Varre a pasta de gravações e move os vídeos com ID (#12345)
+// Varre a pasta de gravações e move os vídeos para a subpasta "Treinamentos" do cliente correto
 async function processMeetRecordings() {
   const recordingsFolderId = GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID;
   if (!recordingsFolderId) {
@@ -439,7 +469,6 @@ async function processMeetRecordings() {
   const drive = getGoogleDriveClient();
 
   try {
-    // Lista os arquivos dentro da pasta de gravações que contenham '#' no nome
     const response = await drive.files.list({
       q: `'${recordingsFolderId}' in parents and name contains '#' and trashed = false`,
       fields: 'files(id, name, parents)',
@@ -449,7 +478,6 @@ async function processMeetRecordings() {
     const files = response.data.files || [];
     
     for (const file of files) {
-      // Procura pelo padrão # seguido de números no nome do arquivo (Ex: #25412)
       const match = file.name.match(/#(\d+)/);
       if (!match) continue;
 
@@ -457,7 +485,6 @@ async function processMeetRecordings() {
       console.log(`[DRIVE] Nova gravação identificada para a tarefa #${issueId}: "${file.name}"`);
 
       try {
-        // Busca a tarefa no Redmine para saber quem é o cliente (Nome Fantasia)
         const issue = await fetchIssueDetails(issueId);
         const projectName = await getMeetProjectName(issue);
 
@@ -466,21 +493,22 @@ async function processMeetRecordings() {
           continue;
         }
 
-        // Garante a existência da pasta do cliente
-        const clientFolderId = await getOrCreateClientFolder(projectName);
-        if (!clientFolderId) continue;
+        // Garante a existência da pasta e extrai o ID da subpasta Treinamentos
+        const folderStructure = await getOrCreateClientFolder(projectName);
+        if (!folderStructure || !folderStructure.treinamentosFolderId) continue;
 
-        // Move o arquivo trocando os "parents" (pastas pai)
+        const targetFolderId = folderStructure.treinamentosFolderId;
         const currentParents = file.parents?.join(',') || recordingsFolderId;
         
+        // Move o arquivo trocando a pasta pai original pela pasta de Treinamentos do cliente
         await drive.files.update({
           fileId: file.id,
-          addParents: clientFolderId,
+          addParents: targetFolderId,
           removeParents: currentParents,
           fields: 'id, parents'
         });
 
-        console.log(`[DRIVE] Sucesso! Vídeo "${file.name}" movido para a pasta do cliente: "${projectName}"`);
+        console.log(`[DRIVE] Sucesso! Vídeo "${file.name}" movido para a pasta "Treinamentos" do cliente: "${projectName}"`);
 
       } catch (err) {
         console.error(`[ERRO DRIVE] Erro ao processar o arquivo "${file.name}" da tarefa #${issueId}:`, err.message);
@@ -782,14 +810,14 @@ function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
   setTimeout(run, 5000);
 }
 
-const app = WebHookExpress = express();
+const app = express();
 
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
   await processDailySummary(); 
   await reconcileDeletedMeets();
-  await processMeetRecordings(); // Executa a varredura das gravações sob demanda
+  await processMeetRecordings(); 
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
@@ -802,7 +830,7 @@ app.listen(PORT, () => {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
-    startSmartPolling(processMeetRecordings, 900, 'Organizador de Gravações'); // <-- Novo Agendador (Roda a cada 15 min)
+    startSmartPolling(processMeetRecordings, 900, 'Organizador de Gravações'); 
     setInterval(processDailySummary, 60000);
   }
 });
