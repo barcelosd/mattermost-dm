@@ -10,7 +10,7 @@ const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 const qrcode = require('qrcode-terminal');
 
-// Importações do NOVO Motor do WhatsApp (Mais leve, sem Chrome)
+// Importações do Motor do WhatsApp
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
@@ -32,7 +32,8 @@ const {
   DAILY_SUMMARY_ENABLED = 'true', DAILY_SUMMARY_HOUR = 17, DAILY_SUMMARY_MINUTE = 45,
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente, Arquivada, Aguardando Link,Reagendar,Aguardando',
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
-  GOOGLE_DRIVE_CLIENTES_FOLDER_ID, // <-- Nova variável para a pasta raiz no Drive
+  GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
+  GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID, // <-- Nova variável para a pasta de gravações
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   MEET_STATUS_NAME = 'Aguardando Data',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
@@ -42,7 +43,7 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP (VIA SOCKETS - LEVE)
+// 1.5 INICIALIZAÇÃO DO WHATSAPP
 // ---------------------------------------------------------
 let waSocket = null;
 
@@ -326,7 +327,6 @@ async function processGoogleMeet(issue) {
   const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
   const signature = JSON.stringify({ summary, start: startDate.toISOString(), end: endDate.toISOString() });
   
-  // ---> GATILHO GOOGLE DRIVE: Cria a pasta do cliente se não existir
   if (projectName) {
     await getOrCreateClientFolder(projectName);
   }
@@ -383,7 +383,7 @@ async function processGoogleMeet(issue) {
 }
 
 // ---------------------------------------------------------
-// 6. GOOGLE DRIVE (GESTÃO DE PASTAS DE CLIENTES)
+// 6. GOOGLE DRIVE (GESTÃO DE PASTAS E GRAVAÇÕES DO MEET)
 // ---------------------------------------------------------
 function getGoogleDriveClient() {
   const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
@@ -396,14 +396,13 @@ async function getOrCreateClientFolder(projectName) {
   
   const parentId = process.env.GOOGLE_DRIVE_CLIENTES_FOLDER_ID;
   if (!parentId) {
-    console.error('[ERRO DRIVE] ID da pasta raiz "Clientes" não configurado (GOOGLE_DRIVE_CLIENTES_FOLDER_ID).');
+    console.error('[ERRO DRIVE] ID da pasta raiz "Clientes" não configurado.');
     return null;
   }
 
   const drive = getGoogleDriveClient();
 
   try {
-    // Busca se já existe uma pasta com o Nome Fantasia dentro da pasta raiz configurada
     const response = await drive.files.list({
       q: `name = '${projectName}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
       fields: 'files(id, name)',
@@ -411,30 +410,84 @@ async function getOrCreateClientFolder(projectName) {
     });
 
     const existingFolder = response.data.files?.[0];
+    if (existingFolder) return existingFolder.id;
 
-    if (existingFolder) {
-      // Pasta já existe, apenas retorna o ID silenciosamente
-      return existingFolder.id;
-    }
-
-    // Se não existir, cria a nova pasta
     const fileMetadata = {
       name: projectName,
       mimeType: 'application/vnd.google-apps.folder',
       parents: [parentId]
     };
 
-    const folder = await drive.files.create({
-      resource: fileMetadata,
-      fields: 'id'
-    });
-
+    const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
     console.log(`[DRIVE] Nova pasta criada para o cliente: ${projectName} (ID: ${folder.data.id})`);
     return folder.data.id;
 
   } catch (error) {
     console.error(`[ERRO DRIVE] Falha ao gerenciar pasta do cliente ${projectName}:`, error.message);
     return null;
+  }
+}
+
+// ---> NOVA FUNÇÃO: Varre a pasta de gravações e move os vídeos com ID (#12345)
+async function processMeetRecordings() {
+  const recordingsFolderId = GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID;
+  if (!recordingsFolderId) {
+    console.error('[ERRO DRIVE] ID da pasta "Meet Recordings" não configurado no .env.');
+    return;
+  }
+
+  const drive = getGoogleDriveClient();
+
+  try {
+    // Lista os arquivos dentro da pasta de gravações que contenham '#' no nome
+    const response = await drive.files.list({
+      q: `'${recordingsFolderId}' in parents and name contains '#' and trashed = false`,
+      fields: 'files(id, name, parents)',
+      pageSize: 50
+    });
+
+    const files = response.data.files || [];
+    
+    for (const file of files) {
+      // Procura pelo padrão # seguido de números no nome do arquivo (Ex: #25412)
+      const match = file.name.match(/#(\d+)/);
+      if (!match) continue;
+
+      const issueId = match[1];
+      console.log(`[DRIVE] Nova gravação identificada para a tarefa #${issueId}: "${file.name}"`);
+
+      try {
+        // Busca a tarefa no Redmine para saber quem é o cliente (Nome Fantasia)
+        const issue = await fetchIssueDetails(issueId);
+        const projectName = await getMeetProjectName(issue);
+
+        if (!projectName) {
+          console.log(`[DRIVE] Não foi possível mapear o Nome Fantasia para a tarefa #${issueId}.`);
+          continue;
+        }
+
+        // Garante a existência da pasta do cliente
+        const clientFolderId = await getOrCreateClientFolder(projectName);
+        if (!clientFolderId) continue;
+
+        // Move o arquivo trocando os "parents" (pastas pai)
+        const currentParents = file.parents?.join(',') || recordingsFolderId;
+        
+        await drive.files.update({
+          fileId: file.id,
+          addParents: clientFolderId,
+          removeParents: currentParents,
+          fields: 'id, parents'
+        });
+
+        console.log(`[DRIVE] Sucesso! Vídeo "${file.name}" movido para a pasta do cliente: "${projectName}"`);
+
+      } catch (err) {
+        console.error(`[ERRO DRIVE] Erro ao processar o arquivo "${file.name}" da tarefa #${issueId}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error('[ERRO DRIVE] Falha ao listar arquivos na pasta de gravações do Meet:', error.message);
   }
 }
 
@@ -462,8 +515,6 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
 
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
-  
-  // Tratamento para o campo multi-seleção "Público Alvo"
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
   let publicoAlvoText = '';
   
@@ -475,10 +526,8 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
     }
   }
 
-  // Mensagem otimizada para o cliente final
   let msg = `🔔 *Lembrete de Compromisso | NewNorte*\n\n`;
   msg += `Olá! Passando para lembrar que a nossa reunião começará em *${alertMinutes} minutos*.\n\n`;
-  
   msg += `📌 *Assunto:* ${issue.subject}\n`;
   
   if (publicoAlvoText) {
@@ -525,14 +574,12 @@ async function checkAppointmentAlert(issue) {
     const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
     if (await wasAppointmentAlertSent(alertKey)) continue;
 
-    // 1. Notifica no Mattermost com a mensagem padrão da equipe
     const mattermostMessage = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
     const targets = await getResponsibleTargets(issue);
     if (targets.length > 0) {
       await notifyTargets(targets, mattermostMessage);
     }
 
-    // 2. Notifica no WhatsApp via WebSockets com a mensagem amigável para o cliente
     if (waSocket) {
       const project = await getRedmineProject(issue.project?.id);
       const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
@@ -735,17 +782,18 @@ function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
   setTimeout(run, 5000);
 }
 
-const app = express();
+const app = WebHookExpress = express();
 
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
   await processDailySummary(); 
   await reconcileDeletedMeets();
+  await processMeetRecordings(); // Executa a varredura das gravações sob demanda
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima e WhatsApp Ativos (Motor Leve).'); });
+app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima, Organização Drive e WhatsApp Ativos.'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
@@ -754,6 +802,7 @@ app.listen(PORT, () => {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
+    startSmartPolling(processMeetRecordings, 900, 'Organizador de Gravações'); // <-- Novo Agendador (Roda a cada 15 min)
     setInterval(processDailySummary, 60000);
   }
 });
