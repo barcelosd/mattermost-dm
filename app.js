@@ -93,7 +93,6 @@ async function initWhatsApp() {
 
   waSocket.ev.on('creds.update', saveCreds);
 
-  // REINTRODUZIDO: Ouvinte para comandos do WhatsApp (como o !id)
   waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     const msg = messages[0];
@@ -144,23 +143,34 @@ async function markAppointmentAlertSent(key) { const ttl = Number(REDIS_TTL_DAYS
 // ---------------------------------------------------------
 function normalizeText(value) { return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
 function isMeetStatus(issue) { return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME); }
+
+// Ignora na criação/modificação padrão por Polling
 function shouldIgnoreIssueByStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
   return String(IGNORE_STATUSES).split(',').map(normalizeText).filter(Boolean).includes(status);
 }
+
+// Filtro especial para Alertas Agendados (Nunca ignora se for "Aguardando Data")
+function shouldIgnoreAlertByStatus(issue) {
+  if (isMeetStatus(issue)) return false; 
+  const status = normalizeText(issue?.status?.name || issue?.status || '');
+  return String(IGNORE_STATUSES).split(',').map(normalizeText).filter(Boolean).includes(status);
+}
+
 function getLastJournal(issue) { return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null; }
 function getEventKey(issue, source, journal) { return `event:${issue.id}:${journal ? journal.id : source}`; }
+
 function getCustomFieldValue(entity, fieldName) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
   return fields.find(f => f.name === fieldName || f.custom_field_name === fieldName)?.value || null;
 }
-function setCustomFieldValue(entity, fieldName, value) {
-  const fields = entity?.custom_fields || entity?.custom_field_values || [];
+function setCustomFieldValue(issue, fieldName, value) {
+  const fields = issue?.custom_fields || issue?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   if (field) field.value = value;
 }
 function getCustomFieldId(issue, fieldName) {
-  const fields = entity?.custom_fields || entity?.custom_field_values || [];
+  const fields = issue?.custom_fields || issue?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   return field?.id || field?.custom_field_id || null;
 }
@@ -257,7 +267,7 @@ async function notifyTargets(targets, message) {
 // ⚡️ ALERTAS DE COMPROMISSO (INSPEÇÃO DE BLOCOS)
 // ---------------------------------------------------------
 async function checkAppointmentAlert(issue) {
-  if (shouldIgnoreIssueByStatus(issue)) return;
+  if (shouldIgnoreAlertByStatus(issue)) return; // Corrigido para não ignorar Aguardando Data
   const appointment = parseAppointmentDateTime(issue);
   if (!appointment) return;
 
@@ -514,7 +524,7 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
 }
 
 async function processIssueNotification(issue, action, source, journal = null) {
-  if (shouldIgnoreIssueByStatus(issue)) return;
+  if (shouldIgnoreIssueByStatus(issue)) return; // Continua ignorando criações normais
   await processGoogleMeet(issue);
   if (isMeetStatus(issue)) return;
   const eventKey = getEventKey(issue, source, journal);
@@ -572,7 +582,7 @@ async function pollingAppointmentAlerts() {
 }
 
 // ---------------------------------------------------------
-// 9. [ BLOCO 4 ] MATTERMOST: RESUMO DIÁRIO (Padrão 17h45)
+// 9. [ BLOCO 4 ] MATTERMOST: RESUMO DIÁREO (Padrão 17h45)
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
@@ -584,7 +594,7 @@ async function processDailySummary() {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     const groupedByEmail = new Map();
     for (const issueSummary of issueSummaries) {
-      if (shouldIgnoreIssueByStatus(issueSummary)) continue;
+      if (shouldIgnoreAlertByStatus(issueSummary)) continue; // Corrigido para não ignorar Aguardando Data
       const issue = await fetchIssueDetails(issueSummary.id);
       const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
       if (!horario) continue;
@@ -630,7 +640,7 @@ async function processClientMorningSummary() {
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     for (const issueSummary of issueSummaries) {
-      if (shouldIgnoreIssueByStatus(issueSummary)) continue;
+      if (shouldIgnoreAlertByStatus(issueSummary)) continue; // Corrigido para não ignorar Aguardando Data
       const issue = await fetchIssueDetails(issueSummary.id);
       const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
       if (!horario) continue;
@@ -737,7 +747,6 @@ app.listen(PORT, () => {
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
     startSmartPolling(processMeetRecordings, 900, 'Gravações Meet');
     
-    // Verificadores de Resumo (Roda a cada minuto checando os horários do seu .env)
     setInterval(processDailySummary, 60000);
     setInterval(processClientMorningSummary, 60000);
   }
