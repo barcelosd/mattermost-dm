@@ -1,5 +1,4 @@
 require('dotenv').config();
-
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
@@ -9,8 +8,6 @@ const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 const qrcode = require('qrcode-terminal');
-
-// Importações do Motor do WhatsApp
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
@@ -23,17 +20,32 @@ dayjs.extend(customParseFormat);
 // ---------------------------------------------------------
 const {
   PORT = 3000,
-  REDMINE_URL, REDMINE_API_KEY,
-  MATTERMOST_URL, MATTERMOST_TOKEN,
-  REDIS_URL, REDIS_TTL_DAYS = 90,
-  POLLING_ENABLED = 'true', POLLING_INTERVAL_SECONDS = 60, POLLING_LIMIT = 20,
-  ALERT_MINUTES_BEFORE = 10, ALERT_EXTRA_MINUTES_BEFORE = 2, ALERT_WINDOW_SECONDS = 180,
-  ALERT_FIELD_NAME = 'Horário', ALERT_POLLING_INTERVAL_SECONDS = 60,
-  DAILY_SUMMARY_ENABLED = 'true', DAILY_SUMMARY_HOUR = 17, DAILY_SUMMARY_MINUTE = 45,
-  IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente, Arquivada, Aguardando Link,Reagendar,Aguardando',
-  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_CALENDAR_ID,
+  REDMINE_URL,
+  REDMINE_API_KEY,
+  MATTERMOST_URL,
+  MATTERMOST_TOKEN,
+  REDIS_URL,
+  REDIS_TTL_DAYS = 90,
+  POLLING_ENABLED = 'true',
+  POLLING_INTERVAL_SECONDS = 60,
+  POLLING_LIMIT = 20,
+  ALERT_MINUTES_BEFORE = 5,
+  ALERT_EXTRA_MINUTES_BEFORE = 0,
+  ALERT_WINDOW_SECONDS = 180,
+  ALERT_FIELD_NAME = 'Horário',
+  ALERT_POLLING_INTERVAL_SECONDS = 60,
+  DAILY_SUMMARY_ENABLED = 'true',
+  DAILY_SUMMARY_HOUR = 17,
+  DAILY_SUMMARY_MINUTE = 45,
+  CLIENT_SUMMARY_ENABLED = 'true',
+  CLIENT_SUMMARY_TIME = '08:30',
+  IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente,Arquivada,Aguardando Link,Reagendar,Aguardando',
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN,
+  GOOGLE_CALENDAR_ID,
   GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
-  GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID,
+  GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   MEET_STATUS_NAME = 'Aguardando Data',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
@@ -43,66 +55,37 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP
+// 1.5 INICIALIZAÇÃO DO WHATSAPP (VIA SOCKETS - COM AUTO QR-CODE)
 // ---------------------------------------------------------
 let waSocket = null;
 
 async function initWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('/opt/render/project/src/.wwebjs_auth');
-  
+
   waSocket = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }), 
+    logger: pino({ level: 'silent' }),
     browser: ["Bot NewNorte", "Chrome", "1.0.0"]
   });
 
   waSocket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
-    
     if (qr) {
-      console.log('\n==================================================');
-      console.log('[WHATSAPP] Escaneie o QR Code abaixo com o seu celular:');
+      console.log('--- NOVO QR CODE GERADO ---');
       qrcode.generate(qr, { small: true });
-      console.log('==================================================\n');
+      console.log('Escaneie o código acima usando o WhatsApp do seu celular.');
     }
-
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      
-      if (shouldReconnect) {
-        console.log(`[WHATSAPP] Conexão caiu. Tentando de novo em 5s...`);
-        setTimeout(initWhatsApp, 5000); 
-      } else {
-        console.log('[WHATSAPP] Desconectado permanentemente (Logout). Apague o disco para novo QR.');
-      }
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Conexão com o WhatsApp fechada. Reconectando:', shouldReconnect);
+      if (shouldReconnect) initWhatsApp();
     } else if (connection === 'open') {
-      console.log('[WHATSAPP] Conectado com sucesso via WebSockets!');
+      console.log('WhatsApp conectado com sucesso!');
     }
   });
 
   waSocket.ev.on('creds.update', saveCreds);
-
-  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
-    if (!msg.message) return;
-    
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-    const comando = text?.trim().toLowerCase();
-
-    if (comando === '!id') {
-      try {
-        const chatId = msg.key.remoteJid;
-        await waSocket.sendMessage(chatId, { 
-          text: `🤖 *Bot NewNorte*\n\nO ID deste grupo/conversa é:\n*${chatId}*\n\n_Copie esse código inteiro e cole no Redmine._` 
-        });
-      } catch (error) {
-        console.error('[ERRO WHATSAPP] Falha ao enviar ID:', error.message);
-      }
-    }
-  });
 }
 
 initWhatsApp();
@@ -113,23 +96,49 @@ initWhatsApp();
 const redis = REDIS_URL ? new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableReadyCheck: false }) : null;
 const memory = { values: new Map(), meetIssues: new Set(), notified: new Set(), alerts: new Set() };
 
-async function redisSet(key, value) {
-  const ttl = Number(REDIS_TTL_DAYS) * 86400;
-  if (redis) { await redis.set(key, value, 'EX', ttl); return; }
+async function redisSet(key, value, customTtl) {
+  const ttl = customTtl || Number(REDIS_TTL_DAYS) * 86400;
+  if (redis) {
+    await redis.set(key, value, 'EX', ttl);
+    return;
+  }
   memory.values.set(key, value);
   setTimeout(() => memory.values.delete(key), ttl * 1000);
 }
-async function redisGet(key) { return redis ? redis.get(key) : (memory.values.get(key) || null); }
-async function redisDel(key) { if (redis) { await redis.del(key); } else { memory.values.delete(key); } }
-async function redisSetAdd(key, value) { if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); } }
-async function redisSetRemove(key, value) { if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); } }
-async function redisSetMembers(key) { return redis ? redis.smembers(key) : Array.from(memory.meetIssues); }
-async function wasAlreadyNotified(key) { return redis ? (await redis.get(key)) === '1' : memory.notified.has(key); }
+
+async function redisGet(key) {
+  return redis ? redis.get(key) : (memory.values.get(key) || null);
+}
+
+async function redisDel(key) {
+  if (redis) { await redis.del(key); } else { memory.values.delete(key); }
+}
+
+async function redisSetAdd(key, value) {
+  if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); }
+}
+
+async function redisSetRemove(key, value) {
+  if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); }
+}
+
+async function redisSetMembers(key) {
+  return redis ? redis.smembers(key) : Array.from(memory.meetIssues);
+}
+
+async function wasAlreadyNotified(key) {
+  return redis ? (await redis.get(key)) === '1' : memory.notified.has(key);
+}
+
 async function markAsNotified(key) {
   const ttl = Number(REDIS_TTL_DAYS) * 86400;
   if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.notified.add(key); }
 }
-async function wasAppointmentAlertSent(key) { return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key); }
+
+async function wasAppointmentAlertSent(key) {
+  return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key);
+}
+
 async function markAppointmentAlertSent(key) {
   const ttl = Number(REDIS_TTL_DAYS) * 86400;
   if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.alerts.add(key); }
@@ -138,23 +147,38 @@ async function markAppointmentAlertSent(key) {
 // ---------------------------------------------------------
 // 3. UTILITÁRIOS E DATAS
 // ---------------------------------------------------------
-function normalizeText(value) { return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
-function isMeetStatus(issue) { return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME); }
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function isMeetStatus(issue) {
+  return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME);
+}
+
 function shouldIgnoreIssueByStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
   return String(IGNORE_STATUSES).split(',').map(normalizeText).filter(Boolean).includes(status);
 }
-function getLastJournal(issue) { return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null; }
-function getEventKey(issue, source, journal) { return `event:${issue.id}:${journal ? journal.id : source}`; }
+
+function getLastJournal(issue) {
+  return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null;
+}
+
+function getEventKey(issue, source, journal) {
+  return `event:${issue.id}:${journal ? journal.id : source}`;
+}
+
 function getCustomFieldValue(entity, fieldName) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
   return fields.find(f => f.name === fieldName || f.custom_field_name === fieldName)?.value || null;
 }
+
 function setCustomFieldValue(entity, fieldName, value) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   if (field) field.value = value;
 }
+
 function getCustomFieldId(issue, fieldName) {
   const fields = issue?.custom_fields || issue?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
@@ -165,9 +189,11 @@ function parseAppointmentDateTime(issue) {
   const date = issue.start_date || issue.due_date;
   const timeValueRaw = getCustomFieldValue(issue, ALERT_FIELD_NAME);
   if (!date || !timeValueRaw) return null;
+
   const timeValue = String(timeValueRaw).trim().toLowerCase().replace(/\s+/g, '');
   let parsedTime = dayjs(timeValue, ['HH:mm', 'HHhmm', 'HHh'], false);
   if (!parsedTime.isValid()) return null;
+
   const dateTime = dayjs.tz(`${date} ${parsedTime.format('HH:mm')}`, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").toDate();
   return { dateTime, timeLabel: parsedTime.format('HH[h]mm') };
 }
@@ -180,7 +206,7 @@ function getEstimatedMinutes(issue) {
 function isDailySummaryTime() {
   if (DAILY_SUMMARY_ENABLED !== 'true') return false;
   const now = dayjs().tz('America/Sao_Paulo');
-  const day = now.day(); 
+  const day = now.day();
   if (day === 0 || day === 6) return false;
   return now.hour() === Number(DAILY_SUMMARY_HOUR) && now.minute() === Number(DAILY_SUMMARY_MINUTE);
 }
@@ -189,6 +215,8 @@ function getNextBusinessSummaryDateString() {
   let target = dayjs().tz('America/Sao_Paulo');
   if (target.day() === 5) {
     target = target.add(3, 'day');
+  } else if (target.day() === 6) {
+    target = target.add(2, 'day');
   } else {
     target = target.add(1, 'day');
   }
@@ -196,14 +224,17 @@ function getNextBusinessSummaryDateString() {
 }
 
 // ---------------------------------------------------------
-// 4. INTEGRAÇÕES API (REDMINE E MATTERMOST)
+// 4. INTEGRAÇÕES API
 // ---------------------------------------------------------
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
   if (!fieldId) return;
-  await axios.put(`${REDMINE_URL}/issues/${issue.id}.json`, { issue: { custom_fields: [{ id: fieldId, value }] } }, { headers: redmineHeaders });
+  await axios.put(`${REDMINE_URL}/issues/${issue.id}.json`, {
+    issue: { custom_fields: [{ id: fieldId, value }] }
+  }, { headers: redmineHeaders });
   setCustomFieldValue(issue, fieldName, value);
 }
+
 async function getRedmineProject(projectId) {
   if (!projectId) return null;
   try {
@@ -211,34 +242,45 @@ async function getRedmineProject(projectId) {
     return response.data.project;
   } catch { return null; }
 }
+
 async function getRedmineUser(userId) {
   const response = await axios.get(`${REDMINE_URL}/users/${userId}.json`, { headers: redmineHeaders });
   return response.data.user;
 }
+
 async function getRedmineGroup(groupId) {
   try {
     const response = await axios.get(`${REDMINE_URL}/groups/${groupId}.json?include=users`, { headers: redmineHeaders });
     return response.data.group;
   } catch { return null; }
 }
-function isRedmineUserActive(user) { return user && user.mail && (!user.status || Number(user.status) === 1); }
+
+function isRedmineUserActive(user) {
+  return user && user.mail && (!user.status || Number(user.status) === 1);
+}
 
 async function getResponsibleTargets(issue) {
   const assignee = issue.assignee || issue.assigned_to;
   if (!assignee) return [];
-  if (typeof assignee.id === 'string' && assignee.id.includes('@')) return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
+
+  if (typeof assignee.id === 'string' && assignee.id.includes('@')) {
+    return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
+  }
   try {
     const user = await getRedmineUser(assignee.id);
     if (isRedmineUserActive(user)) return [{ email: user.mail.toLowerCase(), name: `${user.firstname} ${user.lastname}`.trim() }];
   } catch {}
+
   const group = await getRedmineGroup(assignee.id);
   if (!group?.users?.length) return [];
+
   const usersPromises = group.users.map(async (groupUser) => {
     try {
       const fullUser = await getRedmineUser(groupUser.id);
       if (isRedmineUserActive(fullUser)) return { email: fullUser.mail.toLowerCase(), name: `${fullUser.firstname} ${fullUser.lastname}`.trim() };
     } catch { return null; }
   });
+
   return (await Promise.all(usersPromises)).filter(Boolean);
 }
 
@@ -246,48 +288,68 @@ async function getMattermostBotUser() {
   const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, { headers: mattermostHeaders });
   return response.data;
 }
+
 async function getMattermostUserByEmail(email) {
   const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`, { headers: mattermostHeaders });
   return response.data;
 }
+
 async function createDirectChannel(botUserId, targetUserId) {
   const response = await axios.post(`${MATTERMOST_URL}/api/v4/channels/direct`, [botUserId, targetUserId], { headers: mattermostHeaders });
   return response.data;
 }
+
 async function sendMattermostMessage(channelId, message) {
   await axios.post(`${MATTERMOST_URL}/api/v4/posts`, { channel_id: channelId, message }, { headers: mattermostHeaders });
 }
+
 async function notifyTargets(targets, message) {
-  const botUser = await getMattermostBotUser();
-  for (const target of targets) {
-    try {
-      const mmUser = await getMattermostUserByEmail(target.email);
-      if (mmUser.delete_at && mmUser.delete_at > 0) continue;
-      const channel = await createDirectChannel(botUser.id, mmUser.id);
-      await sendMattermostMessage(channel.id, message);
-    } catch (error) {}
-  }
+  try {
+    const botUser = await getMattermostBotUser();
+    for (const target of targets) {
+      try {
+        const mmUser = await getMattermostUserByEmail(target.email);
+        if (mmUser.delete_at && mmUser.delete_at > 0) continue;
+        const channel = await createDirectChannel(botUser.id, mmUser.id);
+        await sendMattermostMessage(channel.id, message);
+      } catch (error) {}
+    }
+  } catch (err) {}
 }
 
 // ---------------------------------------------------------
 // 5. GOOGLE CALENDAR E MEET
 // ---------------------------------------------------------
-function googleCalendarIsConfigured() { return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN && GOOGLE_CALENDAR_ID); }
-function getGoogleCalendarClient() {
+function googleCalendarIsConfigured() {
+  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN && GOOGLE_CALENDAR_ID);
+}
+
+切实 de getGoogleCalendarClient() {
   const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
   auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
   return google.calendar({ version: 'v3', auth });
 }
+
 async function getMeetProjectName(issue) {
   if (!issue.project?.id) return '';
   const project = await getRedmineProject(issue.project.id);
   return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) || project?.parent?.name || project?.name || issue.project?.name || '';
 }
+
 async function findGoogleEventForIssue(calendar, issueId) {
-  const response = await calendar.events.list({ calendarId: GOOGLE_CALENDAR_ID, q: `#${issueId}`, maxResults: 10, singleEvents: false, showDeleted: false });
+  const response = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    q: `#${issueId}`,
+    maxResults: 10,
+    singleEvents: false,
+    showDeleted: false
+  });
   return response.data.items?.find(event => event.summary?.startsWith(`#${issueId}`)) || null;
 }
-function extractMeetLink(event) { return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null; }
+
+function extractMeetLink(event) {
+  return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null;
+}
 
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
@@ -324,13 +386,13 @@ async function processGoogleMeet(issue) {
   const startDate = appointment.dateTime;
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
   const projectName = await getMeetProjectName(issue);
-  const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
-  const signature = JSON.stringify({ summary, start: startDate.toISOString(), end: endDate.toISOString() });
-  
+
   if (projectName) {
-    await getOrCreateClientFolder(projectName);
+    await getOrCreateClientFolderStructure(projectName).catch(() => {});
   }
 
+  const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
+  const signature = JSON.stringify({ summary, start: startDate.toISOString(), end: endDate.toISOString() });
   const signatureKey = `redmine:meet:signature:${issue.id}`;
   const oldSignature = await redisGet(signatureKey);
   const calendar = getGoogleCalendarClient();
@@ -338,13 +400,14 @@ async function processGoogleMeet(issue) {
   let event = null;
 
   if (eventId) {
-    try { event = (await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId })).data; } catch { eventId = null; }
+    try {
+      event = (await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId })).data;
+    } catch { eventId = null; }
   }
   if (!eventId) {
     event = await findGoogleEventForIssue(calendar, issue.id);
     eventId = event?.id || null;
   }
-  
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
     if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) {
@@ -354,7 +417,8 @@ async function processGoogleMeet(issue) {
   }
 
   const requestBody = {
-    summary, description: `Tarefa Redmine: #${issue.id}\n${REDMINE_URL}/issues/${issue.id}`,
+    summary,
+    description: `Tarefa Redmine: #${issue.id}\n${REDMINE_URL}/issues/${issue.id}`,
     start: { dateTime: startDate.toISOString(), timeZone: 'America/Sao_Paulo' },
     end: { dateTime: endDate.toISOString(), timeZone: 'America/Sao_Paulo' },
     extendedProperties: { private: { redmineIssueId: String(issue.id) } }
@@ -366,8 +430,17 @@ async function processGoogleMeet(issue) {
       event = response.data;
     } else {
       const response = await calendar.events.insert({
-        calendarId: GOOGLE_CALENDAR_ID, conferenceDataVersion: 1,
-        requestBody: { ...requestBody, conferenceData: { createRequest: { requestId: `redmine-${issue.id}-${Date.now()}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } } }
+        calendarId: GOOGLE_CALENDAR_ID,
+        conferenceDataVersion: 1,
+        requestBody: {
+          ...requestBody,
+          conferenceData: {
+            createRequest: {
+              requestId: `redmine-${issue.id}-${Date.now()}`,
+              conferenceSolutionKey: { type: 'hangoutsMeet' }
+            }
+          }
+        }
       });
       event = response.data;
     }
@@ -383,7 +456,7 @@ async function processGoogleMeet(issue) {
 }
 
 // ---------------------------------------------------------
-// 6. GOOGLE DRIVE (GESTÃO DE PASTAS E ESTRUTURA DE CLIENTES)
+// 6. GOOGLE DRIVE
 // ---------------------------------------------------------
 function getGoogleDriveClient() {
   const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
@@ -391,131 +464,65 @@ function getGoogleDriveClient() {
   return google.drive({ version: 'v3', auth });
 }
 
-// Função auxiliar para validar e criar subpastas internas
-async function getOrCreateSubfolder(drive, subfolderName, parentFolderId) {
-  const response = await drive.files.list({
-    q: `name = '${subfolderName}' and '${parentFolderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-    fields: 'files(id, name)',
-    maxResults: 1
-  });
+async function getOrCreateFolder(drive, name, parentId) {
+  let query = `name = '${name.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  if (parentId) query += ` and '${parentId}' in parents`;
 
-  const existingFolder = response.data.files?.[0];
-  if (existingFolder) return existingFolder.id;
+  const res = await drive.files.list({ q: query, fields: 'files(id)' });
+  const found = res.data.files || res.data.items || [];
+  if (found.length > 0) return found[0].id;
 
-  const fileMetadata = {
-    name: subfolderName,
-    mimeType: 'application/vnd.google-apps.folder',
-    parents: [parentFolderId]
-  };
-
-  const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
+  const metadata = { name, mimeType: 'application/vnd.google-apps.folder', parents: parentId ? [parentId] : [] };
+  const folder = await drive.files.create({ resource: metadata, fields: 'id' });
   return folder.data.id;
 }
 
-// Gerencia a pasta do cliente e garante a estrutura interna ("Treinamentos" e "Arquivos")
-async function getOrCreateClientFolder(projectName) {
-  if (!projectName) return null;
-  
-  const parentId = process.env.GOOGLE_DRIVE_CLIENTES_FOLDER_ID;
-  if (!parentId) {
-    console.error('[ERRO DRIVE] ID da pasta raiz "Clientes" não configurado.');
-    return null;
-  }
-
+async function getOrCreateClientFolderStructure(projectName) {
+  if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID) return null;
   const drive = getGoogleDriveClient();
-
-  try {
-    let response = await drive.files.list({
-      q: `name = '${projectName}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-      fields: 'files(id, name)',
-      maxResults: 1
-    });
-
-    let clientFolderId = response.data.files?.[0]?.id;
-
-    if (!clientFolderId) {
-      const fileMetadata = {
-        name: projectName,
-        mimeType: 'application/vnd.google-apps.folder',
-        parents: [parentId]
-      };
-
-      const folder = await drive.files.create({ resource: fileMetadata, fields: 'id' });
-      clientFolderId = folder.data.id;
-      console.log(`[DRIVE] Nova pasta criada para o cliente: ${projectName} (ID: ${clientFolderId})`);
-    }
-
-    // Garante a existência das duas subpastas solicitadas
-    const treinamentosFolderId = await getOrCreateSubfolder(drive, 'Treinamentos', clientFolderId);
-    await getOrCreateSubfolder(drive, 'Arquivos', clientFolderId);
-
-    // Retorna os IDs estruturados
-    return { clientFolderId, treinamentosFolderId };
-
-  } catch (error) {
-    console.error(`[ERRO DRIVE] Falha ao gerenciar estrutura da pasta do cliente ${projectName}:`, error.message);
-    return null;
-  }
+  const clientFolderId = await getOrCreateFolder(drive, projectName, GOOGLE_DRIVE_CLIENTES_FOLDER_ID);
+  const treinamentosFolderId = await getOrCreateFolder(drive, 'Treinamentos', clientFolderId);
+  const arquivosFolderId = await getOrCreateFolder(drive, 'Arquivos', clientFolderId);
+  return { clientFolderId, treinamentosFolderId, arquivosFolderId };
 }
 
-// Varre a pasta de gravações e move os vídeos para a subpasta "Treinamentos" do cliente correto
 async function processMeetRecordings() {
-  const recordingsFolderId = GOOGLE_DRIVE_MEET_RECORDINGS_FOLDER_ID;
-  if (!recordingsFolderId) {
-    console.error('[ERRO DRIVE] ID da pasta "Meet Recordings" não configurado no .env.');
-    return;
-  }
-
-  const drive = getGoogleDriveClient();
-
+  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
   try {
-    const response = await drive.files.list({
-      q: `'${recordingsFolderId}' in parents and name contains '#' and trashed = false`,
-      fields: 'files(id, name, parents)',
-      pageSize: 50
+    const drive = getGoogleDriveClient();
+    const res = await drive.files.list({
+      q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
+      fields: 'files(id, name)'
     });
-
-    const files = response.data.files || [];
-    
+    const files = res.data.files || res.data.items || [];
     for (const file of files) {
       const match = file.name.match(/#(\d+)/);
-      if (!match) continue;
-
-      const issueId = match[1];
-      console.log(`[DRIVE] Nova gravação identificada para a tarefa #${issueId}: "${file.name}"`);
-
-      try {
-        const issue = await fetchIssueDetails(issueId);
-        const projectName = await getMeetProjectName(issue);
-
-        if (!projectName) {
-          console.log(`[DRIVE] Não foi possível mapear o Nome Fantasia para a tarefa #${issueId}.`);
-          continue;
+      if (match) {
+        const issueId = match[1];
+        try {
+          const issue = await fetchIssueDetails(issueId);
+          if (issue) {
+            const projectName = await getMeetProjectName(issue);
+            if (projectName) {
+              const structure = await getOrCreateClientFolderStructure(projectName);
+              if (structure?.treinamentosFolderId) {
+                await drive.files.update({
+                  fileId: file.id,
+                  addParents: structure.treinamentosFolderId,
+                  removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+                  fields: 'id, parents'
+                });
+                console.log(`[DRIVE] Vídeo da tarefa #${issueId} movido com sucesso para a subpasta Treinamentos do cliente ${projectName}`);
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`Erro ao processar gravação para a tarefa #${issueId}:`, err.message);
         }
-
-        // Garante a existência da pasta e extrai o ID da subpasta Treinamentos
-        const folderStructure = await getOrCreateClientFolder(projectName);
-        if (!folderStructure || !folderStructure.treinamentosFolderId) continue;
-
-        const targetFolderId = folderStructure.treinamentosFolderId;
-        const currentParents = file.parents?.join(',') || recordingsFolderId;
-        
-        // Move o arquivo trocando a pasta pai original pela pasta de Treinamentos do cliente
-        await drive.files.update({
-          fileId: file.id,
-          addParents: targetFolderId,
-          removeParents: currentParents,
-          fields: 'id, parents'
-        });
-
-        console.log(`[DRIVE] Sucesso! Vídeo "${file.name}" movido para a pasta "Treinamentos" do cliente: "${projectName}"`);
-
-      } catch (err) {
-        console.error(`[ERRO DRIVE] Erro ao processar o arquivo "${file.name}" da tarefa #${issueId}:`, err.message);
       }
     }
   } catch (error) {
-    console.error('[ERRO DRIVE] Falha ao listar arquivos na pasta de gravações do Meet:', error.message);
+    console.error('Erro geral no processamento de gravações do Meet:', error);
   }
 }
 
@@ -525,64 +532,67 @@ async function processMeetRecordings() {
 function buildNotificationMessage(issue, action, source) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   return [
-    `### Notificação do Redmine`, ``, `Você recebeu uma notificação da tarefa **#${issue.id}**.`, ``,
-    `**Origem:** ${source}`, `**Ação:** ${action}`, `**Projeto:** ${issue.project?.name || ''}`,
-    `**Assunto:** ${issue.subject}`, `**Status:** ${issue.status?.name || ''}`,
-    meetLink ? `**Google Meet:** ${meetLink}` : null, ``, `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
+    `### Notificação do Redmine`,
+    ``,
+    `Você recebeu uma notificação da tarefa **#${issue.id}**.`,
+    ``,
+    `Origem: ${source}`,
+    `Ação: ${action}`,
+    `Projeto: ${issue.project?.name || ''}`,
+    `Assunto: ${issue.subject}`,
+    `Status: ${issue.status?.name || ''}`,
+    meetLink ? `Google Meet: ${meetLink}` : null,
+    ``,
+    `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
 }
 
 function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   return [
-    `### ⏰ Lembrete de Reunião`, ``, `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issue.id}**.`, ``,
-    `**Projeto:** ${issue.project?.name || ''}`, `**Assunto:** ${issue.subject}`, `**Horário:** ${timeLabel}`,
-    meetLink ? `**Link do Google Meet:** ${meetLink}` : null, ``, `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
+    `### ⏰ Lembrete de Reunião`,
+    ``,
+    `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issue.id}**.`,
+    ``,
+    `Projeto: ${issue.project?.name || ''}`,
+    `Assunto: ${issue.subject}`,
+    `Horário: ${timeLabel}`,
+    meetLink ? `Link do Google Meet: ${meetLink}` : null,
+    ``,
+    `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
 }
 
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
-  let publicoAlvoText = '';
   
+  let publicoAlvo = '';
   if (publicoAlvoRaw) {
     if (Array.isArray(publicoAlvoRaw)) {
-      publicoAlvoText = publicoAlvoRaw.filter(Boolean).join(' / ');
+      publicoAlvo = publicoAlvoRaw.map(v => typeof v === 'object' ? (v.value || v.name) : v).join(' / ');
     } else {
-      publicoAlvoText = String(publicoAlvoRaw).trim();
+      publicoAlvo = String(publicoAlvoRaw).trim();
     }
   }
 
-  let msg = `🔔 *Lembrete de Compromisso | NewNorte*\n\n`;
-  msg += `Olá! Passando para lembrar que a nossa reunião começará em *${alertMinutes} minutos*.\n\n`;
-  msg += `📌 *Assunto:* ${issue.subject}\n`;
-  
-  if (publicoAlvoText) {
-    msg += `👥 *Público Alvo:* ${publicoAlvoText}\n`;
+  let msg = `⏰ *Lembrete de Compromisso*\n\n`;
+  msg += `Faltam ${alertMinutes} minutos para a reunião do seu compromisso.\n\n`;
+  msg += `*Projeto:* ${issue.project?.name || ''}\n`;
+  msg += `*Assunto:* ${issue.subject}\n`;
+  if (publicoAlvo) {
+    msg += `*Público Alvo:* ${publicoAlvo}\n`;
   }
-  
-  msg += `⏰ *Horário:* ${timeLabel}\n`;
+  msg += `*Horário:* ${timeLabel}\n`;
   
   if (meetLink) {
-    msg += `\n💻 *Para entrar na sala virtual, clique no link abaixo:*\n👉 ${meetLink}\n`;
+    msg += `\n*👉 Link do Google Meet (Clique no link abaixo para entrar):*\n${meetLink}\n`;
   }
   
-  msg += `\nEstamos te aguardando. Até já! 🚀\n\n`;
-  msg += `⏳ O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado. Após esse período, a sala será encerrada e será necessário entrar em contato conosco para reagendamento do treinamento.`;
-  msg += `\n\n_${issue.project?.name || 'Atendimento'} | Ref: #${issue.id}_`;
+  msg += `\nEstamos te aguardando!\n\n`;
+  msg += `⏳ *Observação:* O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado. Após esse período, a sala será encerrada e será necessário entrar em contato conosco para reagendamento do treinamento.\n`;
   
   return msg;
-}
-
-async function buildDailySummaryLine(issue) {
-  const projectName = await getMeetProjectName(issue);
-  const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME) || '';
-  const meetLink = getCustomFieldValue(issue, 'Google Meet');
-  return {
-    sort: `${issue.start_date || issue.due_date || ''} ${horario}`,
-    text: `- **${horario}**: #${issue.id} - ${projectName} - ${issue.subject}${meetLink ? ` *(Meet: ${meetLink})*` : ''}`
-  };
 }
 
 async function checkAppointmentAlert(issue) {
@@ -590,42 +600,31 @@ async function checkAppointmentAlert(issue) {
   const appointment = parseAppointmentDateTime(issue);
   if (!appointment) return;
 
-  const alertMinutesList = [Number(ALERT_MINUTES_BEFORE), Number(ALERT_EXTRA_MINUTES_BEFORE)].filter((v, i, a) => v > 0 && a.indexOf(v) === i);
-  
+  const alertMinutesList = [Number(ALERT_MINUTES_BEFORE), Number(ALERT_EXTRA_MINUTES_BEFORE)].filter(v => v > 0);
+  const now = new Date();
+
   for (const alertMinutes of alertMinutesList) {
     const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
-    const diffMs = new Date().getTime() - alertAt.getTime();
+    const diffMs = now.getTime() - alertAt.getTime();
     const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
 
-    if (diffMs < 0 || diffMs > windowMs) continue;
-
-    const alertKey = `redmine:appointment:${issue.id}:${appointment.dateTime.toISOString()}:${alertMinutes}`;
-    if (await wasAppointmentAlertSent(alertKey)) continue;
-
-    const mattermostMessage = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
-    const targets = await getResponsibleTargets(issue);
-    if (targets.length > 0) {
-      await notifyTargets(targets, mattermostMessage);
-    }
-
-    if (waSocket) {
-      const project = await getRedmineProject(issue.project?.id);
-      const groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
-      
-      if (groupId) {
-        try {
-          const cleanGroupId = String(groupId).trim();
-          const whatsAppMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
-          
-          await waSocket.sendMessage(cleanGroupId, { text: whatsAppMsg });
-          console.log(`[WHATSAPP] Alerta de ${alertMinutes}m enviado para o grupo ${cleanGroupId}`);
-        } catch (err) {
-          console.error(`[ERRO WHATSAPP] Falha ao enviar para ${groupId}:`, err.message);
+    if (diffMs >= 0 && diffMs <= windowMs) {
+      const alertKey = `alert:${issue.id}:${alertMinutes}`;
+      if (!(await wasAppointmentAlertSent(alertKey))) {
+        const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+        if (waGroupId && waSocket) {
+          const waMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
+          await waSocket.sendMessage(waGroupId.trim(), { text: waMsg });
+          await markAppointmentAlertSent(alertKey);
+        }
+        
+        const targets = await getResponsibleTargets(issue);
+        if (targets.length) {
+          const mmMessage = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
+          await notifyTargets(targets, mmMessage);
         }
       }
     }
-
-    await markAppointmentAlertSent(alertKey);
   }
 }
 
@@ -633,7 +632,7 @@ async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
   await processGoogleMeet(issue);
   if (isMeetStatus(issue)) return;
-  
+
   const eventKey = getEventKey(issue, source, journal);
   if (await wasAlreadyNotified(eventKey)) return;
 
@@ -646,7 +645,7 @@ async function processIssueNotification(issue, action, source, journal = null) {
 }
 
 // ---------------------------------------------------------
-// 8. POLLING DE ATUALIZAÇÕES E BUSCAS DE API
+// 7.5 POLLING DE ATUALIZAÇÕES E BUSCAS DE API
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
@@ -670,6 +669,7 @@ async function pollingRedmineIssues() {
         await processGoogleMeet(issueWithUrl);
         const lastJournal = getLastJournal(issueWithUrl);
         const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
+
         if (!(await wasAlreadyNotified(eventKey))) {
           await processIssueNotification(issueWithUrl, 'Atualização', 'Polling', lastJournal);
         }
@@ -688,8 +688,7 @@ async function fetchIssuesByDate(dateStr) {
       axios.get(`${REDMINE_URL}/issues.json`, { headers: redmineHeaders, params: { status_id: '*', due_date: dateStr, limit: 100 } }).catch(() => ({ data: { issues: [] } }))
     ]);
     const combined = [...(resStart.data.issues || []), ...(resDue.data.issues || [])];
-    const unique = Array.from(new Map(combined.map(i => [i.id, i])).values());
-    return unique;
+    return Array.from(new Map(combined.map(i => [i.id, i])).values());
   } catch (error) { return []; }
 }
 
@@ -708,7 +707,7 @@ async function pollingAppointmentAlerts() {
 }
 
 // ---------------------------------------------------------
-// 9. RESUMO DIÁRIO E FAXINA
+// 9. RESUMO DIÁRIO, RESUMO MATINAL E FAXINA
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
@@ -726,29 +725,86 @@ async function processDailySummary() {
       if (!horario) continue;
       const targets = await getResponsibleTargets(issue);
       if (!targets.length) continue;
-      const line = await buildDailySummaryLine(issue);
+
+      const projectName = await getMeetProjectName(issue);
+      const meetLink = getCustomFieldValue(issue, 'Google Meet');
+      const sortKey = `${issue.start_date || issue.due_date || ''} ${horario}`;
+      const lineText = `- ${horario}: #${issue.id} - ${projectName} - ${issue.subject}${meetLink ? ` (Meet: ${meetLink})` : ''}`;
+
       for (const target of targets) {
-        if (!groupedByEmail.has(target.email)) {
-          groupedByEmail.set(target.email, { target, lines: [] });
-        }
-        groupedByEmail.get(target.email).lines.push(line);
+        if (!groupedByEmail.has(target.email)) { groupedByEmail.set(target.email, { target, lines: [] }); }
+        groupedByEmail.get(target.email).lines.push({ sort: sortKey, text: lineText });
       }
     }
     for (const { target, lines } of groupedByEmail.values()) {
       lines.sort((a, b) => a.sort.localeCompare(b.sort));
-      const message = [`### 📅 Resumo de Compromissos (Próximo Dia Útil)`, ``, `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`, ``, ...lines.map(l => l.text)].join('\n');
+      const message = [
+        `### 📅 Resumo de Compromissos (Próximo Dia Útil)`,
+        ``,
+        `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`,
+        ``,
+        ...lines.map(l => l.text)
+      ].join('\n');
       await notifyTargets([target], message);
     }
     await markAsNotified(summaryKey);
   } catch (error) {}
 }
 
+async function processClientMorningSummary() {
+  if (CLIENT_SUMMARY_ENABLED !== 'true') return;
+  const now = dayjs().tz('America/Sao_Paulo');
+  const [tHour, tMinute] = String(CLIENT_SUMMARY_TIME || '08:30').split(':').map(Number);
+  if (now.hour() !== tHour || now.minute() !== tMinute) return;
+
+  const targetDate = getNextBusinessSummaryDateString();
+  const summaryKey = `whatsapp:client-morning-summary:${targetDate}`;
+  if (await wasAlreadyNotified(summaryKey)) return;
+
+  try {
+    const issueSummaries = await fetchIssuesByDate(targetDate);
+    for (const issueSummary of issueSummaries) {
+      if (shouldIgnoreIssueByStatus(issueSummary)) continue;
+      const issue = await fetchIssueDetails(issueSummary.id);
+      const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
+      if (!horario) continue;
+
+      const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+      if (waGroupId && waSocket) {
+        const appointment = parseAppointmentDateTime(issue);
+        const timeLabel = appointment ? appointment.timeLabel : horario;
+
+        let pollText = `📅 *Confirmação de Compromisso (Próximo Dia Útil)*\n\n`;
+        pollText += `Olá! Passando para lembrar e confirmar o nosso treinamento agendado:\n\n`;
+        pollText += `*Projeto:* ${issue.project?.name || ''}\n`;
+        pollText += `*Assunto:* ${issue.subject}\n`;
+        pollText += `*Horário:* ${timeLabel}\n\n`;
+        pollText += `Por favor, confirme sua presença clicando em uma das opções abaixo:`;
+
+        await waSocket.sendMessage(waGroupId.trim(), {
+          poll: {
+            name: pollText,
+            options: ['✅ Confirmar', '🗓️ Reagendar'],
+            selectableCount: 1
+          }
+        });
+      }
+    }
+    await markAsNotified(summaryKey);
+  } catch (error) {
+    console.error('Erro ao processar o resumo matinal do cliente:', error);
+  }
+}
+
 async function reconcileDeletedMeets() {
   try {
     const meetIssueIds = await redisSetMembers('redmine:meet:issues');
     for (const issueId of meetIssueIds) {
-      try { await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders }); } 
-      catch (err) { if (err.response?.status === 404) await deleteGoogleMeet(issueId); }
+      try {
+        await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders });
+      } catch (err) {
+        if (err.response?.status === 404) await deleteGoogleMeet(issueId);
+      }
     }
   } catch (error) {}
 }
@@ -774,22 +830,23 @@ function getDynamicInterval(baseIntervalSeconds) {
   const BASE_MS = Number(baseIntervalSeconds) * 1000;
 
   if (day === 0 || day === 6) return ONE_HOUR_MS;
-
-  const shift1Start = 7.75 * 3600 * 1000; 
+  const shift1Start = 7.75 * 3600 * 1000;
   const shift1End = 12 * 3600 * 1000;
-  const shift2Start = 13.25 * 3600 * 1000; 
-  const shift2End = 19 * 3600 * 1000; 
+  const shift2Start = 13.25 * 3600 * 1000;
+  const shift2End = 19 * 3600 * 1000;
 
   let targetInterval = BASE_MS;
-  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) { targetInterval = ONE_HOUR_MS; } 
-  else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) { targetInterval = LUNCH_BREAK_MS; }
-
+  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
+    targetInterval = ONE_HOUR_MS;
+  } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
+    targetInterval = LUNCH_BREAK_MS;
+  }
   const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
   for (const boundary of boundaries) {
     if (msSinceMidnight < boundary) {
       const msUntilBoundary = boundary - msSinceMidnight;
       if (targetInterval > msUntilBoundary) targetInterval = msUntilBoundary;
-      break; 
+      break;
     }
   }
   return Math.max(targetInterval, BASE_MS);
@@ -797,8 +854,7 @@ function getDynamicInterval(baseIntervalSeconds) {
 
 function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
   async function run() {
-    try { await taskFn(); } catch (err) {} 
-    finally {
+    try { await taskFn(); } catch (err) {} finally {
       const nextInterval = getDynamicInterval(baseIntervalSeconds);
       if (nextInterval > (baseIntervalSeconds * 1000)) {
         const nextTime = dayjs().add(nextInterval, 'ms').tz('America/Sao_Paulo').format('HH:mm:ss');
@@ -815,22 +871,25 @@ const app = express();
 app.get('/polling-now', async (req, res) => {
   await pollingRedmineIssues();
   await pollingAppointmentAlerts();
-  await processDailySummary(); 
+  await processDailySummary();
+  await processClientMorningSummary();
   await reconcileDeletedMeets();
-  await processMeetRecordings(); 
+  await processMeetRecordings();
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Precisão Máxima, Organização Drive e WhatsApp Ativos.'); });
+app.get('/', (req, res) => {
+  res.send('API Bot - Precisão Máxima, Organização Drive e WhatsApp Ativos.');
+});
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
-  
   if (String(POLLING_ENABLED) === 'true') {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
-    startSmartPolling(processMeetRecordings, 900, 'Organizador de Gravações'); 
+    startSmartPolling(processMeetRecordings, 900, 'Gravações Meet');
     setInterval(processDailySummary, 60000);
+    setInterval(processClientMorningSummary, 60000);
   }
 });
