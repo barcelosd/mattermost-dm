@@ -387,9 +387,8 @@ async function processGoogleMeet(issue) {
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
   const projectName = await getMeetProjectName(issue);
 
-  if (projectName) {
-    await getOrCreateClientFolderStructure(projectName).catch(() => {});
-  }
+  // Executa a validação e criação de pastas estruturadas no Drive
+  await getOrCreateClientFolderStructure(issue).catch(() => {});
 
   const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
   const signature = JSON.stringify({ summary, start: startDate.toISOString(), end: endDate.toISOString() });
@@ -421,7 +420,7 @@ async function processGoogleMeet(issue) {
     description: `Tarefa Redmine: #${issue.id}\n${REDMINE_URL}/issues/${issue.id}`,
     start: { dateTime: startDate.toISOString(), timeZone: 'America/Sao_Paulo' },
     end: { dateTime: endDate.toISOString(), timeZone: 'America/Sao_Paulo' },
-    extendedProperties: { private: { redmineIssueId: String(issue.id) } }
+    extendedProperties: { private: { RedmineIssueId: String(issue.id) } }
   };
 
   try {
@@ -477,13 +476,40 @@ async function getOrCreateFolder(drive, name, parentId) {
   return folder.data.id;
 }
 
-async function getOrCreateClientFolderStructure(projectName) {
-  if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID) return null;
-  const drive = getGoogleDriveClient();
-  const clientFolderId = await getOrCreateFolder(drive, projectName, GOOGLE_DRIVE_CLIENTES_FOLDER_ID);
-  const treinamentosFolderId = await getOrCreateFolder(drive, 'Treinamentos', clientFolderId);
-  const arquivosFolderId = await getOrCreateFolder(drive, 'Arquivos', clientFolderId);
-  return { clientFolderId, treinamentosFolderId, arquivosFolderId };
+async function getOrCreateClientFolderStructure(issue) {
+  if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID || !issue?.project?.id) return null;
+  
+  try {
+    const project = await getRedmineProject(issue.project.id);
+    if (!project) return null;
+
+    // 1. Valida se a sincronização está ativa na configuração do projeto
+    const sincroniza = getCustomFieldValue(project, 'Sincroniza G-Drive');
+    if (!sincroniza || String(sincroniza).trim().toLowerCase() !== 'sim') {
+      console.log(`[DRIVE] Sincronização ignorada. O campo 'Sincroniza G-Drive' não está como 'Sim' no projeto: ${project.name}`);
+      return null;
+    }
+
+    // 2. Extrai os campos para formatação da pasta
+    const personalizacaoRaw = getCustomFieldValue(project, 'Personalização');
+    const nomeFantasiaRaw = getCustomFieldValue(project, 'Nome Fantasia') || project.name;
+
+    const personalizacao = personalizacaoRaw ? String(personalizacaoRaw).trim() : '';
+    const nomeFantasia = nomeFantasiaRaw ? String(nomeFantasiaRaw).trim() : '';
+
+    // 3. Define o nome estruturado: "Personalização - Nome Fantasia"
+    const folderName = personalizacao ? `${personalizacao} - ${nomeFantasia}` : nomeFantasia;
+
+    const drive = getGoogleDriveClient();
+    const clientFolderId = await getOrCreateFolder(drive, folderName, GOOGLE_DRIVE_CLIENTES_FOLDER_ID);
+    const treinamentosFolderId = await getOrCreateFolder(drive, 'Treinamentos', clientFolderId);
+    const arquivosFolderId = await getOrCreateFolder(drive, 'Arquivos', clientFolderId);
+    
+    return { clientFolderId, treinamentosFolderId, arquivosFolderId };
+  } catch (err) {
+    console.error(`[DRIVE] Erro ao gerar estrutura de pastas para a tarefa #${issue.id}:`, err.message);
+    return null;
+  }
 }
 
 async function processMeetRecordings() {
@@ -502,18 +528,15 @@ async function processMeetRecordings() {
         try {
           const issue = await fetchIssueDetails(issueId);
           if (issue) {
-            const projectName = await getMeetProjectName(issue);
-            if (projectName) {
-              const structure = await getOrCreateClientFolderStructure(projectName);
-              if (structure?.treinamentosFolderId) {
-                await drive.files.update({
-                  fileId: file.id,
-                  addParents: structure.treinamentosFolderId,
-                  removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-                  fields: 'id, parents'
-                });
-                console.log(`[DRIVE] Vídeo da tarefa #${issueId} movido com sucesso para a subpasta Treinamentos do cliente ${projectName}`);
-              }
+            const structure = await getOrCreateClientFolderStructure(issue);
+            if (structure?.treinamentosFolderId) {
+              await drive.files.update({
+                fileId: file.id,
+                addParents: structure.treinamentosFolderId,
+                removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+                fields: 'id, parents'
+              });
+              console.log(`[DRIVE] Vídeo da tarefa #${issueId} movido com sucesso para a subpasta Treinamentos.`);
             }
           }
         } catch (err) {
