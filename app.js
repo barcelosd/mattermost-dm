@@ -92,6 +92,26 @@ async function initWhatsApp() {
   });
 
   waSocket.ev.on('creds.update', saveCreds);
+
+  // REINTRODUZIDO: Ouvinte para comandos do WhatsApp (como o !id)
+  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    const from = msg.key.remoteJid;
+
+    if (text.trim().toLowerCase() === '!id') {
+      try {
+        await waSocket.sendMessage(from, { 
+          text: `🆔 *ID deste bate-papo/grupo:* \n\`${from}\`` 
+        }, { quoted: msg });
+      } catch (err) {
+        console.error('Erro ao responder ao comando !id:', err);
+      }
+    }
+  });
 }
 
 initWhatsApp();
@@ -140,7 +160,7 @@ function setCustomFieldValue(entity, fieldName, value) {
   if (field) field.value = value;
 }
 function getCustomFieldId(issue, fieldName) {
-  const fields = issue?.custom_fields || issue?.custom_field_values || [];
+  const fields = entity?.custom_fields || entity?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   return field?.id || field?.custom_field_id || null;
 }
@@ -552,7 +572,7 @@ async function pollingAppointmentAlerts() {
 }
 
 // ---------------------------------------------------------
-// 📑 [ BLOCO 4 ] MATTERMOST: RESUMO DIÁRIO (Padrão 17h45)
+// 9. [ BLOCO 4 ] MATTERMOST: RESUMO DIÁRIO (Padrão 17h45)
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
@@ -595,7 +615,7 @@ async function processDailySummary() {
 }
 
 // ---------------------------------------------------------
-// 📲 [ BLOCO 5 ] WHATSAPP: RESUMO DE CONFIRMAÇÃO (Padrão 08h30)
+// 10. [ BLOCO 5 ] WHATSAPP: RESUMO DE CONFIRMAÇÃO (Padrão 08h30)
 // ---------------------------------------------------------
 async function processClientMorningSummary() {
   if (CLIENT_SUMMARY_ENABLED !== 'true') return;
@@ -655,7 +675,7 @@ async function reconcileDeletedMeets() {
 async function fetchIssueDetails(issueId) { const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders, params: { include: 'journals' } }); return response.data.issue; }
 
 // ---------------------------------------------------------
-// 10. SMART SCHEDULER
+// 11. SMART SCHEDULER
 // ---------------------------------------------------------
 function getDynamicInterval(baseIntervalSeconds) {
   const now = dayjs().tz('America/Sao_Paulo');
