@@ -324,7 +324,7 @@ function googleCalendarIsConfigured() {
   return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN && GOOGLE_CALENDAR_ID);
 }
 
-切实 de getGoogleCalendarClient() {
+function getGoogleCalendarClient() {
   const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
   auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
   return google.calendar({ version: 'v3', auth });
