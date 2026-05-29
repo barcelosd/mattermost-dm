@@ -16,7 +16,7 @@ dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
 
 // ---------------------------------------------------------
-// 1. CONFIGURAÇÕES
+// 1. CONFIGURAÇÕES & PARAMETRIZAÇÃO (.env)
 // ---------------------------------------------------------
 const {
   PORT = 3000,
@@ -29,16 +29,24 @@ const {
   POLLING_ENABLED = 'true',
   POLLING_INTERVAL_SECONDS = 60,
   POLLING_LIMIT = 20,
-  ALERT_MINUTES_BEFORE = 5,
-  ALERT_EXTRA_MINUTES_BEFORE = 0,
+  
+  // Alertas de Compromisso Individuais
+  ALERT_MINUTES_BEFORE = 10,          // Bloco 1: Mattermost Antecipado
+  ALERT_EXTRA_MINUTES_BEFORE = 2,     // Bloco 2: Mattermost Imediato
+  WHATSAPP_ALERT_MINUTES_BEFORE = 5,  // Bloco 3: WhatsApp Alerta do Compromisso
   ALERT_WINDOW_SECONDS = 180,
   ALERT_FIELD_NAME = 'Horário',
   ALERT_POLLING_INTERVAL_SECONDS = 60,
+  
+  // Bloco 4: Resumo Diário Mattermost
   DAILY_SUMMARY_ENABLED = 'true',
   DAILY_SUMMARY_HOUR = 17,
   DAILY_SUMMARY_MINUTE = 45,
+  
+  // Bloco 5: Resumo de Confirmação WhatsApp
   CLIENT_SUMMARY_ENABLED = 'true',
   CLIENT_SUMMARY_TIME = '08:30',
+  
   IGNORE_STATUSES = 'Rejeitado,Fechado,Resolvido,Impedido pelo Cliente,Arquivada,Aguardando Link,Reagendar,Aguardando',
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
@@ -55,7 +63,7 @@ const redmineHeaders = { 'X-Redmine-API-Key': REDMINE_API_KEY, 'Content-Type': '
 const mattermostHeaders = { Authorization: `Bearer ${MATTERMOST_TOKEN}`, 'Content-Type': 'application/json' };
 
 // ---------------------------------------------------------
-// 1.5 INICIALIZAÇÃO DO WHATSAPP (VIA SOCKETS - COM AUTO QR-CODE)
+// 1.5 INICIALIZAÇÃO DO WHATSAPP (BAILEYS)
 // ---------------------------------------------------------
 let waSocket = null;
 
@@ -74,11 +82,9 @@ async function initWhatsApp() {
     if (qr) {
       console.log('--- NOVO QR CODE GERADO ---');
       qrcode.generate(qr, { small: true });
-      console.log('Escaneie o código acima usando o WhatsApp do seu celular.');
     }
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Conexão com o WhatsApp fechada. Reconectando:', shouldReconnect);
       if (shouldReconnect) initWhatsApp();
     } else if (connection === 'open') {
       console.log('WhatsApp conectado com sucesso!');
@@ -91,94 +97,48 @@ async function initWhatsApp() {
 initWhatsApp();
 
 // ---------------------------------------------------------
-// 2. CACHE E REDIS
+// 2. CACHE E CONTROLE DE DISPAROS (REDIS / MEMÓRIA)
 // ---------------------------------------------------------
 const redis = REDIS_URL ? new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableReadyCheck: false }) : null;
 const memory = { values: new Map(), meetIssues: new Set(), notified: new Set(), alerts: new Set() };
 
 async function redisSet(key, value, customTtl) {
   const ttl = customTtl || Number(REDIS_TTL_DAYS) * 86400;
-  if (redis) {
-    await redis.set(key, value, 'EX', ttl);
-    return;
-  }
+  if (redis) { await redis.set(key, value, 'EX', ttl); return; }
   memory.values.set(key, value);
   setTimeout(() => memory.values.delete(key), ttl * 1000);
 }
 
-async function redisGet(key) {
-  return redis ? redis.get(key) : (memory.values.get(key) || null);
-}
-
-async function redisDel(key) {
-  if (redis) { await redis.del(key); } else { memory.values.delete(key); }
-}
-
-async function redisSetAdd(key, value) {
-  if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); }
-}
-
-async function redisSetRemove(key, value) {
-  if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); }
-}
-
-async function redisSetMembers(key) {
-  return redis ? redis.smembers(key) : Array.from(memory.meetIssues);
-}
-
-async function wasAlreadyNotified(key) {
-  return redis ? (await redis.get(key)) === '1' : memory.notified.has(key);
-}
-
-async function markAsNotified(key) {
-  const ttl = Number(REDIS_TTL_DAYS) * 86400;
-  if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.notified.add(key); }
-}
-
-async function wasAppointmentAlertSent(key) {
-  return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key);
-}
-
-async function markAppointmentAlertSent(key) {
-  const ttl = Number(REDIS_TTL_DAYS) * 86400;
-  if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.alerts.add(key); }
-}
+async function redisGet(key) { return redis ? redis.get(key) : (memory.values.get(key) || null); }
+async function redisDel(key) { if (redis) { await redis.del(key); } else { memory.values.delete(key); } }
+async function redisSetAdd(key, value) { if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); } }
+async function redisSetRemove(key, value) { if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); } }
+async function redisSetMembers(key) { return redis ? redis.smembers(key) : Array.from(memory.meetIssues); }
+async function wasAlreadyNotified(key) { return redis ? (await redis.get(key)) === '1' : memory.notified.has(key); }
+async function markAsNotified(key) { const ttl = Number(REDIS_TTL_DAYS) * 86400; if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.notified.add(key); } }
+async function wasAppointmentAlertSent(key) { return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key); }
+async function markAppointmentAlertSent(key) { const ttl = Number(REDIS_TTL_DAYS) * 86400; if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.alerts.add(key); } }
 
 // ---------------------------------------------------------
-// 3. UTILITÁRIOS E DATAS
+// 3. UTILITÁRIOS DE PARSING E DATAS
 // ---------------------------------------------------------
-function normalizeText(value) {
-  return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-function isMeetStatus(issue) {
-  return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME);
-}
-
+function normalizeText(value) { return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function isMeetStatus(issue) { return normalizeText(issue?.status?.name) === normalizeText(MEET_STATUS_NAME); }
 function shouldIgnoreIssueByStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
   return String(IGNORE_STATUSES).split(',').map(normalizeText).filter(Boolean).includes(status);
 }
-
-function getLastJournal(issue) {
-  return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null;
-}
-
-function getEventKey(issue, source, journal) {
-  return `event:${issue.id}:${journal ? journal.id : source}`;
-}
-
+function getLastJournal(issue) { return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null; }
+function getEventKey(issue, source, journal) { return `event:${issue.id}:${journal ? journal.id : source}`; }
 function getCustomFieldValue(entity, fieldName) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
   return fields.find(f => f.name === fieldName || f.custom_field_name === fieldName)?.value || null;
 }
-
 function setCustomFieldValue(entity, fieldName, value) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
   if (field) field.value = value;
 }
-
 function getCustomFieldId(issue, fieldName) {
   const fields = issue?.custom_fields || issue?.custom_field_values || [];
   const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
@@ -206,25 +166,20 @@ function getEstimatedMinutes(issue) {
 function isDailySummaryTime() {
   if (DAILY_SUMMARY_ENABLED !== 'true') return false;
   const now = dayjs().tz('America/Sao_Paulo');
-  const day = now.day();
-  if (day === 0 || day === 6) return false;
+  if (now.day() === 0 || now.day() === 6) return false;
   return now.hour() === Number(DAILY_SUMMARY_HOUR) && now.minute() === Number(DAILY_SUMMARY_MINUTE);
 }
 
 function getNextBusinessSummaryDateString() {
   let target = dayjs().tz('America/Sao_Paulo');
-  if (target.day() === 5) {
-    target = target.add(3, 'day');
-  } else if (target.day() === 6) {
-    target = target.add(2, 'day');
-  } else {
-    target = target.add(1, 'day');
-  }
+  if (target.day() === 5) { target = target.add(3, 'day'); }
+  else if (target.day() === 6) { target = target.add(2, 'day'); }
+  else { target = target.add(1, 'day'); }
   return target.format('YYYY-MM-DD');
 }
 
 // ---------------------------------------------------------
-// 4. INTEGRAÇÕES API
+// 4. INTEGRAÇÕES API (REDMINE & MATTERMOST)
 // ---------------------------------------------------------
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
@@ -237,71 +192,32 @@ async function updateRedmineCustomField(issue, fieldName, value) {
 
 async function getRedmineProject(projectId) {
   if (!projectId) return null;
-  try {
-    const response = await axios.get(`${REDMINE_URL}/projects/${projectId}.json`, { headers: redmineHeaders });
-    return response.data.project;
-  } catch { return null; }
+  try { const response = await axios.get(`${REDMINE_URL}/projects/${projectId}.json`, { headers: redmineHeaders }); return response.data.project; } catch { return null; }
 }
-
-async function getRedmineUser(userId) {
-  const response = await axios.get(`${REDMINE_URL}/users/${userId}.json`, { headers: redmineHeaders });
-  return response.data.user;
-}
-
-async function getRedmineGroup(groupId) {
-  try {
-    const response = await axios.get(`${REDMINE_URL}/groups/${groupId}.json?include=users`, { headers: redmineHeaders });
-    return response.data.group;
-  } catch { return null; }
-}
-
-function isRedmineUserActive(user) {
-  return user && user.mail && (!user.status || Number(user.status) === 1);
-}
+async function getRedmineUser(userId) { const response = await axios.get(`${REDMINE_URL}/users/${userId}.json`, { headers: redmineHeaders }); return response.data.user; }
+async function getRedmineGroup(groupId) { try { const response = await axios.get(`${REDMINE_URL}/groups/${groupId}.json?include=users`, { headers: redmineHeaders }); return response.data.group; } catch { return null; } }
+function isRedmineUserActive(user) { return user && user.mail && (!user.status || Number(user.status) === 1); }
 
 async function getResponsibleTargets(issue) {
   const assignee = issue.assignee || issue.assigned_to;
   if (!assignee) return [];
-
-  if (typeof assignee.id === 'string' && assignee.id.includes('@')) {
-    return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
-  }
+  if (typeof assignee.id === 'string' && assignee.id.includes('@')) return [{ email: assignee.id.trim().toLowerCase(), name: assignee.name || assignee.id }];
   try {
     const user = await getRedmineUser(assignee.id);
     if (isRedmineUserActive(user)) return [{ email: user.mail.toLowerCase(), name: `${user.firstname} ${user.lastname}`.trim() }];
   } catch {}
-
   const group = await getRedmineGroup(assignee.id);
   if (!group?.users?.length) return [];
-
-  const usersPromises = group.users.map(async (groupUser) => {
-    try {
-      const fullUser = await getRedmineUser(groupUser.id);
-      if (isRedmineUserActive(fullUser)) return { email: fullUser.mail.toLowerCase(), name: `${fullUser.firstname} ${fullUser.lastname}`.trim() };
-    } catch { return null; }
+  const usersPromises = group.users.map(async (gUser) => {
+    try { const fu = await getRedmineUser(gUser.id); if (isRedmineUserActive(fu)) return { email: fu.mail.toLowerCase(), name: `${fu.firstname} ${fu.lastname}`.trim() }; } catch { return null; }
   });
-
   return (await Promise.all(usersPromises)).filter(Boolean);
 }
 
-async function getMattermostBotUser() {
-  const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, { headers: mattermostHeaders });
-  return response.data;
-}
-
-async function getMattermostUserByEmail(email) {
-  const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`, { headers: mattermostHeaders });
-  return response.data;
-}
-
-async function createDirectChannel(botUserId, targetUserId) {
-  const response = await axios.post(`${MATTERMOST_URL}/api/v4/channels/direct`, [botUserId, targetUserId], { headers: mattermostHeaders });
-  return response.data;
-}
-
-async function sendMattermostMessage(channelId, message) {
-  await axios.post(`${MATTERMOST_URL}/api/v4/posts`, { channel_id: channelId, message }, { headers: mattermostHeaders });
-}
+async function getMattermostBotUser() { const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, { headers: mattermostHeaders }); return response.data; }
+async function getMattermostUserByEmail(email) { const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`, { headers: mattermostHeaders }); return response.data; }
+async function createDirectChannel(botUserId, targetUserId) { const response = await axios.post(`${MATTERMOST_URL}/api/v4/channels/direct`, [botUserId, targetUserId], { headers: mattermostHeaders }); return response.data; }
+async function sendMattermostMessage(channelId, message) { await axios.post(`${MATTERMOST_URL}/api/v4/posts`, { channel_id: channelId, message }, { headers: mattermostHeaders }); }
 
 async function notifyTargets(targets, message) {
   try {
@@ -318,51 +234,89 @@ async function notifyTargets(targets, message) {
 }
 
 // ---------------------------------------------------------
-// 5. GOOGLE CALENDAR E MEET
+// ⚡️ ALERTAS DE COMPROMISSO (INSPEÇÃO DE BLOCOS)
 // ---------------------------------------------------------
-function googleCalendarIsConfigured() {
-  return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN && GOOGLE_CALENDAR_ID);
+async function checkAppointmentAlert(issue) {
+  if (shouldIgnoreIssueByStatus(issue)) return;
+  const appointment = parseAppointmentDateTime(issue);
+  if (!appointment) return;
+
+  const now = new Date();
+  const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
+
+  // --- [ BLOCO 1 ] MATTERMOST: 10 MINUTOS ANTES ---
+  const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);
+  const alertAtMM1 = new Date(appointment.dateTime.getTime() - mmMin1 * 60000);
+  const diffMsMM1 = now.getTime() - alertAtMM1.getTime();
+
+  if (diffMsMM1 >= 0 && diffMsMM1 <= windowMs) {
+    const alertKeyMM1 = `alert:mm10min:${issue.id}`;
+    if (!(await wasAppointmentAlertSent(alertKeyMM1))) {
+      const targets = await getResponsibleTargets(issue);
+      if (targets.length) {
+        const mmMessage = buildAppointmentMessage(issue, mmMin1, appointment.timeLabel);
+        await notifyTargets(targets, mmMessage);
+        await markAppointmentAlertSent(alertKeyMM1);
+      }
+    }
+  }
+
+  // --- [ BLOCO 2 ] MATTERMOST: 2 MINUTOS ANTES ---
+  const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);
+  const alertAtMM2 = new Date(appointment.dateTime.getTime() - mmMin2 * 60000);
+  const diffMsMM2 = now.getTime() - alertAtMM2.getTime();
+
+  if (diffMsMM2 >= 0 && diffMsMM2 <= windowMs) {
+    const alertKeyMM2 = `alert:mm2min:${issue.id}`;
+    if (!(await wasAppointmentAlertSent(alertKeyMM2))) {
+      const targets = await getResponsibleTargets(issue);
+      if (targets.length) {
+        const mmMessage = buildAppointmentMessage(issue, mmMin2, appointment.timeLabel);
+        await notifyTargets(targets, mmMessage);
+        await markAppointmentAlertSent(alertKeyMM2);
+      }
+    }
+  }
+
+  // --- [ BLOCO 3 ] WHATSAPP: EXCLUSIVO 5 MINUTOS ANTES ---
+  const waMin = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5); 
+  const alertAtWA = new Date(appointment.dateTime.getTime() - waMin * 60000);
+  const diffMsWA = now.getTime() - alertAtWA.getTime();
+
+  if (diffMsWA >= 0 && diffMsWA <= windowMs) {
+    const alertKeyWA = `alert:wa5min:${issue.id}`;
+    if (!(await wasAppointmentAlertSent(alertKeyWA))) {
+      const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+      if (waGroupId && waSocket) {
+        let groupJid = waGroupId.trim();
+        if (!groupJid.includes('@')) {
+          groupJid = `${groupJid}@g.us`;
+        }
+        const waMsg = buildWhatsAppMessage(issue, waMin, appointment.timeLabel);
+        await waSocket.sendMessage(groupJid, { text: waMsg });
+        await markAppointmentAlertSent(alertKeyWA);
+      }
+    }
+  }
 }
 
-function getGoogleCalendarClient() {
-  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return google.calendar({ version: 'v3', auth });
-}
-
-async function getMeetProjectName(issue) {
-  if (!issue.project?.id) return '';
-  const project = await getRedmineProject(issue.project.id);
-  return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) || project?.parent?.name || project?.name || issue.project?.name || '';
-}
-
-async function findGoogleEventForIssue(calendar, issueId) {
-  const response = await calendar.events.list({
-    calendarId: GOOGLE_CALENDAR_ID,
-    q: `#${issueId}`,
-    maxResults: 10,
-    singleEvents: false,
-    showDeleted: false
-  });
-  return response.data.items?.find(event => event.summary?.startsWith(`#${issueId}`)) || null;
-}
-
-function extractMeetLink(event) {
-  return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null;
-}
+// ---------------------------------------------------------
+// 5. GOOGLE CALENDAR & MEET
+// ---------------------------------------------------------
+function googleCalendarIsConfigured() { return Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN && GOOGLE_CALENDAR_ID); }
+function getGoogleCalendarClient() { const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET); auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN }); return google.calendar({ version: 'v3', auth }); }
+function getGoogleDriveClient() { const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET); auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN }); return google.drive({ version: 'v3', auth }); }
+async function getMeetProjectName(issue) { if (!issue.project?.id) return ''; const project = await getRedmineProject(issue.project.id); return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) || project?.parent?.name || project?.name || issue.project?.name || ''; }
+async function findGoogleEventForIssue(calendar, issueId) { const response = await calendar.events.list({ calendarId: GOOGLE_CALENDAR_ID, q: `#${issueId}`, maxResults: 10, singleEvents: false, showDeleted: false }); return response.data.items?.find(event => event.summary?.startsWith(`#${issueId}`)) || null; }
+function extractMeetLink(event) { return event.hangoutLink || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri || null; }
 
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
   const calendar = getGoogleCalendarClient();
   let eventId = await redisGet(`redmine:meet:event:${issueId}`);
   try {
-    if (!eventId) {
-      const event = await findGoogleEventForIssue(calendar, issueId);
-      eventId = event?.id || null;
-    }
-    if (eventId) {
-      await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
-    }
+    if (!eventId) { const event = await findGoogleEventForIssue(calendar, issueId); eventId = event?.id || null; }
+    if (eventId) await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId });
   } catch (error) {
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
@@ -378,16 +332,12 @@ async function processGoogleMeet(issue) {
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
-  if (!isMeet || !appointment || !estimatedMinutes) {
-    await deleteGoogleMeet(issue.id);
-    return;
-  }
+  if (!isMeet || !appointment || !estimatedMinutes) { await deleteGoogleMeet(issue.id); return; }
 
   const startDate = appointment.dateTime;
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
   const projectName = await getMeetProjectName(issue);
 
-  // Executa a validação e criação de pastas estruturadas no Drive
   await getOrCreateClientFolderStructure(issue).catch(() => {});
 
   const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
@@ -398,20 +348,11 @@ async function processGoogleMeet(issue) {
   let eventId = await redisGet(`redmine:meet:event:${issue.id}`);
   let event = null;
 
-  if (eventId) {
-    try {
-      event = (await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId })).data;
-    } catch { eventId = null; }
-  }
-  if (!eventId) {
-    event = await findGoogleEventForIssue(calendar, issue.id);
-    eventId = event?.id || null;
-  }
+  if (eventId) { try { event = (await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId })).data; } catch { eventId = null; } }
+  if (!eventId) { event = await findGoogleEventForIssue(calendar, issue.id); eventId = event?.id || null; }
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
-    if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) {
-      await updateRedmineCustomField(issue, 'Google Meet', meetLink);
-    }
+    if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) await updateRedmineCustomField(issue, 'Google Meet', meetLink);
     return;
   }
 
@@ -433,12 +374,7 @@ async function processGoogleMeet(issue) {
         conferenceDataVersion: 1,
         requestBody: {
           ...requestBody,
-          conferenceData: {
-            createRequest: {
-              requestId: `redmine-${issue.id}-${Date.now()}`,
-              conferenceSolutionKey: { type: 'hangoutsMeet' }
-            }
-          }
+          conferenceData: { createRequest: { requestId: `redmine-${issue.id}-${Date.now()}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } }
         }
       });
       event = response.data;
@@ -455,22 +391,14 @@ async function processGoogleMeet(issue) {
 }
 
 // ---------------------------------------------------------
-// 6. GOOGLE DRIVE
+// 6. GOOGLE DRIVE (ESTRUTURA DE PASTAS SE SINC=SIM)
 // ---------------------------------------------------------
-function getGoogleDriveClient() {
-  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return google.drive({ version: 'v3', auth });
-}
-
 async function getOrCreateFolder(drive, name, parentId) {
   let query = `name = '${name.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
   if (parentId) query += ` and '${parentId}' in parents`;
-
   const res = await drive.files.list({ q: query, fields: 'files(id)' });
   const found = res.data.files || res.data.items || [];
   if (found.length > 0) return found[0].id;
-
   const metadata = { name, mimeType: 'application/vnd.google-apps.folder', parents: parentId ? [parentId] : [] };
   const folder = await drive.files.create({ resource: metadata, fields: 'id' });
   return folder.data.id;
@@ -478,48 +406,31 @@ async function getOrCreateFolder(drive, name, parentId) {
 
 async function getOrCreateClientFolderStructure(issue) {
   if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID || !issue?.project?.id) return null;
-  
   try {
     const project = await getRedmineProject(issue.project.id);
     if (!project) return null;
-
-    // 1. Valida se a sincronização está ativa na configuração do projeto
     const sincroniza = getCustomFieldValue(project, 'Sincroniza G-Drive');
-    if (!sincroniza || String(sincroniza).trim().toLowerCase() !== 'sim') {
-      console.log(`[DRIVE] Sincronização ignorada. O campo 'Sincroniza G-Drive' não está como 'Sim' no projeto: ${project.name}`);
-      return null;
-    }
+    if (!sincroniza || String(sincroniza).trim().toLowerCase() !== 'sim') return null;
 
-    // 2. Extrai os campos para formatação da pasta
     const personalizacaoRaw = getCustomFieldValue(project, 'Personalização');
     const nomeFantasiaRaw = getCustomFieldValue(project, 'Nome Fantasia') || project.name;
-
     const personalizacao = personalizacaoRaw ? String(personalizacaoRaw).trim() : '';
     const nomeFantasia = nomeFantasiaRaw ? String(nomeFantasiaRaw).trim() : '';
 
-    // 3. Define o nome estruturado: "Personalização - Nome Fantasia"
     const folderName = personalizacao ? `${personalizacao} - ${nomeFantasia}` : nomeFantasia;
-
     const drive = getGoogleDriveClient();
     const clientFolderId = await getOrCreateFolder(drive, folderName, GOOGLE_DRIVE_CLIENTES_FOLDER_ID);
     const treinamentosFolderId = await getOrCreateFolder(drive, 'Treinamentos', clientFolderId);
     const arquivosFolderId = await getOrCreateFolder(drive, 'Arquivos', clientFolderId);
-    
     return { clientFolderId, treinamentosFolderId, arquivosFolderId };
-  } catch (err) {
-    console.error(`[DRIVE] Erro ao gerar estrutura de pastas para a tarefa #${issue.id}:`, err.message);
-    return null;
-  }
+  } catch (err) { return null; }
 }
 
 async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
   try {
     const drive = getGoogleDriveClient();
-    const res = await drive.files.list({
-      q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name)'
-    });
+    const res = await drive.files.list({ q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id, name)' });
     const files = res.data.files || res.data.items || [];
     for (const file of files) {
       const match = file.name.match(/#(\d+)/);
@@ -530,42 +441,26 @@ async function processMeetRecordings() {
           if (issue) {
             const structure = await getOrCreateClientFolderStructure(issue);
             if (structure?.treinamentosFolderId) {
-              await drive.files.update({
-                fileId: file.id,
-                addParents: structure.treinamentosFolderId,
-                removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-                fields: 'id, parents'
-              });
-              console.log(`[DRIVE] Vídeo da tarefa #${issueId} movido com sucesso para a subpasta Treinamentos.`);
+              await drive.files.update({ fileId: file.id, addParents: structure.treinamentosFolderId, removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID, fields: 'id, parents' });
             }
           }
-        } catch (err) {
-          console.error(`Erro ao processar gravação para a tarefa #${issueId}:`, err.message);
-        }
+        } catch (err) {}
       }
     }
-  } catch (error) {
-    console.error('Erro geral no processamento de gravações do Meet:', error);
-  }
+  } catch (error) {}
 }
 
 // ---------------------------------------------------------
-// 7. ALERTAS E REGRAS DE NEGÓCIO
+// 7. FORMATADORES DE MENSAGENS
 // ---------------------------------------------------------
 function buildNotificationMessage(issue, action, source) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   return [
     `### Notificação do Redmine`,
-    ``,
     `Você recebeu uma notificação da tarefa **#${issue.id}**.`,
-    ``,
-    `Origem: ${source}`,
-    `Ação: ${action}`,
-    `Projeto: ${issue.project?.name || ''}`,
-    `Assunto: ${issue.subject}`,
-    `Status: ${issue.status?.name || ''}`,
+    `Origem: ${source} | Ação: ${action}`,
+    `Projeto: ${issue.project?.name || ''} | Assunto: ${issue.subject}`,
     meetLink ? `Google Meet: ${meetLink}` : null,
-    ``,
     `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
 }
@@ -574,14 +469,9 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   return [
     `### ⏰ Lembrete de Reunião`,
-    ``,
     `Faltam **${alertMinutes} minutos** para o compromisso da tarefa **#${issue.id}**.`,
-    ``,
-    `Projeto: ${issue.project?.name || ''}`,
-    `Assunto: ${issue.subject}`,
-    `Horário: ${timeLabel}`,
+    `Projeto: ${issue.project?.name || ''} | Assunto: ${issue.subject} | Horário: ${timeLabel}`,
     meetLink ? `Link do Google Meet: ${meetLink}` : null,
-    ``,
     `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
   ].filter(Boolean).join('\n');
 }
@@ -589,96 +479,37 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
-  
   let publicoAlvo = '';
-  if (publicoAlvoRaw) {
-    if (Array.isArray(publicoAlvoRaw)) {
-      publicoAlvo = publicoAlvoRaw.map(v => typeof v === 'object' ? (v.value || v.name) : v).join(' / ');
-    } else {
-      publicoAlvo = String(publicoAlvoRaw).trim();
-    }
-  }
+  if (publicoAlvoRaw) publicoAlvo = Array.isArray(publicoAlvoRaw) ? publicoAlvoRaw.map(v => typeof v === 'object' ? (v.value || v.name) : v).join(' / ') : String(publicoAlvoRaw).trim();
 
   let msg = `⏰ *Lembrete de Compromisso*\n\n`;
   msg += `Faltam ${alertMinutes} minutos para a reunião do seu compromisso.\n\n`;
   msg += `*Projeto:* ${issue.project?.name || ''}\n`;
   msg += `*Assunto:* ${issue.subject}\n`;
-  if (publicoAlvo) {
-    msg += `*Público Alvo:* ${publicoAlvo}\n`;
-  }
+  if (publicoAlvo) msg += `*Público Alvo:* ${publicoAlvo}\n`;
   msg += `*Horário:* ${timeLabel}\n`;
-  
-  if (meetLink) {
-    msg += `\n*👉 Link do Google Meet (Clique no link abaixo para entrar):*\n${meetLink}\n`;
-  }
-  
-  msg += `\nEstamos te aguardando!\n\n`;
-  msg += `⏳ *Observação:* O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado. Após esse período, a sala será encerrada e será necessário entrar em contato conosco para reagendamento do treinamento.\n`;
-  
+  if (meetLink) msg += `\n*👉 Link do Google Meet (Clique no link abaixo para entrar):*\n${meetLink}\n`;
+  msg += `\nEstamos te aguardando!\n\n⏳ *Observação:* O técnico permanecerá com a sala aberta por 10 minutos após o horário agendado.`;
   return msg;
-}
-
-async function checkAppointmentAlert(issue) {
-  if (shouldIgnoreIssueByStatus(issue)) return;
-  const appointment = parseAppointmentDateTime(issue);
-  if (!appointment) return;
-
-  const alertMinutesList = [Number(ALERT_MINUTES_BEFORE), Number(ALERT_EXTRA_MINUTES_BEFORE)].filter(v => v > 0);
-  const now = new Date();
-
-  for (const alertMinutes of alertMinutesList) {
-    const alertAt = new Date(appointment.dateTime.getTime() - alertMinutes * 60000);
-    const diffMs = now.getTime() - alertAt.getTime();
-    const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
-
-    if (diffMs >= 0 && diffMs <= windowMs) {
-      const alertKey = `alert:${issue.id}:${alertMinutes}`;
-      if (!(await wasAppointmentAlertSent(alertKey))) {
-        const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
-        if (waGroupId && waSocket) {
-          const waMsg = buildWhatsAppMessage(issue, alertMinutes, appointment.timeLabel);
-          await waSocket.sendMessage(waGroupId.trim(), { text: waMsg });
-          await markAppointmentAlertSent(alertKey);
-        }
-        
-        const targets = await getResponsibleTargets(issue);
-        if (targets.length) {
-          const mmMessage = buildAppointmentMessage(issue, alertMinutes, appointment.timeLabel);
-          await notifyTargets(targets, mmMessage);
-        }
-      }
-    }
-  }
 }
 
 async function processIssueNotification(issue, action, source, journal = null) {
   if (shouldIgnoreIssueByStatus(issue)) return;
   await processGoogleMeet(issue);
   if (isMeetStatus(issue)) return;
-
   const eventKey = getEventKey(issue, source, journal);
   if (await wasAlreadyNotified(eventKey)) return;
-
   const targets = await getResponsibleTargets(issue);
   if (!targets.length) return;
-
-  const message = buildNotificationMessage(issue, action, source);
-  await notifyTargets(targets, message);
+  await notifyTargets(targets, buildNotificationMessage(issue, action, source));
   await markAsNotified(eventKey);
 }
 
 // ---------------------------------------------------------
-// 7.5 POLLING DE ATUALIZAÇÕES E BUSCAS DE API
+// 8. CRON & POLLING INTERNO
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
-
-async function fetchRecentIssues() {
-  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-    headers: redmineHeaders,
-    params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) }
-  });
-  return response.data.issues || [];
-}
+async function fetchRecentIssues() { const response = await axios.get(`${REDMINE_URL}/issues.json`, { headers: redmineHeaders, params: { status_id: '*', sort: 'updated_on:desc', limit: Number(POLLING_LIMIT) } }); return response.data.issues || []; }
 
 async function pollingRedmineIssues() {
   try {
@@ -692,13 +523,8 @@ async function pollingRedmineIssues() {
         await processGoogleMeet(issueWithUrl);
         const lastJournal = getLastJournal(issueWithUrl);
         const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
-
-        if (!(await wasAlreadyNotified(eventKey))) {
-          await processIssueNotification(issueWithUrl, 'Atualização', 'Polling', lastJournal);
-        }
-      } catch (errorIssue) {
-        if (errorIssue.response?.status === 404) await deleteGoogleMeet(issueSummary.id);
-      }
+        if (!(await wasAlreadyNotified(eventKey))) await processIssueNotification(issueWithUrl, 'Atualização', 'Polling', lastJournal);
+      } catch (err) { if (err.response?.status === 404) await deleteGoogleMeet(issueSummary.id); }
     }
     lastPollingTimestamp = Date.now();
   } catch (error) {}
@@ -720,17 +546,13 @@ async function pollingAppointmentAlerts() {
     const today = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
     const issues = await fetchIssuesByDate(today);
     for (const issueSummary of issues) {
-      try {
-        const issue = await fetchIssueDetails(issueSummary.id);
-        const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
-        await checkAppointmentAlert(issueWithUrl);
-      } catch (err) {}
+      try { const issue = await fetchIssueDetails(issueSummary.id); await checkAppointmentAlert({ ...issue, url: `${REDMINE_URL}/issues/${issue.id}` }); } catch (err) {}
     }
   } catch (error) {}
 }
 
 // ---------------------------------------------------------
-// 9. RESUMO DIÁRIO, RESUMO MATINAL E FAXINA
+// 📑 [ BLOCO 4 ] MATTERMOST: RESUMO DIÁRIO (Padrão 17h45)
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
@@ -755,7 +577,7 @@ async function processDailySummary() {
       const lineText = `- ${horario}: #${issue.id} - ${projectName} - ${issue.subject}${meetLink ? ` (Meet: ${meetLink})` : ''}`;
 
       for (const target of targets) {
-        if (!groupedByEmail.has(target.email)) { groupedByEmail.set(target.email, { target, lines: [] }); }
+        if (!groupedByEmail.has(target.email)) groupedByEmail.set(target.email, { target, lines: [] });
         groupedByEmail.get(target.email).lines.push({ sort: sortKey, text: lineText });
       }
     }
@@ -763,9 +585,7 @@ async function processDailySummary() {
       lines.sort((a, b) => a.sort.localeCompare(b.sort));
       const message = [
         `### 📅 Resumo de Compromissos (Próximo Dia Útil)`,
-        ``,
-        `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**`,
-        ``,
+        `Data: **${dayjs(targetDate).format('DD/MM/YYYY')}**\n`,
         ...lines.map(l => l.text)
       ].join('\n');
       await notifyTargets([target], message);
@@ -774,6 +594,9 @@ async function processDailySummary() {
   } catch (error) {}
 }
 
+// ---------------------------------------------------------
+// 📲 [ BLOCO 5 ] WHATSAPP: RESUMO DE CONFIRMAÇÃO (Padrão 08h30)
+// ---------------------------------------------------------
 async function processClientMorningSummary() {
   if (CLIENT_SUMMARY_ENABLED !== 'true') return;
   const now = dayjs().tz('America/Sao_Paulo');
@@ -794,6 +617,10 @@ async function processClientMorningSummary() {
 
       const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
       if (waGroupId && waSocket) {
+        let groupJid = waGroupId.trim();
+        if (!groupJid.includes('@')) {
+          groupJid = `${groupJid}@g.us`;
+        }
         const appointment = parseAppointmentDateTime(issue);
         const timeLabel = appointment ? appointment.timeLabel : horario;
 
@@ -804,7 +631,7 @@ async function processClientMorningSummary() {
         pollText += `*Horário:* ${timeLabel}\n\n`;
         pollText += `Por favor, confirme sua presença clicando em uma das opções abaixo:`;
 
-        await waSocket.sendMessage(waGroupId.trim(), {
+        await waSocket.sendMessage(groupJid, {
           poll: {
             name: pollText,
             options: ['✅ Confirmar', '🗓️ Reagendar'],
@@ -814,28 +641,18 @@ async function processClientMorningSummary() {
       }
     }
     await markAsNotified(summaryKey);
-  } catch (error) {
-    console.error('Erro ao processar o resumo matinal do cliente:', error);
-  }
+  } catch (error) {}
 }
 
 async function reconcileDeletedMeets() {
   try {
     const meetIssueIds = await redisSetMembers('redmine:meet:issues');
     for (const issueId of meetIssueIds) {
-      try {
-        await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders });
-      } catch (err) {
-        if (err.response?.status === 404) await deleteGoogleMeet(issueId);
-      }
+      try { await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders }); } catch (err) { if (err.response?.status === 404) await deleteGoogleMeet(issueId); }
     }
   } catch (error) {}
 }
-
-async function fetchIssueDetails(issueId) {
-  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders, params: { include: 'journals' } });
-  return response.data.issue;
-}
+async function fetchIssueDetails(issueId) { const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders, params: { include: 'journals' } }); return response.data.issue; }
 
 // ---------------------------------------------------------
 // 10. SMART SCHEDULER
@@ -845,9 +662,7 @@ function getDynamicInterval(baseIntervalSeconds) {
   const day = now.day();
   const hour = now.hour();
   const minute = now.minute();
-  const second = now.second();
-  const msSinceMidnight = (hour * 3600 + minute * 60 + second) * 1000;
-
+  const msSinceMidnight = (hour * 3600 + minute * 60 + now.second()) * 1000;
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const LUNCH_BREAK_MS = 5 * 60 * 1000;
   const BASE_MS = Number(baseIntervalSeconds) * 1000;
@@ -859,11 +674,9 @@ function getDynamicInterval(baseIntervalSeconds) {
   const shift2End = 19 * 3600 * 1000;
 
   let targetInterval = BASE_MS;
-  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) {
-    targetInterval = ONE_HOUR_MS;
-  } else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) {
-    targetInterval = LUNCH_BREAK_MS;
-  }
+  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) targetInterval = ONE_HOUR_MS;
+  else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) targetInterval = LUNCH_BREAK_MS;
+
   const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
   for (const boundary of boundaries) {
     if (msSinceMidnight < boundary) {
@@ -877,14 +690,7 @@ function getDynamicInterval(baseIntervalSeconds) {
 
 function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
   async function run() {
-    try { await taskFn(); } catch (err) {} finally {
-      const nextInterval = getDynamicInterval(baseIntervalSeconds);
-      if (nextInterval > (baseIntervalSeconds * 1000)) {
-        const nextTime = dayjs().add(nextInterval, 'ms').tz('America/Sao_Paulo').format('HH:mm:ss');
-        console.log(`[ECONOMIA] ${taskName} em repouso. Desperta pontualmente às ${nextTime}`);
-      }
-      setTimeout(run, nextInterval);
-    }
+    try { await taskFn(); } catch (err) {} finally { setTimeout(run, getDynamicInterval(baseIntervalSeconds)); }
   }
   setTimeout(run, 5000);
 }
@@ -901,17 +707,17 @@ app.get('/polling-now', async (req, res) => {
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => {
-  res.send('API Bot - Precisão Máxima, Organização Drive e WhatsApp Ativos.');
-});
+app.get('/', (req, res) => { res.send('API Bot - Todos os 5 blocos operantes e isolados.'); });
 
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}. Smart Scheduler inicializado.`);
+  console.log(`Servidor rodando na porta ${PORT}.`);
   if (String(POLLING_ENABLED) === 'true') {
     startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
     startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
     startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
     startSmartPolling(processMeetRecordings, 900, 'Gravações Meet');
+    
+    // Verificadores de Resumo (Roda a cada minuto checando os horários do seu .env)
     setInterval(processDailySummary, 60000);
     setInterval(processClientMorningSummary, 60000);
   }
