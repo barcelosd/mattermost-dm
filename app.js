@@ -45,9 +45,9 @@ const {
   CLIENT_SUMMARY_ENABLED = 'true',
   CLIENT_SUMMARY_TIME = '08:30',      // Alerta 4: Confirmação WhatsApp 1 dia antes
   
-  // --- NOVOS PARÂMETROS DE FILTRAGEM POR STATUS ---
-  NOTIFY_STATUSES = 'Novo,Reaberta',  // Status permitidos para alertas de criação/atribuição normais
-  MEET_STATUS_NAME = 'Aguardando Data', // Status obrigatório e exclusivo para os Alertas de 1 a 5
+  // Parâmetros de Filtragem por Status
+  NOTIFY_STATUSES = 'Novo,Reaberta',  
+  MEET_STATUS_NAME = 'Aguardando Data', 
   
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
@@ -133,6 +133,8 @@ async function redisDel(key) { if (redis) { await redis.del(key); } else { memor
 async function redisSetAdd(key, value) { if (redis) { await redis.sadd(key, value); } else { memory.meetIssues.add(value); } }
 async function redisSetRemove(key, value) { if (redis) { await redis.srem(key, value); } else { memory.meetIssues.delete(value); } }
 async function redisSetMembers(key) { return redis ? redis.smembers(key) : Array.from(memory.meetIssues); }
+
+// Verificadores específicos de chaves
 async function wasAlreadyNotified(key) { return redis ? (await redis.get(key)) === '1' : memory.notified.has(key); }
 async function markAsNotified(key) { const ttl = Number(REDIS_TTL_DAYS) * 86400; if (redis) { await redis.set(key, '1', 'EX', ttl); } else { memory.notified.add(key); } }
 async function wasAppointmentAlertSent(key) { return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key); }
@@ -143,21 +145,24 @@ async function markAppointmentAlertSent(key) { const ttl = Number(REDIS_TTL_DAYS
 // ---------------------------------------------------------
 function normalizeText(value) { return String(value || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
 
-// Valida se o status pertence à lista permitida para envio padrão (Criação/Atribuição)
 function shouldNotifyStandardStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
   const allowedStatuses = String(NOTIFY_STATUSES).split(',').map(normalizeText).filter(Boolean);
   return allowedStatuses.includes(status);
 }
 
-// Filtro estrito: Garante que os Alertas de 1 a 5 só executem se for exatamente "Aguardando Data"
 function isStrictMeetStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
   return status === normalizeText(MEET_STATUS_NAME);
 }
 
 function getLastJournal(issue) { return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null; }
-function getEventKey(issue, source, journal) { return `event:${issue.id}:${journal ? journal.id : source}`; }
+
+// Chave com escopo totalmente isolado por STATUS para evitar poluição no Redis
+function getEventKey(issue, source, journal) { 
+  const statusLabel = normalizeText(issue?.status?.name || issue?.status || 'unknown');
+  return `redmine:standard_notify:${statusLabel}:${issue.id}:${journal ? journal.id : source}`; 
+}
 
 function getCustomFieldValue(entity, fieldName) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
@@ -263,10 +268,10 @@ async function notifyTargets(targets, message) {
 }
 
 // ---------------------------------------------------------
-// ⚡️ PROCESSAMENTO DE ALERTAS TIMED (ALERTAS 2, 3 e 5)
+// ⚡️ PROCESSAMENTO DE ALERTAS CRONOMETRADOS (ALERTAS 2, 3 e 5)
 // ---------------------------------------------------------
 async function checkAppointmentAlert(issue) {
-  // EXCLUSIVIDADE: Só gera alertas se o status for rigorosamente "Aguardando Data"
+  // Bloqueio estrito: Alertas 2, 3 e 5 exigem exclusivamente o status "Aguardando Data"
   if (!isStrictMeetStatus(issue)) return;
 
   const appointment = parseAppointmentDateTime(issue);
@@ -281,7 +286,7 @@ async function checkAppointmentAlert(issue) {
   const diffMsMM1 = now.getTime() - alertAtMM1.getTime();
 
   if (diffMsMM1 >= 0 && diffMsMM1 <= windowMs) {
-    const alertKeyMM1 = `alert:mm10min:${issue.id}`;
+    const alertKeyMM1 = `redmine:alert:mm10min:${issue.id}`;
     if (!(await wasAppointmentAlertSent(alertKeyMM1))) {
       const targets = await getResponsibleTargets(issue);
       if (targets.length) {
@@ -298,7 +303,7 @@ async function checkAppointmentAlert(issue) {
   const diffMsMM2 = now.getTime() - alertAtMM2.getTime();
 
   if (diffMsMM2 >= 0 && diffMsMM2 <= windowMs) {
-    const alertKeyMM2 = `alert:mm2min:${issue.id}`;
+    const alertKeyMM2 = `redmine:alert:mm2min:${issue.id}`;
     if (!(await wasAppointmentAlertSent(alertKeyMM2))) {
       const targets = await getResponsibleTargets(issue);
       if (targets.length) {
@@ -315,7 +320,7 @@ async function checkAppointmentAlert(issue) {
   const diffMsWA = now.getTime() - alertAtWA.getTime();
 
   if (diffMsWA >= 0 && diffMsWA <= windowMs) {
-    const alertKeyWA = `alert:wa5min:${issue.id}`;
+    const alertKeyWA = `redmine:alert:wa5min:${issue.id}`;
     if (!(await wasAppointmentAlertSent(alertKeyWA))) {
       const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
       if (waGroupId && waSocket) {
@@ -357,7 +362,7 @@ async function deleteGoogleMeet(issueId) {
 
 async function processGoogleMeet(issue) {
   if (!googleCalendarIsConfigured()) return;
-  const isMeet = isStrictMeetStatus(issue); // Integrado com o status parametrizado
+  const isMeet = isStrictMeetStatus(issue); 
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
@@ -522,9 +527,9 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   return msg;
 }
 
-// Handler de notificações normais (Criada / Atribuída)
+// Handler de notificações comuns (Criação / Atribuição)
 async function processIssueNotification(issue, action, source, journal = null) {
-  // NOVA REGRA: Só dispara se o status for explicitamente mapeado para notificar (Novo, Reaberta, etc.)
+  // TRAVA DE SEGURANÇA: Se não estiver nos status autorizados (Novo/Reaberta), aborta sem tocar no Redis
   if (!shouldNotifyStandardStatus(issue)) return;
 
   const eventKey = getEventKey(issue, source, journal);
@@ -553,7 +558,6 @@ async function pollingRedmineIssues() {
         const issue = await fetchIssueDetails(issueSummary.id);
         const issueWithUrl = { ...issue, url: `${REDMINE_URL}/issues/${issue.id}` };
         
-        // Garante que o Google Meet seja processado sem interferência
         await processGoogleMeet(issueWithUrl);
         
         const lastJournal = getLastJournal(issueWithUrl);
@@ -580,7 +584,7 @@ async function pollingAppointmentAlerts() {
     const today = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
     const issues = await fetchIssuesByDate(today);
     for (const issueSummary of issues) {
-      if (!isStrictMeetStatus(issueSummary)) continue; // Evita requests desnecessários se o status do sumário já estiver inválido
+      if (!isStrictMeetStatus(issueSummary)) continue; 
       try { 
         const issue = await fetchIssueDetails(issueSummary.id); 
         await checkAppointmentAlert({ ...issue, url: `${REDMINE_URL}/issues/${issue.id}` }); 
@@ -595,14 +599,14 @@ async function pollingAppointmentAlerts() {
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
   const targetDate = getNextBusinessSummaryDateString();
-  const summaryKey = `redmine:daily-summary:${targetDate}`;
+  const summaryKey = `redmine:summary:mattermost:${targetDate}`;
   if (await wasAlreadyNotified(summaryKey)) return;
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     const groupedByEmail = new Map();
     for (const issueSummary of issueSummaries) {
-      if (!isStrictMeetStatus(issueSummary)) continue; // EXCLUSIVIDADE: Só "Aguardando Data"
+      if (!isStrictMeetStatus(issueSummary)) continue; 
       
       const issue = await fetchIssueDetails(issueSummary.id);
       if (!isStrictMeetStatus(issue)) continue;
@@ -645,13 +649,13 @@ async function processClientMorningSummary() {
   if (now.hour() !== tHour || now.minute() !== tMinute) return;
 
   const targetDate = getNextBusinessSummaryDateString();
-  const summaryKey = `whatsapp:client-morning-summary:${targetDate}`;
+  const summaryKey = `redmine:summary:whatsapp:${targetDate}`;
   if (await wasAlreadyNotified(summaryKey)) return;
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     for (const issueSummary of issueSummaries) {
-      if (!isStrictMeetStatus(issueSummary)) continue; // EXCLUSIVIDADE: Só "Aguardando Data"
+      if (!isStrictMeetStatus(issueSummary)) continue; 
       
       const issue = await fetchIssueDetails(issueSummary.id);
       if (!isStrictMeetStatus(issue)) continue;
@@ -749,7 +753,7 @@ app.get('/polling-now', async (req, res) => {
   res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Filtros parametrizados com controle rígido por status.'); });
+app.get('/', (req, res) => { res.send('API Bot - Filtros parametrizados com chaves isoladas por status.'); });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}.`);
