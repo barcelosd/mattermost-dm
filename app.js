@@ -266,7 +266,6 @@ async function notifyTargets(targets, message) {
     }
   } catch (err) {}
 }
-
 // ---------------------------------------------------------
 // ⚡️ PROCESSAMENTO DE ALERTAS CRONOMETRADOS (ALERTAS 2, 3 e 5)
 // ---------------------------------------------------------
@@ -277,15 +276,23 @@ async function checkAppointmentAlert(issue) {
   const appointment = parseAppointmentDateTime(issue);
   if (!appointment) return;
 
-  const now = new Date();
-  const windowMs = Number(ALERT_WINDOW_SECONDS || 180) * 1000;
+  // 1. Obter o momento atual e o agendamento usando Day.js no fuso horário correto
+  // Isso elimina qualquer divergência de fuso horário ou relógio dessincronizado no servidor
+  const agora = dayjs().tz("America/Sao_Paulo");
+  const dataAgendamento = dayjs(appointment.dateTime).tz("America/Sao_Paulo");
+
+  // 2. Calcular a diferença exata EM SEGUNDOS até o evento
+  const diffSegundos = dataAgendamento.diff(agora, 'second');
+  const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
+
+  // Definição dos minutos de antecedência de cada alerta
+  const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);         // Padrão: 10 min
+  const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);    // Padrão: 2 min
+  const waMin  = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5); // Padrão: 5 min
 
   // --- [ ALERTA 2 ] MATTERMOST: 10 MINUTOS ANTES ---
-  const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);
-  const alertAtMM1 = new Date(appointment.dateTime.getTime() - mmMin1 * 60000);
-  const diffMsMM1 = now.getTime() - alertAtMM1.getTime();
-
-  if (diffMsMM1 >= 0 && diffMsMM1 <= windowMs) {
+  const targetSecMM1 = mmMin1 * 60;
+  if (diffSegundos <= targetSecMM1 && diffSegundos >= (targetSecMM1 - windowSeconds)) {
     const alertKeyMM1 = `redmine:alert:mm10min:${issue.id}`;
     if (!(await wasAppointmentAlertSent(alertKeyMM1))) {
       const targets = await getResponsibleTargets(issue);
@@ -297,29 +304,9 @@ async function checkAppointmentAlert(issue) {
     }
   }
 
-  // --- [ ALERTA 3 ] MATTERMOST: 2 MINUTOS ANTES ---
-  const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);
-  const alertAtMM2 = new Date(appointment.dateTime.getTime() - mmMin2 * 60000);
-  const diffMsMM2 = now.getTime() - alertAtMM2.getTime();
-
-  if (diffMsMM2 >= 0 && diffMsMM2 <= windowMs) {
-    const alertKeyMM2 = `redmine:alert:mm2min:${issue.id}`;
-    if (!(await wasAppointmentAlertSent(alertKeyMM2))) {
-      const targets = await getResponsibleTargets(issue);
-      if (targets.length) {
-        const mmMessage = buildAppointmentMessage(issue, mmMin2, appointment.timeLabel);
-        await notifyTargets(targets, mmMessage);
-        await markAppointmentAlertSent(alertKeyMM2);
-      }
-    }
-  }
-
   // --- [ ALERTA 5 ] WHATSAPP: 5 MINUTOS ANTES ---
-  const waMin = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5); 
-  const alertAtWA = new Date(appointment.dateTime.getTime() - waMin * 60000);
-  const diffMsWA = now.getTime() - alertAtWA.getTime();
-
-  if (diffMsWA >= 0 && diffMsWA <= windowMs) {
+  const targetSecWA = waMin * 60;
+  if (diffSegundos <= targetSecWA && diffSegundos >= (targetSecWA - windowSeconds)) {
     const alertKeyWA = `redmine:alert:wa5min:${issue.id}`;
     if (!(await wasAppointmentAlertSent(alertKeyWA))) {
       const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
@@ -329,6 +316,20 @@ async function checkAppointmentAlert(issue) {
         const waMsg = buildWhatsAppMessage(issue, waMin, appointment.timeLabel);
         await waSocket.sendMessage(groupJid, { text: waMsg });
         await markAppointmentAlertSent(alertKeyWA);
+      }
+    }
+  }
+
+  // --- [ ALERTA 3 ] MATTERMOST: 2 MINUTOS ANTES ---
+  const targetSecMM2 = mmMin2 * 60;
+  if (diffSegundos <= targetSecMM2 && diffSegundos >= (targetSecMM2 - windowSeconds)) {
+    const alertKeyMM2 = `redmine:alert:mm2min:${issue.id}`;
+    if (!(await wasAppointmentAlertSent(alertKeyMM2))) {
+      const targets = await getResponsibleTargets(issue);
+      if (targets.length) {
+        const mmMessage = buildAppointmentMessage(issue, mmMin2, appointment.timeLabel);
+        await notifyTargets(targets, mmMessage);
+        await markAppointmentAlertSent(alertKeyMM2);
       }
     }
   }
