@@ -158,7 +158,6 @@ function isStrictMeetStatus(issue) {
 
 function getLastJournal(issue) { return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null; }
 
-// Chave com escopo totalmente isolado por STATUS para evitar poluição no Redis
 function getEventKey(issue, source, journal) { 
   const statusLabel = normalizeText(issue?.status?.name || issue?.status || 'unknown');
   return `redmine:standard_notify:${statusLabel}:${issue.id}:${journal ? journal.id : source}`; 
@@ -215,6 +214,11 @@ function getNextBusinessSummaryDateString() {
 // ---------------------------------------------------------
 // 4. INTEGRAÇÕES API (REDMINE & MATTERMOST)
 // ---------------------------------------------------------
+async function fetchIssueDetails(issueId) {
+  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json?include=journals`, { headers: redmineHeaders });
+  return response.data.issue;
+}
+
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
   if (!fieldId) return;
@@ -266,29 +270,25 @@ async function notifyTargets(targets, message) {
     }
   } catch (err) {}
 }
+
 // ---------------------------------------------------------
 // ⚡️ PROCESSAMENTO DE ALERTAS CRONOMETRADOS (ALERTAS 2, 3 e 5)
 // ---------------------------------------------------------
 async function checkAppointmentAlert(issue) {
-  // Bloqueio estrito: Alertas 2, 3 e 5 exigem exclusivamente o status "Aguardando Data"
   if (!isStrictMeetStatus(issue)) return;
 
   const appointment = parseAppointmentDateTime(issue);
   if (!appointment) return;
 
-  // 1. Obter o momento atual e o agendamento usando Day.js no fuso horário correto
-  // Isso elimina qualquer divergência de fuso horário ou relógio dessincronizado no servidor
   const agora = dayjs().tz("America/Sao_Paulo");
   const dataAgendamento = dayjs(appointment.dateTime).tz("America/Sao_Paulo");
 
-  // 2. Calcular a diferença exata EM SEGUNDOS até o evento
   const diffSegundos = dataAgendamento.diff(agora, 'second');
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
 
-  // Definição dos minutos de antecedência de cada alerta
-  const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);         // Padrão: 10 min
-  const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);    // Padrão: 2 min
-  const waMin  = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5); // Padrão: 5 min
+  const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);         
+  const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);    
+  const waMin  = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5); 
 
   // --- [ ALERTA 2 ] MATTERMOST: 10 MINUTOS ANTES ---
   const targetSecMM1 = mmMin1 * 60;
@@ -528,9 +528,25 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   return msg;
 }
 
+function buildClientSummaryMessage(issue, timeLabel) {
+  const meetLink = getCustomFieldValue(issue, 'Google Meet');
+  const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
+  let publicoAlvo = '';
+  if (publicoAlvoRaw) publicoAlvo = Array.isArray(publicoAlvoRaw) ? publicoAlvoRaw.map(v => typeof v === 'object' ? (v.value || v.name) : v).join(' / ') : String(publicoAlvoRaw).trim();
+
+  let msg = `📅 *Confirmação de Compromisso*\n\n`;
+  msg += `Olá! Passando para lembrar do seu compromisso agendado para o próximo dia útil (${dayjs(issue.start_date || issue.due_date).format('DD/MM/YYYY')}).\n\n`;
+  msg += `*Projeto:* ${issue.project?.name || ''}\n`;
+  msg += `*Assunto:* ${issue.subject}\n`;
+  if (publicoAlvo) msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  msg += `*Horário:* ${timeLabel}\n`;
+  if (meetLink) msg += `\n*👉 Link do Google Meet (Clique para entrar):*\n${meetLink}\n`;
+  msg += `\nPor favor, confirme respondendo a esta mensagem se está tudo confirmado para o nosso encontro! 😊`;
+  return msg;
+}
+
 // Handler de notificações comuns (Criação / Atribuição)
 async function processIssueNotification(issue, action, source, journal = null) {
-  // TRAVA DE SEGURANÇA: Se não estiver nos status autorizados (Novo/Reaberta), aborta sem tocar no Redis
   if (!shouldNotifyStandardStatus(issue)) return;
 
   const eventKey = getEventKey(issue, source, journal);
@@ -641,7 +657,7 @@ async function processDailySummary() {
 }
 
 // ---------------------------------------------------------
-// 10. [ ALERTA 4 ] WHATSAPP: ENQUETE DE CONFIRMAÇÃO (Padrão 08h30)
+// 10. [ ALERTA 4 ] WHATSAPP: REMINDER DE CONFIRMAÇÃO (Padrão 08h30)
 // ---------------------------------------------------------
 async function processClientMorningSummary() {
   if (CLIENT_SUMMARY_ENABLED !== 'true') return;
@@ -656,115 +672,61 @@ async function processClientMorningSummary() {
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
     for (const issueSummary of issueSummaries) {
-      if (!isStrictMeetStatus(issueSummary)) continue; 
-      
-      const issue = await fetchIssueDetails(issueSummary.id);
-      if (!isStrictMeetStatus(issue)) continue;
+      if (!isStrictMeetStatus(issueSummary)) continue;
 
-      const horario = getCustomFieldValue(issue, ALERT_FIELD_NAME);
-      if (!horario) continue;
+      try {
+        const issue = await fetchIssueDetails(issueSummary.id);
+        if (!isStrictMeetStatus(issue)) continue;
 
-      const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
-      if (waGroupId && waSocket) {
-        let groupJid = waGroupId.trim();
-        if (!groupJid.includes('@')) { groupJid = `${groupJid}@g.us`; }
         const appointment = parseAppointmentDateTime(issue);
-        const timeLabel = appointment ? appointment.timeLabel : horario;
+        if (!appointment) continue;
 
-        let pollText = `📅 *Confirmação de Compromisso (Próximo Dia Útil)*\n\n`;
-        pollText += `Olá! Passando para lembrar e confirmar o nosso treinamento agendado:\n\n`;
-        pollText += `*Projeto:* ${issue.project?.name || ''}\n`;
-        pollText += `*Assunto:* ${issue.subject}\n`;
-        pollText += `*Horário:* ${timeLabel}\n\n`;
-        pollText += `Por favor, confirme sua presença clicando em uma das opções abaixo:`;
-
-        await waSocket.sendMessage(groupJid, {
-          poll: {
-            name: pollText,
-            options: ['✅ Confirmar', '🗓️ Reagendar'],
-            selectableCount: 1
-          }
-        });
+        const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+        if (waGroupId && waSocket) {
+          let groupJid = waGroupId.trim();
+          if (!groupJid.includes('@')) { groupJid = `${groupJid}@g.us`; }
+          const waMsg = buildClientSummaryMessage(issue, appointment.timeLabel);
+          await waSocket.sendMessage(groupJid, { text: waMsg });
+        }
+      } catch (err) {
+        console.error(`Erro ao processar resumo individual do WhatsApp para tarefa #${issueSummary.id}:`, err);
       }
     }
     await markAsNotified(summaryKey);
-  } catch (error) {}
+  } catch (error) {
+    console.error('Erro geral no processamento do resumo matinal do cliente:', error);
+  }
 }
-
-async function reconcileDeletedMeets() {
-  try {
-    const meetIssueIds = await redisSetMembers('redmine:meet:issues');
-    for (const issueId of meetIssueIds) {
-      try { await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders }); } catch (err) { if (err.response?.status === 404) await deleteGoogleMeet(issueId); }
-    }
-  } catch (error) {}
-}
-async function fetchIssueDetails(issueId) { const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, { headers: redmineHeaders, params: { include: 'journals' } }); return response.data.issue; }
 
 // ---------------------------------------------------------
-// 11. SMART SCHEDULER
+// 11. INICIALIZAÇÃO DOS LOOPS E SERVIDOR EXPRESS
 // ---------------------------------------------------------
-function getDynamicInterval(baseIntervalSeconds) {
-  const now = dayjs().tz('America/Sao_Paulo');
-  const day = now.day();
-  const hour = now.hour();
-  const minute = now.minute();
-  const msSinceMidnight = (hour * 3600 + minute * 60 + now.second()) * 1000;
-  const ONE_HOUR_MS = 60 * 60 * 1000;
-  const LUNCH_BREAK_MS = 5 * 60 * 1000;
-  const BASE_MS = Number(baseIntervalSeconds) * 1000;
-
-  if (day === 0 || day === 6) return ONE_HOUR_MS;
-  const shift1Start = 7.75 * 3600 * 1000;
-  const shift1End = 12 * 3600 * 1000;
-  const shift2Start = 13.25 * 3600 * 1000;
-  const shift2End = 19 * 3600 * 1000;
-
-  let targetInterval = BASE_MS;
-  if (msSinceMidnight < shift1Start || msSinceMidnight >= shift2End) targetInterval = ONE_HOUR_MS;
-  else if (msSinceMidnight >= shift1End && msSinceMidnight < shift2Start) targetInterval = LUNCH_BREAK_MS;
-
-  const boundaries = [shift1Start, shift1End, shift2Start, shift2End];
-  for (const boundary of boundaries) {
-    if (msSinceMidnight < boundary) {
-      const msUntilBoundary = boundary - msSinceMidnight;
-      if (targetInterval > msUntilBoundary) targetInterval = msUntilBoundary;
-      break;
-    }
-  }
-  return Math.max(targetInterval, BASE_MS);
-}
-
-function startSmartPolling(taskFn, baseIntervalSeconds, taskName) {
-  async function run() {
-    try { await taskFn(); } catch (err) {} finally { setTimeout(run, getDynamicInterval(baseIntervalSeconds)); }
-  }
-  setTimeout(run, 5000);
-}
-
 const app = express();
+app.use(express.json());
 
-app.get('/polling-now', async (req, res) => {
-  await pollingRedmineIssues();
-  await pollingAppointmentAlerts();
-  await processDailySummary();
-  await processClientMorningSummary();
-  await reconcileDeletedMeets();
-  await processMeetRecordings();
-  res.json({ success: true, message: 'Processo completo forçado com sucesso.' });
+// Endpoint de verificação de integridade do bot
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', whatsappConnected: !!waSocket });
 });
 
-app.get('/', (req, res) => { res.send('API Bot - Filtros parametrizados com chaves isoladas por status.'); });
-
 app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}.`);
-  if (String(POLLING_ENABLED) === 'true') {
-    startSmartPolling(pollingRedmineIssues, POLLING_INTERVAL_SECONDS, 'Atualizações');
-    startSmartPolling(pollingAppointmentAlerts, ALERT_POLLING_INTERVAL_SECONDS, 'Alertas');
-    startSmartPolling(reconcileDeletedMeets, 900, 'Faxina');
-    startSmartPolling(processMeetRecordings, 900, 'Gravações Meet');
-    
-    setInterval(processDailySummary, 60000);
-    setInterval(processClientMorningSummary, 60000);
-  }
+  console.log(`Servidor rodando com sucesso na porta ${PORT}`);
+  
+  // Dispara imediatamente as rotinas na inicialização para testar
+  pollingRedmineIssues();
+  pollingAppointmentAlerts();
+  processDailySummary();
+  processClientMorningSummary();
+  processMeetRecordings();
+
+  // Configura os intervalos recorrentes
+  setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
+  setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
+  
+  // Verificação de horários de resumos (Roda a cada 60 segundos)
+  setInterval(processDailySummary, 60 * 1000);
+  setInterval(processClientMorningSummary, 60 * 1000);
+  
+  // Sincronização de gravações do Drive (Roda a cada 5 minutos)
+  setInterval(processMeetRecordings, 5 * 60 * 1000);
 });
