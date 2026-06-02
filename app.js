@@ -722,14 +722,26 @@ async function checkAppointmentAlert(issue) {
   const diffSegundos = dataAgendamento.diff(agora, 'second');
 
   // Ignora tarefa que já passou há mais de 10 minutos.
-  if (diffSegundos < -600) {
-    return;
-  }
+  const maxAlertMinutes = Math.max(
+  Number(ALERT_MINUTES_BEFORE || 10),
+  Number(ALERT_EXTRA_MINUTES_BEFORE || 2),
+  Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5)
+);
 
-  // Ignora tarefa com mais de 1 hora de antecedência.
-  if (diffSegundos > 3600) {
-    return;
-  }
+// Começa a verificar apenas 2 minutos antes do primeiro alerta.
+// Exemplo: primeiro alerta 10 min => começa com 12 min.
+const startCheckingSeconds = (maxAlertMinutes + 2) * 60;
+
+// Depois que passou do horário, não precisa mais verificar.
+const stopAfterSeconds = 30;
+
+if (diffSegundos > startCheckingSeconds) {
+  return;
+}
+
+if (diffSegundos < -stopAfterSeconds) {
+  return;
+}
 
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
 
@@ -739,9 +751,14 @@ async function checkAppointmentAlert(issue) {
 
   const appointmentKey = dataAgendamento.format('YYYYMMDDHHmm');
 
+  if (
+  diffSegundos <= startCheckingSeconds &&
+  diffSegundos >= -stopAfterSeconds
+) {
   console.log(
-    `Verificando tarefa #${issue.id} | Horário ${appointment.timeLabel} | Faltam ${diffSegundos}s`
+    `Verificando alerta #${issue.id} | ${appointment.timeLabel} | Faltam ${diffSegundos}s`
   );
+}
 
   async function sendMattermostAlert(minutes) {
     const targetSec = minutes * 60;
