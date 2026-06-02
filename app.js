@@ -117,6 +117,42 @@ async function initWhatsApp() {
     }
   });
 }
+async function getWhatsAppGroupId(issue) {
+  // Primeiro tenta na tarefa
+  let groupId = getCustomFieldValue(
+    issue,
+    WHATSAPP_GROUP_FIELD_NAME
+  );
+
+  if (groupId) {
+    return String(groupId).trim();
+  }
+
+  // Se não existir, busca no projeto
+  if (issue.project?.id) {
+    try {
+      const project = await getRedmineProject(
+        issue.project.id
+      );
+
+      groupId = getCustomFieldValue(
+        project,
+        WHATSAPP_GROUP_FIELD_NAME
+      );
+
+      if (groupId) {
+        return String(groupId).trim();
+      }
+    } catch (err) {
+      console.error(
+        `Erro ao buscar grupo WhatsApp do projeto ${issue.project.id}`,
+        err.message
+      );
+    }
+  }
+
+  return null;
+}
 
 initWhatsApp();
 
@@ -714,10 +750,7 @@ async function checkAppointmentAlert(issue) {
       }
 
       const waGroupId =
-        getCustomFieldValue(
-          issue,
-          WHATSAPP_GROUP_FIELD_NAME
-        );
+  await getWhatsAppGroupId(issue);
 
       if (!waGroupId) {
         console.log(
@@ -1311,7 +1344,11 @@ async function processClientMorningSummary() {
         const appointment = parseAppointmentDateTime(issue);
         if (!appointment) continue;
 
-        const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+        const waGroupId =
+  await getWhatsAppGroupId(issue);
+  console.log(
+  `Tarefa #${issue.id} usando grupo WhatsApp: ${waGroupId}`
+);
 
         if (!waGroupId || !waSocket) continue;
 
