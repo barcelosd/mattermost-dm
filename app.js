@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
+const path = require('path');
 const { google } = require('googleapis');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -65,10 +66,13 @@ const {
   GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
 
-  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
+  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
+  WHATSAPP_AUTH_DIR,
+  WHATSAPP_DEBUG_LOGS = 'true'
 } = process.env;
 
 const TZ = 'America/Sao_Paulo';
+const WA_AUTH_DIR = WHATSAPP_AUTH_DIR || path.join(__dirname, '.wwebjs_auth');
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -84,68 +88,155 @@ const mattermostHeaders = {
 // WHATSAPP
 // ---------------------------------------------------------
 let waSocket = null;
+let waConnected = false;
+let waConnectionState = 'not_started';
+let waLastQrAt = null;
+let waLastError = null;
+let waInitializing = false;
+let waReconnectTimer = null;
+
+function describeError(err) {
+  return err?.response?.data || err?.message || err || null;
+}
+
+function whatsappDebugEnabled() {
+  return WHATSAPP_DEBUG_LOGS === 'true';
+}
+
+function logWhatsAppDebug(message, details = null) {
+  if (!whatsappDebugEnabled()) return;
+
+  if (details) {
+    console.log(message, details);
+    return;
+  }
+
+  console.log(message);
+}
+
+function getWhatsAppRuntimeStatus() {
+  return {
+    connected: waConnected,
+    connectionState: waConnectionState,
+    hasSocket: Boolean(waSocket),
+    lastQrAt: waLastQrAt,
+    lastError: waLastError,
+    authDir: WA_AUTH_DIR
+  };
+}
+
+function scheduleWhatsAppReconnect(reason) {
+  if (waReconnectTimer) return;
+
+  console.log(`WhatsApp: reconexão agendada em 15s${reason ? ` (${reason})` : ''}.`);
+
+  waReconnectTimer = setTimeout(() => {
+    waReconnectTimer = null;
+    initWhatsApp();
+  }, 15000);
+}
 
 async function initWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('/opt/render/project/src/.wwebjs_auth');
+  if (waInitializing) return;
 
-  waSocket = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
-    browser: ['Bot NewNorte', 'Chrome', '1.0.0']
-  });
+  waInitializing = true;
+  waConnected = false;
+  waConnectionState = 'starting';
 
-  waSocket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  try {
+    console.log(`WhatsApp: inicializando sessão em ${WA_AUTH_DIR}`);
 
-    if (qr) {
-      console.log('--- NOVO QR CODE GERADO ---');
-      qrcode.generate(qr, { small: true });
-    }
+    const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);
 
-    if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+    waSocket = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: ['Bot NewNorte', 'Chrome', '1.0.0']
+    });
 
-      if (shouldReconnect) {
-        initWhatsApp();
+    waSocket.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        waLastQrAt = new Date().toISOString();
+        console.log('--- NOVO QR CODE GERADO ---');
+        qrcode.generate(qr, { small: true });
       }
-    }
 
-    if (connection === 'open') {
-      console.log('WhatsApp conectado com sucesso!');
-    }
-  });
+      if (connection) {
+        waConnectionState = connection;
+        logWhatsAppDebug(`WhatsApp: connection.update = ${connection}`);
+      }
 
-  waSocket.ev.on('creds.update', saveCreds);
+      if (connection === 'close') {
+        waConnected = false;
+        waSocket = null;
 
-  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        waLastError = describeError(lastDisconnect?.error);
 
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
-
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      '';
-
-    const from = msg.key.remoteJid;
-
-    if (text.trim().toLowerCase() === '!id') {
-      try {
-        await waSocket.sendMessage(
-          from,
-          {
-            text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
-          },
-          { quoted: msg }
+        console.log(
+          `WhatsApp: conexão fechada${statusCode ? ` (status ${statusCode})` : ''}.`,
+          waLastError || ''
         );
-      } catch (err) {
-        console.error('Erro ao responder !id:', err.message);
+
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        if (shouldReconnect) {
+          scheduleWhatsAppReconnect(`status ${statusCode || 'desconhecido'}`);
+        } else {
+          console.log('WhatsApp: sessão deslogada. Leia o novo QR Code para reconectar.');
+        }
       }
-    }
-  });
+
+      if (connection === 'open') {
+        waConnected = true;
+        waLastError = null;
+        console.log('WhatsApp conectado com sucesso!');
+      }
+    });
+
+    waSocket.ev.on('creds.update', saveCreds);
+
+    waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      const msg = messages[0];
+      if (!msg.message || msg.key.fromMe) return;
+
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        '';
+
+      const from = msg.key.remoteJid;
+
+      if (text.trim().toLowerCase() === '!id') {
+        try {
+          await waSocket.sendMessage(
+            from,
+            {
+              text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
+            },
+            { quoted: msg }
+          );
+        } catch (err) {
+          console.error('Erro ao responder !id:', describeError(err));
+        }
+      }
+    });
+  } catch (err) {
+    waSocket = null;
+    waConnected = false;
+    waConnectionState = 'error';
+    waLastError = describeError(err);
+
+    console.error('Erro ao inicializar WhatsApp:', waLastError);
+    scheduleWhatsAppReconnect('erro na inicialização');
+  } finally {
+    waInitializing = false;
+  }
 }
 
 initWhatsApp();
@@ -299,8 +390,19 @@ function getCustomFieldId(issue, fieldName) {
   return field?.id || field?.custom_field_id || null;
 }
 
-function parseAppointmentDateTime(issue) {
-  const date = issue.start_date || issue.due_date;
+function getAppointmentDate(issue, preferredDate = null) {
+  const startDate = issue.start_date || null;
+  const dueDate = issue.due_date || null;
+
+  if (preferredDate && (dueDate === preferredDate || startDate === preferredDate)) {
+    return preferredDate;
+  }
+
+  return dueDate || startDate || null;
+}
+
+function parseAppointmentDateTime(issue, preferredDate = null) {
+  const date = getAppointmentDate(issue, preferredDate);
   const timeValueRaw = getCustomFieldValue(issue, ALERT_FIELD_NAME);
 
   if (!date || !timeValueRaw) return null;
@@ -321,6 +423,7 @@ function parseAppointmentDateTime(issue) {
   ).toDate();
 
   return {
+    date,
     dateTime,
     timeLabel: parsedTime.format('HH[h]mm')
   };
@@ -502,6 +605,48 @@ async function getWhatsAppGroupId(issue) {
   return null;
 }
 
+function normalizeWhatsAppGroupJid(groupId) {
+  if (!groupId) return null;
+
+  const groupJid = String(groupId).trim();
+
+  if (!groupJid) return null;
+
+  if (groupJid.includes('@')) {
+    return groupJid;
+  }
+
+  return `${groupJid}@g.us`;
+}
+
+async function sendWhatsAppText(groupId, text, contextLabel) {
+  const groupJid = normalizeWhatsAppGroupJid(groupId);
+
+  if (!groupJid) {
+    console.log(`WhatsApp ${contextLabel}: grupo não informado.`);
+    return { sent: false, reason: 'missing_group' };
+  }
+
+  if (!waSocket) {
+    console.log(`WhatsApp ${contextLabel}: socket não inicializado.`, getWhatsAppRuntimeStatus());
+    return { sent: false, reason: 'missing_socket' };
+  }
+
+  if (!waConnected) {
+    console.log(`WhatsApp ${contextLabel}: conexão não está aberta.`, getWhatsAppRuntimeStatus());
+    return { sent: false, reason: 'not_connected' };
+  }
+
+  try {
+    await waSocket.sendMessage(groupJid, { text });
+    console.log(`WhatsApp ${contextLabel}: mensagem enviada para ${groupJid}`);
+    return { sent: true, groupJid };
+  } catch (err) {
+    console.error(`WhatsApp ${contextLabel}: erro ao enviar para ${groupJid}:`, describeError(err));
+    return { sent: false, reason: 'send_error', error: describeError(err), groupJid };
+  }
+}
+
 // ---------------------------------------------------------
 // MATTERMOST
 // ---------------------------------------------------------
@@ -641,9 +786,10 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   return msg;
 }
 
-function buildClientSummaryMessage(issue, timeLabel) {
+function buildClientSummaryMessage(issue, timeLabel, preferredDate = null) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
+  const appointmentDate = getAppointmentDate(issue, preferredDate);
 
   let publicoAlvo = '';
 
@@ -656,7 +802,7 @@ function buildClientSummaryMessage(issue, timeLabel) {
   }
 
   let msg = `📅 *Confirmação de Compromisso*\n\n`;
-  msg += `Olá! Passando para lembrar do seu compromisso agendado para o próximo dia útil (${dayjs(issue.start_date || issue.due_date).format('DD/MM/YYYY')}).\n\n`;
+  msg += `Olá! Passando para lembrar do seu compromisso agendado para o próximo dia útil (${dayjs(appointmentDate).format('DD/MM/YYYY')}).\n\n`;
   msg += `*Projeto:* ${issue.project?.name || ''}\n`;
   msg += `*Assunto:* ${issue.subject}\n`;
 
@@ -707,12 +853,27 @@ async function processIssueNotification(issue, action, source, journal = null) {
 // ---------------------------------------------------------
 // ALERTAS — AGUARDANDO DATA
 // ---------------------------------------------------------
-async function checkAppointmentAlert(issue) {
-  if (!isStrictMeetStatus(issue)) return;
+async function checkAppointmentAlert(issue, preferredDate = null) {
+  if (!isStrictMeetStatus(issue)) {
+    logWhatsAppDebug(
+      `[Alertas] Tarefa #${issue.id} ignorada: status "${issue.status?.name || ''}" não é "${MEET_STATUS_NAME}".`
+    );
+    return;
+  }
 
-  const appointment = parseAppointmentDateTime(issue);
+  const appointment = parseAppointmentDateTime(issue, preferredDate);
 
   if (!appointment) {
+    logWhatsAppDebug(
+      `[Alertas] Tarefa #${issue.id} ignorada: data/horário inválidos.`,
+      {
+        startDate: issue.start_date,
+        dueDate: issue.due_date,
+        preferredDate,
+        fieldName: ALERT_FIELD_NAME,
+        fieldValue: getCustomFieldValue(issue, ALERT_FIELD_NAME)
+      }
+    );
     return;
   }
 
@@ -721,27 +882,42 @@ async function checkAppointmentAlert(issue) {
 
   const diffSegundos = dataAgendamento.diff(agora, 'second');
 
-  // Ignora tarefa que já passou há mais de 10 minutos.
   const maxAlertMinutes = Math.max(
-  Number(ALERT_MINUTES_BEFORE || 10),
-  Number(ALERT_EXTRA_MINUTES_BEFORE || 2),
-  Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5)
-);
+    Number(ALERT_MINUTES_BEFORE || 10),
+    Number(ALERT_EXTRA_MINUTES_BEFORE || 2),
+    Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5)
+  );
 
-// Começa a verificar apenas 2 minutos antes do primeiro alerta.
-// Exemplo: primeiro alerta 10 min => começa com 12 min.
-const startCheckingSeconds = (maxAlertMinutes + 2) * 60;
+  // Começa a verificar apenas 2 minutos antes do primeiro alerta.
+  // Exemplo: primeiro alerta 10 min => começa com 12 min.
+  const startCheckingSeconds = (maxAlertMinutes + 2) * 60;
 
-// Depois que passou do horário, não precisa mais verificar.
-const stopAfterSeconds = 30;
+  // Depois que passou do horário, não precisa mais verificar.
+  const stopAfterSeconds = 30;
 
-if (diffSegundos > startCheckingSeconds) {
-  return;
-}
+  if (diffSegundos > startCheckingSeconds) {
+    logWhatsAppDebug(
+      `[Alertas] Tarefa #${issue.id} ainda fora da janela: compromisso em ${diffSegundos}s.`,
+      {
+        appointmentDate: appointment.date,
+        timeLabel: appointment.timeLabel,
+        startsCheckingAtSeconds: startCheckingSeconds
+      }
+    );
+    return;
+  }
 
-if (diffSegundos < -stopAfterSeconds) {
-  return;
-}
+  if (diffSegundos < -stopAfterSeconds) {
+    logWhatsAppDebug(
+      `[Alertas] Tarefa #${issue.id} ignorada: compromisso já passou (${diffSegundos}s).`,
+      {
+        appointmentDate: appointment.date,
+        timeLabel: appointment.timeLabel,
+        stopAfterSeconds
+      }
+    );
+    return;
+  }
 
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
 
@@ -751,14 +927,9 @@ if (diffSegundos < -stopAfterSeconds) {
 
   const appointmentKey = dataAgendamento.format('YYYYMMDDHHmm');
 
-  if (
-  diffSegundos <= startCheckingSeconds &&
-  diffSegundos >= -stopAfterSeconds
-) {
   console.log(
-    `Verificando alerta #${issue.id} | ${appointment.timeLabel} | Faltam ${diffSegundos}s`
+    `Verificando alerta #${issue.id} | ${appointment.date} ${appointment.timeLabel} | Faltam ${diffSegundos}s`
   );
-}
 
   async function sendMattermostAlert(minutes) {
     const targetSec = minutes * 60;
@@ -770,6 +941,7 @@ if (diffSegundos < -stopAfterSeconds) {
       const alertKey = `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
+        logWhatsAppDebug(`[Alertas] Mattermost #${issue.id} (${minutes} min) já enviado.`);
         return;
       }
 
@@ -801,6 +973,7 @@ if (diffSegundos < -stopAfterSeconds) {
       const alertKey = `redmine:wa:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
+        logWhatsAppDebug(`[Alertas] WhatsApp #${issue.id} (${minutes} min) já enviado.`);
         return;
       }
 
@@ -811,25 +984,15 @@ if (diffSegundos < -stopAfterSeconds) {
         return;
       }
 
-      if (!waSocket) {
-        console.log('WhatsApp desconectado.');
-        return;
-      }
+      const result = await sendWhatsAppText(
+        waGroupId,
+        buildWhatsAppMessage(issue, minutes, appointment.timeLabel),
+        `alerta #${issue.id} (${minutes} min)`
+      );
 
-      let groupJid = String(waGroupId).trim();
-
-      if (!groupJid.includes('@')) {
-        groupJid = `${groupJid}@g.us`;
-      }
-
-      console.log(`Tarefa #${issue.id} usando grupo WhatsApp: ${groupJid}`);
-
-      await waSocket.sendMessage(groupJid, {
-        text: buildWhatsAppMessage(issue, minutes, appointment.timeLabel)
-      });
+      if (!result.sent) return;
 
       await markAppointmentAlertSent(alertKey);
-
       console.log(`WhatsApp enviado (${minutes} min) para tarefa #${issue.id}`);
     }
   }
@@ -1351,6 +1514,8 @@ async function pollingAppointmentAlerts() {
 
     const issues = await fetchIssuesByDate(today);
 
+    logWhatsAppDebug(`[Alertas] ${issues.length} tarefa(s) encontradas para ${today}.`);
+
     for (const issueSummary of issues) {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
@@ -1360,7 +1525,7 @@ async function pollingAppointmentAlerts() {
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
 
-        await checkAppointmentAlert(issueWithUrl);
+        await checkAppointmentAlert(issueWithUrl, today);
       } catch (err) {
         console.error(
           `Erro ao verificar alerta da tarefa #${issueSummary.id}:`,
@@ -1396,7 +1561,7 @@ async function processDailySummary() {
 
       if (!isStrictMeetStatus(issue)) continue;
 
-      const appointment = parseAppointmentDateTime(issue);
+      const appointment = parseAppointmentDateTime(issue, targetDate);
 
       if (!appointment) continue;
 
@@ -1407,7 +1572,7 @@ async function processDailySummary() {
       const projectName = await getMeetProjectName(issue);
       const meetLink = getCustomFieldValue(issue, 'Google Meet');
 
-      const sortKey = `${issue.start_date || issue.due_date || ''} ${appointment.timeLabel}`;
+      const sortKey = `${appointment.date || ''} ${appointment.timeLabel}`;
 
       const lineText =
         `- ${appointment.timeLabel}: #${issue.id} - ${projectName} - ${issue.subject}` +
@@ -1454,90 +1619,198 @@ async function processDailySummary() {
 // ---------------------------------------------------------
 // RESUMO WHATSAPP CLIENTE
 // ---------------------------------------------------------
-async function processClientMorningSummary() {
-  if (CLIENT_SUMMARY_ENABLED !== 'true') return;
-
+async function processClientMorningSummary(options = {}) {
+  const force = options.force === true;
+  const dryRun = options.dryRun === true;
+  const source = options.source || 'scheduler';
   const now = dayjs().tz(TZ);
   const [tHour, tMinute] = String(CLIENT_SUMMARY_TIME || '08:30')
     .split(':')
     .map(Number);
+  const targetTime = `${String(tHour).padStart(2, '0')}:${String(tMinute).padStart(2, '0')}`;
+  const result = {
+    source,
+    force,
+    dryRun,
+    enabled: CLIENT_SUMMARY_ENABLED === 'true',
+    now: now.format('YYYY-MM-DD HH:mm:ss'),
+    targetTime,
+    targetDate: null,
+    summaryKey: null,
+    alreadyNotified: false,
+    markedNotified: false,
+    reason: null,
+    counts: {
+      found: 0,
+      eligible: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0
+    },
+    sent: [],
+    failed: [],
+    skipped: [],
+    whatsapp: getWhatsAppRuntimeStatus()
+  };
 
-  if (now.hour() !== tHour || now.minute() !== tMinute) return;
+  if (CLIENT_SUMMARY_ENABLED !== 'true' && !force) {
+    result.reason = 'disabled';
+    logWhatsAppDebug('[Resumo WhatsApp] Ignorado: CLIENT_SUMMARY_ENABLED não está true.');
+    return result;
+  }
+
+  if (Number.isNaN(tHour) || Number.isNaN(tMinute)) {
+    result.reason = 'invalid_time';
+    console.error(`[Resumo WhatsApp] CLIENT_SUMMARY_TIME inválido: ${CLIENT_SUMMARY_TIME}`);
+    return result;
+  }
+
+  if (!force && (now.hour() !== tHour || now.minute() !== tMinute)) {
+    result.reason = 'outside_time';
+    logWhatsAppDebug(
+      `[Resumo WhatsApp] Fora do horário: agora ${result.now}, alvo ${targetTime}.`
+    );
+    return result;
+  }
 
   const targetDate = getNextBusinessSummaryDateString();
   const summaryKey = `redmine:summary:whatsapp:${targetDate}`;
 
-  if (await wasAlreadyNotified(summaryKey)) return;
+  result.targetDate = targetDate;
+  result.summaryKey = summaryKey;
+
+  result.alreadyNotified = await wasAlreadyNotified(summaryKey);
+
+  if (result.alreadyNotified && !force) {
+    result.reason = 'already_notified';
+    console.log(`[Resumo WhatsApp] Ignorado: chave já notificada (${summaryKey}).`);
+    return result;
+  }
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
 
-    console.log(`Tarefas encontradas para ${targetDate}:`, issueSummaries.map(i => i.id));
+    result.counts.found = issueSummaries.length;
+
+    console.log(
+      `[Resumo WhatsApp] ${issueSummaries.length} tarefa(s) encontradas para ${targetDate}.`,
+      issueSummaries.map(i => i.id)
+    );
 
     for (const issueSummary of issueSummaries) {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
+        const item = {
+          id: issue.id,
+          status: issue.status?.name || null,
+          startDate: issue.start_date || null,
+          dueDate: issue.due_date || null,
+          timeValue: getCustomFieldValue(issue, ALERT_FIELD_NAME),
+          groupId: null,
+          reason: null
+        };
 
-        if (!isStrictMeetStatus(issue)) continue;
-
-        const appointment = parseAppointmentDateTime(issue);
-
-        if (!appointment) continue;
-
-        const waGroupId = await getWhatsAppGroupId(issue);
-
-        if (!waGroupId || !waSocket) continue;
-
-        let groupJid = String(waGroupId).trim();
-
-        if (!groupJid.includes('@')) {
-          groupJid = `${groupJid}@g.us`;
+        if (!isStrictMeetStatus(issue)) {
+          item.reason = 'not_meet_status';
+          result.skipped.push(item);
+          result.counts.skipped += 1;
+          logWhatsAppDebug(`[Resumo WhatsApp] Tarefa #${issue.id} ignorada: status "${item.status}".`);
+          continue;
         }
 
-        console.log('--- Tarefa encontrada ---');
-console.log('ID:', issue.id);
-console.log('Status:', issue.status?.name);
-console.log('Início:', issue.start_date);
-console.log('Data prevista:', issue.due_date);
-console.log('Horário:', getCustomFieldValue(issue, ALERT_FIELD_NAME));
-console.log('Grupo WhatsApp:', await getWhatsAppGroupId(issue));
-console.log('WhatsApp conectado:', !!waSocket);
-console.log('É Aguardando Data:', isStrictMeetStatus(issue));
-console.log('Appointment:', parseAppointmentDateTime(issue));
+        const appointment = parseAppointmentDateTime(issue, targetDate);
 
-        await waSocket.sendMessage(groupJid, {
-          text: buildClientSummaryMessage(issue, appointment.timeLabel)
+        if (!appointment) {
+          item.reason = 'invalid_appointment';
+          result.skipped.push(item);
+          result.counts.skipped += 1;
+          console.log('[Resumo WhatsApp] Tarefa ignorada: data/horário inválidos.', item);
+          continue;
+        }
+
+        const waGroupId = await getWhatsAppGroupId(issue);
+        item.groupId = waGroupId;
+        item.appointmentDate = appointment.date;
+        item.timeLabel = appointment.timeLabel;
+
+        if (!waGroupId) {
+          item.reason = 'missing_group';
+          result.skipped.push(item);
+          result.counts.skipped += 1;
+          console.log(`[Resumo WhatsApp] Tarefa #${issue.id} sem grupo WhatsApp.`, item);
+          continue;
+        }
+
+        result.counts.eligible += 1;
+
+        if (dryRun) {
+          item.reason = 'dry_run';
+          result.skipped.push(item);
+          result.counts.skipped += 1;
+          console.log(`[Resumo WhatsApp] Dry-run: enviaria tarefa #${issue.id} para ${waGroupId}.`);
+          continue;
+        }
+
+        const sendResult = await sendWhatsAppText(
+          waGroupId,
+          buildClientSummaryMessage(issue, appointment.timeLabel, targetDate),
+          `resumo #${issue.id}`
+        );
+
+        if (sendResult.sent) {
+          result.sent.push({
+            ...item,
+            groupJid: sendResult.groupJid
+          });
+          result.counts.sent += 1;
+          continue;
+        }
+
+        result.failed.push({
+          ...item,
+          reason: sendResult.reason,
+          error: sendResult.error || null,
+          groupJid: sendResult.groupJid || null
         });
-
-        console.log(`Resumo WhatsApp enviado para tarefa #${issue.id}`);
-
-console.log(
-  `Resumo WhatsApp: verificando chave ${summaryKey}`
-);        
-
-console.log('========== DEBUG RESUMO WHATSAPP ==========');
-console.log('Agora:', now.format('YYYY-MM-DD HH:mm:ss'));
-console.log('CLIENT_SUMMARY_TIME:', CLIENT_SUMMARY_TIME);
-console.log('Horário alvo:', `${tHour}:${tMinute}`);
-console.log('Data alvo:', targetDate);
-console.log('Chave Redis:', summaryKey);
-
-console.log(`Enviando resumo WhatsApp da tarefa #${issue.id}`);
-
+        result.counts.failed += 1;
       } catch (err) {
         console.error(
           `Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`,
-          err.response?.data || err.message
+          describeError(err)
         );
+
+        result.failed.push({
+          id: issueSummary.id,
+          reason: 'exception',
+          error: describeError(err)
+        });
+        result.counts.failed += 1;
       }
     }
 
-    await markAsNotified(summaryKey);
+    const blockingSkips = result.skipped.filter(item => item.reason === 'missing_group');
+
+    if (!dryRun && result.counts.sent > 0 && result.counts.failed === 0 && blockingSkips.length === 0) {
+      await markAsNotified(summaryKey);
+      result.markedNotified = true;
+      console.log(`[Resumo WhatsApp] Concluído e marcado como notificado: ${summaryKey}`);
+    } else if (!dryRun) {
+      console.log(
+        `[Resumo WhatsApp] Não marcou ${summaryKey}: enviados=${result.counts.sent}, falhas=${result.counts.failed}, sem_grupo=${blockingSkips.length}.`
+      );
+    }
+
+    return result;
   } catch (error) {
+    result.reason = 'general_error';
+    result.error = describeError(error);
+
     console.error(
       'Erro geral no resumo WhatsApp:',
-      error.response?.data || error.message
+      result.error
     );
+
+    return result;
   }
 }
 
@@ -1551,38 +1824,115 @@ app.use(express.json());
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
-    whatsappConnected: !!waSocket,
+    whatsappConnected: waConnected,
+    whatsapp: getWhatsAppRuntimeStatus(),
     redisConnected: !!redis,
     pollingEnabled: POLLING_ENABLED,
     notifyStatuses: NOTIFY_STATUSES,
-    meetStatusName: MEET_STATUS_NAME
+    meetStatusName: MEET_STATUS_NAME,
+    clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
+    clientSummaryTime: CLIENT_SUMMARY_TIME,
+    whatsappDebugLogs: WHATSAPP_DEBUG_LOGS
   });
+});
+
+app.get('/debug-whatsapp', (req, res) => {
+  res.status(200).json({
+    whatsapp: getWhatsAppRuntimeStatus()
+  });
+});
+
+app.get('/debug-whatsapp-summary', async (req, res) => {
+  const send = req.query.send === 'true';
+  const force = send || req.query.force !== 'false';
+
+  const result = await processClientMorningSummary({
+    force,
+    dryRun: !send,
+    source: 'debug-endpoint'
+  });
+
+  res.status(200).json(result);
 });
 
 app.get('/debug-alerts/:id', async (req, res) => {
   try {
     const issue = await fetchIssueDetails(req.params.id);
-    const appointment = parseAppointmentDateTime(issue);
+    const preferredDate = req.query.date || getAppointmentDate(issue);
+    const appointment = parseAppointmentDateTime(issue, preferredDate);
     const waGroupId = await getWhatsAppGroupId(issue);
-
-    res.json({
+    const dataAgendamento = appointment
+      ? dayjs(appointment.dateTime).tz(TZ)
+      : null;
+    const diffSeconds = dataAgendamento
+      ? dataAgendamento.diff(dayjs().tz(TZ), 'second')
+      : null;
+    const response = {
       issue: issue.id,
       status: issue.status?.name,
-      date: issue.start_date || issue.due_date,
+      isMeetStatus: isStrictMeetStatus(issue),
+      startDate: issue.start_date || null,
+      dueDate: issue.due_date || null,
+      selectedDate: appointment?.date || preferredDate || null,
+      horarioCampo: getCustomFieldValue(issue, ALERT_FIELD_NAME),
       horario: appointment?.timeLabel || null,
       dataCompleta: appointment?.dateTime || null,
+      diffSeconds,
       grupoWhatsapp: waGroupId,
-      googleMeet: getCustomFieldValue(issue, 'Google Meet')
-    });
+      grupoWhatsappJid: normalizeWhatsAppGroupJid(waGroupId),
+      googleMeet: getCustomFieldValue(issue, 'Google Meet'),
+      whatsapp: getWhatsAppRuntimeStatus(),
+      alertConfig: {
+        mattermostMinutesBefore: Number(ALERT_MINUTES_BEFORE || 10),
+        mattermostExtraMinutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE || 2),
+        whatsappMinutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
+        windowSeconds: Number(ALERT_WINDOW_SECONDS || 180)
+      }
+    };
+
+    if (req.query.sendWhatsApp === 'true') {
+      if (!appointment || !waGroupId) {
+        response.manualSend = {
+          sent: false,
+          reason: !appointment ? 'invalid_appointment' : 'missing_group'
+        };
+      } else {
+        response.manualSend = await sendWhatsAppText(
+          waGroupId,
+          buildWhatsAppMessage(
+            issue,
+            Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
+            appointment.timeLabel
+          ),
+          `debug-alerts #${issue.id}`
+        );
+      }
+    }
+
+    res.json(response);
   } catch (err) {
     res.status(500).json({
-      erro: err.response?.data || err.message
+      erro: describeError(err)
     });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
+  console.log('Configuração carregada:', {
+    timezone: TZ,
+    pollingEnabled: POLLING_ENABLED,
+    pollingIntervalSeconds: Number(POLLING_INTERVAL_SECONDS),
+    alertPollingIntervalSeconds: Number(ALERT_POLLING_INTERVAL_SECONDS),
+    alertFieldName: ALERT_FIELD_NAME,
+    meetStatusName: MEET_STATUS_NAME,
+    whatsappAlertMinutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
+    clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
+    clientSummaryTime: CLIENT_SUMMARY_TIME,
+    whatsappGroupFieldName: WHATSAPP_GROUP_FIELD_NAME,
+    whatsappDebugLogs: WHATSAPP_DEBUG_LOGS,
+    whatsappAuthDir: WA_AUTH_DIR
+  });
 
   pollingRedmineIssues();
   pollingAppointmentAlerts();

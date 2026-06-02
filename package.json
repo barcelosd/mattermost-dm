@@ -14,13 +14,18 @@
   ],
   "author": "Daniel",
   "license": "ISC",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "axios": "^1.9.0",
     "dayjs": "^1.11.20",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "googleapis": "^172.0.0",
     "ioredis": "^5.10.1",
+    "pino": "^10.3.1",
     "puppeteer": "^25.1.0",
     "qrcode-terminal": "^0.12.0",
     "uuid": "^14.0.0",
