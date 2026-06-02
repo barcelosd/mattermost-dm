@@ -1472,6 +1472,8 @@ async function processClientMorningSummary() {
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
 
+    console.log(`Tarefas encontradas para ${targetDate}:`, issueSummaries.map(i => i.id));
+
     for (const issueSummary of issueSummaries) {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
@@ -1492,6 +1494,17 @@ async function processClientMorningSummary() {
           groupJid = `${groupJid}@g.us`;
         }
 
+        console.log('--- Tarefa encontrada ---');
+console.log('ID:', issue.id);
+console.log('Status:', issue.status?.name);
+console.log('Início:', issue.start_date);
+console.log('Data prevista:', issue.due_date);
+console.log('Horário:', getCustomFieldValue(issue, ALERT_FIELD_NAME));
+console.log('Grupo WhatsApp:', await getWhatsAppGroupId(issue));
+console.log('WhatsApp conectado:', !!waSocket);
+console.log('É Aguardando Data:', isStrictMeetStatus(issue));
+console.log('Appointment:', parseAppointmentDateTime(issue));
+
         await waSocket.sendMessage(groupJid, {
           text: buildClientSummaryMessage(issue, appointment.timeLabel)
         });
@@ -1500,14 +1513,17 @@ async function processClientMorningSummary() {
 
 console.log(
   `Resumo WhatsApp: verificando chave ${summaryKey}`
-);
+);        
 
-if (await wasAlreadyNotified(summaryKey)) {
-  console.log(
-    `Resumo WhatsApp ignorado pois já existe ${summaryKey}`
-  );
-  return;
-}
+console.log('========== DEBUG RESUMO WHATSAPP ==========');
+console.log('Agora:', now.format('YYYY-MM-DD HH:mm:ss'));
+console.log('CLIENT_SUMMARY_TIME:', CLIENT_SUMMARY_TIME);
+console.log('Horário alvo:', `${tHour}:${tMinute}`);
+console.log('Data alvo:', targetDate);
+console.log('Chave Redis:', summaryKey);
+
+console.log(`Enviando resumo WhatsApp da tarefa #${issue.id}`);
+
       } catch (err) {
         console.error(
           `Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`,
