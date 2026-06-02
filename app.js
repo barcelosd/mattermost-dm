@@ -255,7 +255,8 @@ const memory = {
   values: new Map(),
   meetIssues: new Set(),
   notified: new Set(),
-  alerts: new Set()
+  alerts: new Set(),
+  completedAppointments: new Set()
 };
 
 async function redisSet(key, value, customTtl) {
@@ -356,6 +357,17 @@ async function markAppointmentAlertSent(key) {
 
   memory.alerts.add(key);
   setTimeout(() => memory.alerts.delete(key), ttl * 1000);
+}
+
+async function wasAppointmentCompleted(key) {
+  return memory.completedAppointments.has(key);
+}
+
+async function markAppointmentCompleted(key) {
+  const ttl = 36 * 60 * 60;
+
+  memory.completedAppointments.add(key);
+  setTimeout(() => memory.completedAppointments.delete(key), ttl * 1000);
 }
 
 // ---------------------------------------------------------
@@ -891,28 +903,25 @@ async function processIssueNotification(issue, action, source, journal = null) {
 // ---------------------------------------------------------
 // ALERTAS — AGUARDANDO DATA
 // ---------------------------------------------------------
-async function checkAppointmentAlert(issue, preferredDate = null) {
+const APPOINTMENT_ALERT_LOOKAHEAD_SECONDS = 12 * 60;
+const APPOINTMENT_ALERT_STOP_BEFORE_SECONDS = 60;
+
+function incrementAlertStat(stats, key) {
+  if (!stats) return;
+  stats[key] = (stats[key] || 0) + 1;
+}
+
+async function checkAppointmentAlert(issue, preferredDate = null, stats = null) {
   if (!isStrictMeetStatus(issue)) {
-    logWhatsAppDebug(
-      `[Alertas] Tarefa #${issue.id} ignorada: status "${issue.status?.name || ''}" não é "${MEET_STATUS_NAME}".`
-    );
-    return;
+    incrementAlertStat(stats, 'skippedStatus');
+    return 'skipped_status';
   }
 
   const appointment = parseAppointmentDateTime(issue, preferredDate);
 
   if (!appointment) {
-    logWhatsAppDebug(
-      `[Alertas] Tarefa #${issue.id} ignorada: data/horário inválidos.`,
-      {
-        startDate: issue.start_date,
-        dueDate: issue.due_date,
-        preferredDate,
-        fieldName: ALERT_FIELD_NAME,
-        fieldValue: getCustomFieldValue(issue, ALERT_FIELD_NAME)
-      }
-    );
-    return;
+    incrementAlertStat(stats, 'invalidAppointment');
+    return 'invalid_appointment';
   }
 
   const agora = dayjs().tz(TZ);
@@ -920,41 +929,14 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
 
   const diffSegundos = dataAgendamento.diff(agora, 'second');
 
-  const maxAlertMinutes = Math.max(
-    Number(ALERT_MINUTES_BEFORE || 10),
-    Number(ALERT_EXTRA_MINUTES_BEFORE || 2),
-    Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5)
-  );
-
-  // Começa a verificar apenas 2 minutos antes do primeiro alerta.
-  // Exemplo: primeiro alerta 10 min => começa com 12 min.
-  const startCheckingSeconds = (maxAlertMinutes + 2) * 60;
-
-  // Depois que passou do horário, não precisa mais verificar.
-  const stopAfterSeconds = 30;
-
-  if (diffSegundos > startCheckingSeconds) {
-    logWhatsAppDebug(
-      `[Alertas] Tarefa #${issue.id} ainda fora da janela: compromisso em ${diffSegundos}s.`,
-      {
-        appointmentDate: appointment.date,
-        timeLabel: appointment.timeLabel,
-        startsCheckingAtSeconds: startCheckingSeconds
-      }
-    );
-    return;
+  if (diffSegundos > APPOINTMENT_ALERT_LOOKAHEAD_SECONDS) {
+    incrementAlertStat(stats, 'tooEarly');
+    return 'too_early';
   }
 
-  if (diffSegundos < -stopAfterSeconds) {
-    logWhatsAppDebug(
-      `[Alertas] Tarefa #${issue.id} ignorada: compromisso já passou (${diffSegundos}s).`,
-      {
-        appointmentDate: appointment.date,
-        timeLabel: appointment.timeLabel,
-        stopAfterSeconds
-      }
-    );
-    return;
+  if (diffSegundos < APPOINTMENT_ALERT_STOP_BEFORE_SECONDS) {
+    incrementAlertStat(stats, 'pastOrTooLate');
+    return 'past_or_too_late';
   }
 
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
@@ -968,18 +950,23 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
   console.log(
     `Verificando alerta #${issue.id} | ${appointment.date} ${appointment.timeLabel} | Faltam ${diffSegundos}s`
   );
+  incrementAlertStat(stats, 'checkedWindow');
 
   async function sendMattermostAlert(minutes) {
     const targetSec = minutes * 60;
+    const lowerBoundSeconds = Math.max(
+      APPOINTMENT_ALERT_STOP_BEFORE_SECONDS,
+      targetSec - windowSeconds
+    );
 
     if (
       diffSegundos <= targetSec &&
-      diffSegundos >= targetSec - windowSeconds
+      diffSegundos >= lowerBoundSeconds
     ) {
       const alertKey = `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
-        logWhatsAppDebug(`[Alertas] Mattermost #${issue.id} (${minutes} min) já enviado.`);
+        incrementAlertStat(stats, 'alreadySent');
         return;
       }
 
@@ -996,6 +983,7 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
       );
 
       await markAppointmentAlertSent(alertKey);
+      incrementAlertStat(stats, 'sentMattermost');
 
       console.log(`Mattermost enviado (${minutes} min) para tarefa #${issue.id}`);
     }
@@ -1003,15 +991,19 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
 
   async function sendWhatsAppAlert(minutes) {
     const targetSec = minutes * 60;
+    const lowerBoundSeconds = Math.max(
+      APPOINTMENT_ALERT_STOP_BEFORE_SECONDS,
+      targetSec - windowSeconds
+    );
 
     if (
       diffSegundos <= targetSec &&
-      diffSegundos >= targetSec - windowSeconds
+      diffSegundos >= lowerBoundSeconds
     ) {
       const alertKey = `redmine:wa:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
-        logWhatsAppDebug(`[Alertas] WhatsApp #${issue.id} (${minutes} min) já enviado.`);
+        incrementAlertStat(stats, 'alreadySent');
         return;
       }
 
@@ -1031,6 +1023,7 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
       if (!result.sent) return;
 
       await markAppointmentAlertSent(alertKey);
+      incrementAlertStat(stats, 'sentWhatsapp');
       console.log(`WhatsApp enviado (${minutes} min) para tarefa #${issue.id}`);
     }
   }
@@ -1038,6 +1031,8 @@ async function checkAppointmentAlert(issue, preferredDate = null) {
   await sendMattermostAlert(mmMin1);
   await sendWhatsAppAlert(waMin);
   await sendMattermostAlert(mmMin2);
+
+  return 'checked';
 }
 
 // ---------------------------------------------------------
@@ -1549,28 +1544,61 @@ async function fetchIssuesByDate(dateStr) {
 async function pollingAppointmentAlerts() {
   try {
     const today = dayjs().tz(TZ).format('YYYY-MM-DD');
+    const stats = {
+      found: 0,
+      fetchedDetails: 0,
+      skippedStatus: 0,
+      invalidAppointment: 0,
+      tooEarly: 0,
+      pastOrTooLate: 0,
+      skippedCompleted: 0,
+      checkedWindow: 0,
+      alreadySent: 0,
+      sentMattermost: 0,
+      sentWhatsapp: 0,
+      errors: 0
+    };
 
     const issues = await fetchIssuesByDate(today);
-
-    logWhatsAppDebug(`[Alertas] ${issues.length} tarefa(s) encontradas para ${today}.`);
+    stats.found = issues.length;
 
     for (const issueSummary of issues) {
       try {
+        if (issueSummary.status && !isStrictMeetStatus(issueSummary)) {
+          stats.skippedStatus += 1;
+          continue;
+        }
+
+        const completedKey = `redmine:appointment:completed:${today}:${issueSummary.id}`;
+
+        if (await wasAppointmentCompleted(completedKey)) {
+          stats.skippedCompleted += 1;
+          continue;
+        }
+
         const issue = await fetchIssueDetails(issueSummary.id);
+        stats.fetchedDetails += 1;
 
         const issueWithUrl = {
           ...issue,
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
 
-        await checkAppointmentAlert(issueWithUrl, today);
+        const result = await checkAppointmentAlert(issueWithUrl, today, stats);
+
+        if (result === 'past_or_too_late') {
+          await markAppointmentCompleted(completedKey);
+        }
       } catch (err) {
+        stats.errors += 1;
         console.error(
           `Erro ao verificar alerta da tarefa #${issueSummary.id}:`,
           err.response?.data || err.message
         );
       }
     }
+
+    logWhatsAppDebug(`[Alertas] Resumo ${today}:`, stats);
   } catch (error) {
     console.error(
       'Erro geral no polling de alertas:',
