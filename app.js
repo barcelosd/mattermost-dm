@@ -1727,14 +1727,8 @@ async function processClientMorningSummary(options = {}) {
     console.log(`[Resumo WhatsApp] Chave removida para reprocessamento: ${summaryKey}`);
   }
 
-  result.alreadyNotified = await wasAlreadyNotified(summaryKey);
   result.notifiedMarker = await getNotificationMarker(summaryKey);
-
-  if (result.alreadyNotified && !force) {
-    result.reason = 'already_notified';
-    console.log(`[Resumo WhatsApp] Ignorado: chave já notificada (${summaryKey}).`, result.notifiedMarker);
-    return result;
-  }
+  result.alreadyNotified = Boolean(result.notifiedMarker);
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
