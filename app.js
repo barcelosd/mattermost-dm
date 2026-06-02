@@ -68,7 +68,12 @@ const {
 
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
   WHATSAPP_AUTH_DIR,
-  WHATSAPP_DEBUG_LOGS = 'true'
+  WHATSAPP_DEBUG_LOGS = 'true',
+
+  ERROR_NOTIFICATION_ENABLED = 'true',
+  ERROR_NOTIFICATION_WEBHOOK_URL,
+  ERROR_NOTIFICATION_WHATSAPP_GROUP_ID,
+  ERROR_NOTIFICATION_MIN_INTERVAL_SECONDS = 300
 } = process.env;
 
 const TZ = 'America/Sao_Paulo';
@@ -187,6 +192,11 @@ async function initWhatsApp() {
           scheduleWhatsAppReconnect(`status ${statusCode || 'desconhecido'}`);
         } else {
           console.log('WhatsApp: sessão deslogada. Leia o novo QR Code para reconectar.');
+          notifyAttention(
+            'whatsapp_logged_out',
+            'WhatsApp deslogado: precisa ler um novo QR Code',
+            { statusCode, error: waLastError }
+          );
         }
       }
 
@@ -233,13 +243,16 @@ async function initWhatsApp() {
     waLastError = describeError(err);
 
     console.error('Erro ao inicializar WhatsApp:', waLastError);
+    await notifyAttention(
+      'whatsapp_init_error',
+      'Erro ao inicializar WhatsApp',
+      waLastError
+    );
     scheduleWhatsAppReconnect('erro na inicialização');
   } finally {
     waInitializing = false;
   }
 }
-
-initWhatsApp();
 
 // ---------------------------------------------------------
 // REDIS / CACHE LOCAL
@@ -256,8 +269,70 @@ const memory = {
   meetIssues: new Set(),
   notified: new Set(),
   alerts: new Set(),
-  completedAppointments: new Set()
+  completedAppointments: new Set(),
+  attentionNotifications: new Map()
 };
+
+function compactDetails(details) {
+  if (!details) return null;
+
+  const value = typeof details === 'string'
+    ? details
+    : JSON.stringify(details, null, 2);
+
+  return value.length > 1200 ? `${value.slice(0, 1200)}...` : value;
+}
+
+async function notifyAttention(key, title, details = null) {
+  if (ERROR_NOTIFICATION_ENABLED !== 'true') return;
+
+  const throttleMs = Number(ERROR_NOTIFICATION_MIN_INTERVAL_SECONDS || 300) * 1000;
+  const now = Date.now();
+  const lastSentAt = memory.attentionNotifications.get(key) || 0;
+
+  if (now - lastSentAt < throttleMs) return;
+
+  memory.attentionNotifications.set(key, now);
+
+  const detailsText = compactDetails(details);
+  const message = [
+    `⚠️ Atenção necessária no bot Redmine`,
+    `*${title}*`,
+    `Horário: ${dayjs().tz(TZ).format('YYYY-MM-DD HH:mm:ss')}`,
+    detailsText ? `Detalhes:\n${detailsText}` : null
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  if (ERROR_NOTIFICATION_WEBHOOK_URL) {
+    try {
+      await axios.post(ERROR_NOTIFICATION_WEBHOOK_URL, { text: message });
+    } catch (err) {
+      console.error('Erro ao notificar atenção por webhook:', describeError(err));
+    }
+  }
+
+  if (ERROR_NOTIFICATION_WHATSAPP_GROUP_ID) {
+    try {
+      const groupJid = normalizeWhatsAppGroupJid(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID);
+
+      if (groupJid && waSocket && waConnected) {
+        await waSocket.sendMessage(groupJid, { text: message });
+      }
+    } catch (err) {
+      console.error('Erro ao notificar atenção por WhatsApp:', describeError(err));
+    }
+  }
+}
+
+if (redis) {
+  redis.on('error', (err) => {
+    console.error('Erro no Redis:', describeError(err));
+    notifyAttention('redis_error', 'Erro de conexão/operação no Redis', describeError(err));
+  });
+}
+
+initWhatsApp();
 
 async function redisSet(key, value, customTtl) {
   const ttl = customTtl || Number(REDIS_TTL_DAYS) * 86400;
@@ -552,6 +627,11 @@ async function getRedmineProject(projectId) {
     return response.data.project;
   } catch (err) {
     console.error(`Erro ao buscar projeto ${projectId}:`, err.response?.data || err.message);
+    await notifyAttention(
+      `redmine_project_error:${projectId}`,
+      'Erro ao buscar projeto no Redmine',
+      { projectId, error: err.response?.data || err.message }
+    );
     return null;
   }
 }
@@ -679,11 +759,21 @@ async function sendWhatsAppText(groupId, text, contextLabel) {
 
   if (!waSocket) {
     console.log(`WhatsApp ${contextLabel}: socket não inicializado.`, getWhatsAppRuntimeStatus());
+    await notifyAttention(
+      'whatsapp_missing_socket',
+      'WhatsApp sem socket inicializado',
+      { contextLabel, whatsapp: getWhatsAppRuntimeStatus() }
+    );
     return { sent: false, reason: 'missing_socket' };
   }
 
   if (!waConnected) {
     console.log(`WhatsApp ${contextLabel}: conexão não está aberta.`, getWhatsAppRuntimeStatus());
+    await notifyAttention(
+      'whatsapp_not_connected',
+      'WhatsApp desconectado',
+      { contextLabel, whatsapp: getWhatsAppRuntimeStatus() }
+    );
     return { sent: false, reason: 'not_connected' };
   }
 
@@ -693,6 +783,11 @@ async function sendWhatsAppText(groupId, text, contextLabel) {
     return { sent: true, groupJid };
   } catch (err) {
     console.error(`WhatsApp ${contextLabel}: erro ao enviar para ${groupJid}:`, describeError(err));
+    await notifyAttention(
+      `whatsapp_send_error:${groupJid}`,
+      'Erro ao enviar mensagem pelo WhatsApp',
+      { contextLabel, groupJid, error: describeError(err) }
+    );
     return { sent: false, reason: 'send_error', error: describeError(err), groupJid };
   }
 }
@@ -762,10 +857,20 @@ async function notifyTargets(targets, message) {
           `Erro ao enviar Mattermost para ${target.email}:`,
           error.response?.data || error.message
         );
+        await notifyAttention(
+          `mattermost_send_error:${target.email}`,
+          'Erro ao enviar mensagem pelo Mattermost',
+          { target: target.email, error: error.response?.data || error.message }
+        );
       }
     }
   } catch (err) {
     console.error('Erro geral no Mattermost:', err.response?.data || err.message);
+    await notifyAttention(
+      'mattermost_general_error',
+      'Erro geral no Mattermost',
+      err.response?.data || err.message
+    );
   }
 }
 
@@ -1011,6 +1116,15 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
 
       if (!waGroupId) {
         console.log(`Tarefa #${issue.id} sem grupo WhatsApp.`);
+        await notifyAttention(
+          `appointment_missing_whatsapp_group:${issue.id}`,
+          'Tarefa sem grupo WhatsApp para alerta',
+          {
+            issueId: issue.id,
+            project: issue.project?.name || null,
+            fieldName: WHATSAPP_GROUP_FIELD_NAME
+          }
+        );
         return;
       }
 
@@ -1142,6 +1256,11 @@ async function deleteGoogleMeet(issueId) {
     console.error(
       `Erro ao excluir Meet da tarefa #${issueId}:`,
       error.response?.data || error.message
+    );
+    await notifyAttention(
+      `meet_delete_error:${issueId}`,
+      'Erro ao excluir evento do Google Meet',
+      { issueId, error: error.response?.data || error.message }
     );
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
@@ -1283,6 +1402,11 @@ async function processGoogleMeet(issue) {
       `Erro ao sincronizar Google Meet da tarefa #${issue.id}:`,
       error.response?.data || error.message
     );
+    await notifyAttention(
+      `meet_sync_error:${issue.id}`,
+      'Erro ao sincronizar Google Meet',
+      { issueId: issue.id, error: error.response?.data || error.message }
+    );
   }
 }
 
@@ -1384,6 +1508,11 @@ async function getOrCreateClientFolderStructure(issue) {
     };
   } catch (err) {
     console.error('Erro ao criar estrutura Drive:', err.response?.data || err.message);
+    await notifyAttention(
+      `drive_structure_error:${issue?.project?.id || 'unknown'}`,
+      'Erro ao criar estrutura no Google Drive',
+      { issueId: issue?.id, projectId: issue?.project?.id, error: err.response?.data || err.message }
+    );
     return null;
   }
 }
@@ -1428,11 +1557,21 @@ async function processMeetRecordings() {
           `Erro ao mover gravação da tarefa #${issueId}:`,
           err.response?.data || err.message
         );
+        await notifyAttention(
+          `drive_recording_move_error:${issueId}`,
+          'Erro ao mover gravação no Google Drive',
+          { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
+        );
       }
     }
   } catch (error) {
     console.error(
       'Erro geral no processamento de gravações:',
+      error.response?.data || error.message
+    );
+    await notifyAttention(
+      'drive_recordings_general_error',
+      'Erro geral no processamento de gravações',
       error.response?.data || error.message
     );
   }
@@ -1493,6 +1632,11 @@ async function pollingRedmineIssues() {
             `Erro no polling da tarefa #${issueSummary.id}:`,
             err.response?.data || err.message
           );
+          await notifyAttention(
+            `polling_issue_error:${issueSummary.id}`,
+            'Erro no polling de tarefa do Redmine',
+            { issueId: issueSummary.id, error: err.response?.data || err.message }
+          );
         }
       }
     }
@@ -1500,6 +1644,11 @@ async function pollingRedmineIssues() {
     lastPollingTimestamp = Date.now();
   } catch (error) {
     console.error('Erro geral no polling:', error.response?.data || error.message);
+    await notifyAttention(
+      'polling_general_error',
+      'Erro geral no polling do Redmine',
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -1522,8 +1671,22 @@ async function fetchIssuesByDate(dateStr) {
 
   try {
     const [byStartDate, byDueDate] = await Promise.all([
-      fetchByField('start_date').catch(() => []),
-      fetchByField('due_date').catch(() => [])
+      fetchByField('start_date').catch(async (error) => {
+        await notifyAttention(
+          `redmine_fetch_by_date_error:start_date:${dateStr}`,
+          'Erro ao buscar tarefas por data no Redmine',
+          { field: 'start_date', date: dateStr, error: error.response?.data || error.message }
+        );
+        return [];
+      }),
+      fetchByField('due_date').catch(async (error) => {
+        await notifyAttention(
+          `redmine_fetch_by_date_error:due_date:${dateStr}`,
+          'Erro ao buscar tarefas por data no Redmine',
+          { field: 'due_date', date: dateStr, error: error.response?.data || error.message }
+        );
+        return [];
+      })
     ]);
 
     const combined = [...byStartDate, ...byDueDate];
@@ -1535,6 +1698,11 @@ async function fetchIssuesByDate(dateStr) {
     console.error(
       'Erro ao buscar tarefas por data:',
       error.response?.data || error.message
+    );
+    await notifyAttention(
+      `redmine_fetch_by_date_general_error:${dateStr}`,
+      'Erro geral ao buscar tarefas por data no Redmine',
+      { date: dateStr, error: error.response?.data || error.message }
     );
 
     return [];
@@ -1595,6 +1763,11 @@ async function pollingAppointmentAlerts() {
           `Erro ao verificar alerta da tarefa #${issueSummary.id}:`,
           err.response?.data || err.message
         );
+        await notifyAttention(
+          `appointment_alert_issue_error:${issueSummary.id}`,
+          'Erro ao verificar alerta de compromisso',
+          { issueId: issueSummary.id, error: err.response?.data || err.message }
+        );
       }
     }
 
@@ -1602,6 +1775,11 @@ async function pollingAppointmentAlerts() {
   } catch (error) {
     console.error(
       'Erro geral no polling de alertas:',
+      error.response?.data || error.message
+    );
+    await notifyAttention(
+      'appointment_alerts_general_error',
+      'Erro geral no polling de alertas',
       error.response?.data || error.message
     );
   }
@@ -1679,6 +1857,11 @@ async function processDailySummary() {
       'Erro no resumo Mattermost:',
       error.response?.data || error.message
     );
+    await notifyAttention(
+      `daily_summary_mattermost_error:${targetDate}`,
+      'Erro no resumo diário do Mattermost',
+      { targetDate, error: error.response?.data || error.message }
+    );
   }
 }
 
@@ -1732,14 +1915,16 @@ async function processClientMorningSummary(options = {}) {
   if (Number.isNaN(tHour) || Number.isNaN(tMinute)) {
     result.reason = 'invalid_time';
     console.error(`[Resumo WhatsApp] CLIENT_SUMMARY_TIME inválido: ${CLIENT_SUMMARY_TIME}`);
+    await notifyAttention(
+      'client_summary_invalid_time',
+      'CLIENT_SUMMARY_TIME inválido',
+      { value: CLIENT_SUMMARY_TIME }
+    );
     return result;
   }
 
   if (!force && (now.hour() !== tHour || now.minute() !== tMinute)) {
     result.reason = 'outside_time';
-    logWhatsAppDebug(
-      `[Resumo WhatsApp] Fora do horário: agora ${result.now}, alvo ${targetTime}.`
-    );
     return result;
   }
 
@@ -1809,6 +1994,16 @@ async function processClientMorningSummary(options = {}) {
           result.skipped.push(item);
           result.counts.skipped += 1;
           console.log(`[Resumo WhatsApp] Tarefa #${issue.id} sem grupo WhatsApp.`, item);
+          await notifyAttention(
+            `client_summary_missing_whatsapp_group:${issue.id}`,
+            'Tarefa sem grupo WhatsApp para resumo',
+            {
+              issueId: issue.id,
+              targetDate,
+              project: issue.project?.name || null,
+              fieldName: WHATSAPP_GROUP_FIELD_NAME
+            }
+          );
           continue;
         }
 
@@ -1849,6 +2044,11 @@ async function processClientMorningSummary(options = {}) {
           `Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`,
           describeError(err)
         );
+        await notifyAttention(
+          `client_summary_issue_error:${issueSummary.id}`,
+          'Erro no resumo WhatsApp de uma tarefa',
+          { issueId: issueSummary.id, error: describeError(err) }
+        );
 
         result.failed.push({
           id: issueSummary.id,
@@ -1888,6 +2088,11 @@ async function processClientMorningSummary(options = {}) {
       'Erro geral no resumo WhatsApp:',
       result.error
     );
+    await notifyAttention(
+      `client_summary_general_error:${targetDate || 'unknown'}`,
+      'Erro geral no resumo WhatsApp',
+      { targetDate, error: result.error }
+    );
 
     return result;
   }
@@ -1911,7 +2116,10 @@ app.get('/health', (req, res) => {
     meetStatusName: MEET_STATUS_NAME,
     clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
     clientSummaryTime: CLIENT_SUMMARY_TIME,
-    whatsappDebugLogs: WHATSAPP_DEBUG_LOGS
+    whatsappDebugLogs: WHATSAPP_DEBUG_LOGS,
+    errorNotificationEnabled: ERROR_NOTIFICATION_ENABLED,
+    errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
+    errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
   });
 });
 
@@ -2012,7 +2220,10 @@ app.listen(PORT, () => {
     clientSummaryTime: CLIENT_SUMMARY_TIME,
     whatsappGroupFieldName: WHATSAPP_GROUP_FIELD_NAME,
     whatsappDebugLogs: WHATSAPP_DEBUG_LOGS,
-    whatsappAuthDir: WA_AUTH_DIR
+    whatsappAuthDir: WA_AUTH_DIR,
+    errorNotificationEnabled: ERROR_NOTIFICATION_ENABLED,
+    errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
+    errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
   });
 
   pollingRedmineIssues();
