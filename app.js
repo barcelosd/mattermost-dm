@@ -660,7 +660,14 @@ async function checkAppointmentAlert(issue) {
   if (!isStrictMeetStatus(issue)) return;
 
   const appointment = parseAppointmentDateTime(issue);
+ 
+  if (diffSegundos < -600) {
+   return;
+}
 
+if (diffSegundos < -600) {
+   return;
+}
   if (!appointment) {
     console.log(`Tarefa #${issue.id} sem data/horário válido.`);
     return;
@@ -722,7 +729,34 @@ async function checkAppointmentAlert(issue) {
         )
       );
 
-      await markAppointmentAlertSent(alertKey);
+      memory.alerts.add(alertKey);
+
+      async function wasAppointmentAlertSent(key) {
+   return memory.alerts.has(key);
+}
+
+const issueCache = new Map();
+
+async function fetchIssueCached(id) {
+
+   const cached = issueCache.get(id);
+
+   if (
+      cached &&
+      Date.now() - cached.timestamp < 30000
+   ) {
+      return cached.issue;
+   }
+
+   const issue = await fetchIssueDetails(id);
+
+   issueCache.set(id,{
+      issue,
+      timestamp: Date.now()
+   });
+
+   return issue;
+}
 
       console.log(
         `Mattermost enviado (${minutes} min) para tarefa #${issue.id}`
