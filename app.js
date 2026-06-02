@@ -191,15 +191,33 @@ async function wasAppointmentAlertSent(key) {
 }
 
 async function markAppointmentAlertSent(key) {
-  const ttl = 36 * 60 * 60;
+  const ttl = 48 * 60 * 60;
 
   if (redis) {
     await redis.set(key, '1', 'EX', ttl);
   } else {
     memory.alerts.add(key);
-    setTimeout(() => memory.alerts.delete(key), ttl * 1000);
+    setTimeout(
+      () => memory.alerts.delete(key),
+      ttl * 1000
+    );
   }
 }
+
+async function markAppointmentAlertSent(key) {
+  const ttl = 48 * 60 * 60;
+
+  if (redis) {
+    await redis.set(key, '1', 'EX', ttl);
+  } else {
+    memory.alerts.add(key);
+    setTimeout(
+      () => memory.alerts.delete(key),
+      ttl * 1000
+    );
+  }
+}
+
 
 // ---------------------------------------------------------
 // UTILITÁRIOS
@@ -608,84 +626,138 @@ async function checkAppointmentAlert(issue) {
   const appointment = parseAppointmentDateTime(issue);
 
   if (!appointment) {
-    console.log(`Tarefa #${issue.id} sem data/horário válido para alerta.`);
+    console.log(`Tarefa #${issue.id} sem data/horário válido.`);
     return;
   }
 
-  const agora = dayjs().tz('America/Sao_Paulo');
-  const dataAgendamento = dayjs(appointment.dateTime).tz('America/Sao_Paulo');
+  const agora = dayjs().tz("America/Sao_Paulo");
+  const dataAgendamento = dayjs(appointment.dateTime).tz("America/Sao_Paulo");
 
-  const diffSegundos = dataAgendamento.diff(agora, 'second');
+  const diffSegundos = dataAgendamento.diff(agora, "second");
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
 
   const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);
   const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);
   const waMin = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5);
 
+  const appointmentKey =
+    dayjs(appointment.dateTime)
+      .tz("America/Sao_Paulo")
+      .format("YYYYMMDDHHmm");
+
   console.log(
-    `Alerta tarefa #${issue.id}: faltam ${diffSegundos}s para ${appointment.timeLabel}`
+    `Verificando tarefa #${issue.id} | Horário ${appointment.timeLabel} | Faltam ${diffSegundos}s`
   );
 
-  async function sendMattermostAlert(minutes, keyLabel) {
+  // --------------------------------------------------
+  // MATTERMOST
+  // --------------------------------------------------
+
+  async function sendMattermostAlert(minutes) {
     const targetSec = minutes * 60;
 
-    if (diffSegundos <= targetSec && diffSegundos >= targetSec - windowSeconds) {
-      const alertKey = `redmine:alert:${keyLabel}:${issue.id}`;
+    if (
+      diffSegundos <= targetSec &&
+      diffSegundos >= targetSec - windowSeconds
+    ) {
 
-      if (await wasAppointmentAlertSent(alertKey)) return;
+      const alertKey =
+        `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
+
+      if (await wasAppointmentAlertSent(alertKey)) {
+        return;
+      }
 
       const targets = await getResponsibleTargets(issue);
 
       if (!targets.length) {
-        console.log(`Tarefa #${issue.id} sem responsável ativo para alerta Mattermost.`);
+        console.log(
+          `Tarefa #${issue.id} sem responsáveis ativos.`
+        );
         return;
       }
 
       await notifyTargets(
         targets,
-        buildAppointmentMessage(issue, minutes, appointment.timeLabel)
+        buildAppointmentMessage(
+          issue,
+          minutes,
+          appointment.timeLabel
+        )
       );
 
       await markAppointmentAlertSent(alertKey);
 
-      console.log(`Alerta Mattermost ${minutes}min enviado para tarefa #${issue.id}`);
+      console.log(
+        `Mattermost enviado (${minutes} min) para tarefa #${issue.id}`
+      );
     }
   }
 
-  async function sendWhatsAppAlert(minutes, keyLabel) {
+  // --------------------------------------------------
+  // WHATSAPP
+  // --------------------------------------------------
+
+  async function sendWhatsAppAlert(minutes) {
     const targetSec = minutes * 60;
 
-    if (diffSegundos <= targetSec && diffSegundos >= targetSec - windowSeconds) {
-      const alertKey = `redmine:alert:${keyLabel}:${issue.id}`;
+    if (
+      diffSegundos <= targetSec &&
+      diffSegundos >= targetSec - windowSeconds
+    ) {
 
-      if (await wasAppointmentAlertSent(alertKey)) return;
+      const alertKey =
+        `redmine:wa:${issue.id}:${appointmentKey}:${minutes}`;
 
-      const waGroupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+      if (await wasAppointmentAlertSent(alertKey)) {
+        return;
+      }
 
-      if (!waGroupId || !waSocket) {
-        console.log(`Tarefa #${issue.id} sem grupo WhatsApp ou socket desconectado.`);
+      const waGroupId =
+        getCustomFieldValue(
+          issue,
+          WHATSAPP_GROUP_FIELD_NAME
+        );
+
+      if (!waGroupId) {
+        console.log(
+          `Tarefa #${issue.id} sem grupo WhatsApp.`
+        );
+        return;
+      }
+
+      if (!waSocket) {
+        console.log(
+          `WhatsApp desconectado.`
+        );
         return;
       }
 
       let groupJid = String(waGroupId).trim();
 
-      if (!groupJid.includes('@')) {
+      if (!groupJid.includes("@")) {
         groupJid = `${groupJid}@g.us`;
       }
 
       await waSocket.sendMessage(groupJid, {
-        text: buildWhatsAppMessage(issue, minutes, appointment.timeLabel)
+        text: buildWhatsAppMessage(
+          issue,
+          minutes,
+          appointment.timeLabel
+        )
       });
 
       await markAppointmentAlertSent(alertKey);
 
-      console.log(`Alerta WhatsApp ${minutes}min enviado para tarefa #${issue.id}`);
+      console.log(
+        `WhatsApp enviado (${minutes} min) para tarefa #${issue.id}`
+      );
     }
   }
 
-  await sendMattermostAlert(mmMin1, `mm${mmMin1}min`);
-  await sendWhatsAppAlert(waMin, `wa${waMin}min`);
-  await sendMattermostAlert(mmMin2, `mm${mmMin2}min`);
+  await sendMattermostAlert(mmMin1);
+  await sendWhatsAppAlert(waMin);
+  await sendMattermostAlert(mmMin2);
 }
 
 // ---------------------------------------------------------
