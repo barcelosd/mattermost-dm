@@ -1497,6 +1497,17 @@ async function processClientMorningSummary() {
         });
 
         console.log(`Resumo WhatsApp enviado para tarefa #${issue.id}`);
+
+console.log(
+  `Resumo WhatsApp: verificando chave ${summaryKey}`
+);
+
+if (await wasAlreadyNotified(summaryKey)) {
+  console.log(
+    `Resumo WhatsApp ignorado pois já existe ${summaryKey}`
+  );
+  return;
+}
       } catch (err) {
         console.error(
           `Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`,
