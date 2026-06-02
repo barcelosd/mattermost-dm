@@ -291,20 +291,52 @@ async function redisSetRemove(key, value) {
 }
 
 async function wasAlreadyNotified(key) {
-  if (redis) return (await redis.get(key)) === '1';
+  if (redis) return (await redis.get(key)) !== null;
   return memory.notified.has(key);
 }
 
-async function markAsNotified(key) {
+async function getNotificationMarker(key) {
+  const value = redis
+    ? await redis.get(key)
+    : memory.values.get(key) || (memory.notified.has(key) ? '1' : null);
+
+  if (!value) return null;
+
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return { value };
+  }
+}
+
+async function clearNotificationMarker(key) {
+  if (redis) {
+    await redis.del(key);
+    return;
+  }
+
+  memory.values.delete(key);
+  memory.notified.delete(key);
+}
+
+async function markAsNotified(key, metadata = null) {
   const ttl = Number(REDIS_TTL_DAYS) * 86400;
+  const value = metadata
+    ? JSON.stringify({
+        ...metadata,
+        markedAt: dayjs().tz(TZ).format('YYYY-MM-DD HH:mm:ss')
+      })
+    : '1';
 
   if (redis) {
-    await redis.set(key, '1', 'EX', ttl);
+    await redis.set(key, value, 'EX', ttl);
     return;
   }
 
   memory.notified.add(key);
+  memory.values.set(key, value);
   setTimeout(() => memory.notified.delete(key), ttl * 1000);
+  setTimeout(() => memory.values.delete(key), ttl * 1000);
 }
 
 // Alertas usam memória local para reduzir consumo de Redis.
@@ -1622,6 +1654,7 @@ async function processDailySummary() {
 async function processClientMorningSummary(options = {}) {
   const force = options.force === true;
   const dryRun = options.dryRun === true;
+  const resetNotified = options.resetNotified === true;
   const source = options.source || 'scheduler';
   const now = dayjs().tz(TZ);
   const [tHour, tMinute] = String(CLIENT_SUMMARY_TIME || '08:30')
@@ -1632,13 +1665,16 @@ async function processClientMorningSummary(options = {}) {
     source,
     force,
     dryRun,
+    resetNotified,
     enabled: CLIENT_SUMMARY_ENABLED === 'true',
     now: now.format('YYYY-MM-DD HH:mm:ss'),
     targetTime,
     targetDate: null,
     summaryKey: null,
     alreadyNotified: false,
+    notifiedMarker: null,
     markedNotified: false,
+    clearedNotified: false,
     reason: null,
     counts: {
       found: 0,
@@ -1679,11 +1715,18 @@ async function processClientMorningSummary(options = {}) {
   result.targetDate = targetDate;
   result.summaryKey = summaryKey;
 
+  if (resetNotified) {
+    await clearNotificationMarker(summaryKey);
+    result.clearedNotified = true;
+    console.log(`[Resumo WhatsApp] Chave removida para reprocessamento: ${summaryKey}`);
+  }
+
   result.alreadyNotified = await wasAlreadyNotified(summaryKey);
+  result.notifiedMarker = await getNotificationMarker(summaryKey);
 
   if (result.alreadyNotified && !force) {
     result.reason = 'already_notified';
-    console.log(`[Resumo WhatsApp] Ignorado: chave já notificada (${summaryKey}).`);
+    console.log(`[Resumo WhatsApp] Ignorado: chave já notificada (${summaryKey}).`, result.notifiedMarker);
     return result;
   }
 
@@ -1791,7 +1834,15 @@ async function processClientMorningSummary(options = {}) {
     const blockingSkips = result.skipped.filter(item => item.reason === 'missing_group');
 
     if (!dryRun && result.counts.sent > 0 && result.counts.failed === 0 && blockingSkips.length === 0) {
-      await markAsNotified(summaryKey);
+      await markAsNotified(summaryKey, {
+        type: 'client_summary_whatsapp',
+        source,
+        targetDate,
+        sent: result.counts.sent,
+        eligible: result.counts.eligible,
+        found: result.counts.found
+      });
+      result.notifiedMarker = await getNotificationMarker(summaryKey);
       result.markedNotified = true;
       console.log(`[Resumo WhatsApp] Concluído e marcado como notificado: ${summaryKey}`);
     } else if (!dryRun) {
@@ -1845,10 +1896,12 @@ app.get('/debug-whatsapp', (req, res) => {
 app.get('/debug-whatsapp-summary', async (req, res) => {
   const send = req.query.send === 'true';
   const force = send || req.query.force !== 'false';
+  const resetNotified = req.query.reset === 'true';
 
   const result = await processClientMorningSummary({
     force,
     dryRun: !send,
+    resetNotified,
     source: 'debug-endpoint'
   });
 
