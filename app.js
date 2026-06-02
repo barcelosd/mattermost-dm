@@ -1,4 +1,5 @@
 require('dotenv').config();
+
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
@@ -8,19 +9,29 @@ const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 const qrcode = require('qrcode-terminal');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
 
+// ---------------------------------------------------------
+// CONFIGURAÇÕES
+// ---------------------------------------------------------
 const {
   PORT = 3000,
+
   REDMINE_URL,
   REDMINE_API_KEY,
+
   MATTERMOST_URL,
   MATTERMOST_TOKEN,
+
   REDIS_URL,
   REDIS_TTL_DAYS = 90,
 
@@ -49,12 +60,15 @@ const {
   GOOGLE_CLIENT_SECRET,
   GOOGLE_REFRESH_TOKEN,
   GOOGLE_CALENDAR_ID,
+
   GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
   GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
 
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp'
 } = process.env;
+
+const TZ = 'America/Sao_Paulo';
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -90,8 +104,12 @@ async function initWhatsApp() {
     }
 
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) initWhatsApp();
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+      if (shouldReconnect) {
+        initWhatsApp();
+      }
     }
 
     if (connection === 'open') {
@@ -107,60 +125,39 @@ async function initWhatsApp() {
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      '';
+
     const from = msg.key.remoteJid;
 
     if (text.trim().toLowerCase() === '!id') {
-      await waSocket.sendMessage(from, {
-        text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
-      }, { quoted: msg });
+      try {
+        await waSocket.sendMessage(
+          from,
+          {
+            text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
+          },
+          { quoted: msg }
+        );
+      } catch (err) {
+        console.error('Erro ao responder !id:', err.message);
+      }
     }
   });
-}
-async function getWhatsAppGroupId(issue) {
-  // Primeiro tenta na tarefa
-  let groupId = getCustomFieldValue(
-    issue,
-    WHATSAPP_GROUP_FIELD_NAME
-  );
-
-  if (groupId) {
-    return String(groupId).trim();
-  }
-
-  // Se não existir, busca no projeto
-  if (issue.project?.id) {
-    try {
-      const project = await getRedmineProject(
-        issue.project.id
-      );
-
-      groupId = getCustomFieldValue(
-        project,
-        WHATSAPP_GROUP_FIELD_NAME
-      );
-
-      if (groupId) {
-        return String(groupId).trim();
-      }
-    } catch (err) {
-      console.error(
-        `Erro ao buscar grupo WhatsApp do projeto ${issue.project.id}`,
-        err.message
-      );
-    }
-  }
-
-  return null;
 }
 
 initWhatsApp();
 
 // ---------------------------------------------------------
-// REDIS / MEMÓRIA
+// REDIS / CACHE LOCAL
 // ---------------------------------------------------------
 const redis = REDIS_URL
-  ? new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableReadyCheck: false })
+  ? new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 1,
+      enableReadyCheck: false
+    })
   : null;
 
 const memory = {
@@ -183,7 +180,8 @@ async function redisSet(key, value, customTtl) {
 }
 
 async function redisGet(key) {
-  return redis ? redis.get(key) : memory.values.get(key) || null;
+  if (redis) return redis.get(key);
+  return memory.values.get(key) || null;
 }
 
 async function redisDel(key) {
@@ -201,13 +199,9 @@ async function redisSetRemove(key, value) {
   else memory.meetIssues.delete(value);
 }
 
-async function redisSetMembers(key) {
-  return redis ? redis.smembers(key) : Array.from(memory.meetIssues);
-}
-
-// Notificação comum: Novo/Reaberta
 async function wasAlreadyNotified(key) {
-  return redis ? (await redis.get(key)) === '1' : memory.notified.has(key);
+  if (redis) return (await redis.get(key)) === '1';
+  return memory.notified.has(key);
 }
 
 async function markAsNotified(key) {
@@ -215,45 +209,25 @@ async function markAsNotified(key) {
 
   if (redis) {
     await redis.set(key, '1', 'EX', ttl);
-  } else {
-    memory.notified.add(key);
-    setTimeout(() => memory.notified.delete(key), ttl * 1000);
+    return;
   }
+
+  memory.notified.add(key);
+  setTimeout(() => memory.notified.delete(key), ttl * 1000);
 }
 
-// Alertas de reunião: Aguardando Data
+// Alertas usam memória local para reduzir consumo de Redis.
+// A chave inclui tarefa + data + horário + tipo de alerta.
 async function wasAppointmentAlertSent(key) {
-  return redis ? (await redis.get(key)) === '1' : memory.alerts.has(key);
+  return memory.alerts.has(key);
 }
 
 async function markAppointmentAlertSent(key) {
   const ttl = 48 * 60 * 60;
 
-  if (redis) {
-    await redis.set(key, '1', 'EX', ttl);
-  } else {
-    memory.alerts.add(key);
-    setTimeout(
-      () => memory.alerts.delete(key),
-      ttl * 1000
-    );
-  }
+  memory.alerts.add(key);
+  setTimeout(() => memory.alerts.delete(key), ttl * 1000);
 }
-
-async function markAppointmentAlertSent(key) {
-  const ttl = 48 * 60 * 60;
-
-  if (redis) {
-    await redis.set(key, '1', 'EX', ttl);
-  } else {
-    memory.alerts.add(key);
-    setTimeout(
-      () => memory.alerts.delete(key),
-      ttl * 1000
-    );
-  }
-}
-
 
 // ---------------------------------------------------------
 // UTILITÁRIOS
@@ -268,6 +242,7 @@ function normalizeText(value) {
 
 function shouldNotifyStandardStatus(issue) {
   const status = normalizeText(issue?.status?.name || issue?.status || '');
+
   const allowedStatuses = String(NOTIFY_STATUSES)
     .split(',')
     .map(normalizeText)
@@ -282,7 +257,9 @@ function isStrictMeetStatus(issue) {
 }
 
 function getLastJournal(issue) {
-  return issue?.journals?.length ? issue.journals[issue.journals.length - 1] : null;
+  return issue?.journals?.length
+    ? issue.journals[issue.journals.length - 1]
+    : null;
 }
 
 function getEventKey(issue, source, journal) {
@@ -292,18 +269,33 @@ function getEventKey(issue, source, journal) {
 
 function getCustomFieldValue(entity, fieldName) {
   const fields = entity?.custom_fields || entity?.custom_field_values || [];
-  return fields.find(f => f.name === fieldName || f.custom_field_name === fieldName)?.value || null;
+
+  const field = fields.find(
+    f => f.name === fieldName || f.custom_field_name === fieldName
+  );
+
+  return field?.value || null;
 }
 
 function setCustomFieldValue(issue, fieldName, value) {
   const fields = issue?.custom_fields || issue?.custom_field_values || [];
-  const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
-  if (field) field.value = value;
+
+  const field = fields.find(
+    f => f.name === fieldName || f.custom_field_name === fieldName
+  );
+
+  if (field) {
+    field.value = value;
+  }
 }
 
 function getCustomFieldId(issue, fieldName) {
   const fields = issue?.custom_fields || issue?.custom_field_values || [];
-  const field = fields.find(f => f.name === fieldName || f.custom_field_name === fieldName);
+
+  const field = fields.find(
+    f => f.name === fieldName || f.custom_field_name === fieldName
+  );
+
   return field?.id || field?.custom_field_id || null;
 }
 
@@ -325,7 +317,7 @@ function parseAppointmentDateTime(issue) {
   const dateTime = dayjs.tz(
     `${date} ${parsedTime.format('HH:mm')}`,
     'YYYY-MM-DD HH:mm',
-    'America/Sao_Paulo'
+    TZ
   ).toDate();
 
   return {
@@ -336,22 +328,27 @@ function parseAppointmentDateTime(issue) {
 
 function getEstimatedMinutes(issue) {
   const hours = Number(String(issue.estimated_hours || 0).replace(',', '.'));
-  return !hours || Number.isNaN(hours) ? null : Math.round(hours * 60);
+
+  if (!hours || Number.isNaN(hours)) return null;
+
+  return Math.round(hours * 60);
 }
 
 function isDailySummaryTime() {
   if (DAILY_SUMMARY_ENABLED !== 'true') return false;
 
-  const now = dayjs().tz('America/Sao_Paulo');
+  const now = dayjs().tz(TZ);
 
   if (now.day() === 0 || now.day() === 6) return false;
 
-  return now.hour() === Number(DAILY_SUMMARY_HOUR)
-    && now.minute() === Number(DAILY_SUMMARY_MINUTE);
+  return (
+    now.hour() === Number(DAILY_SUMMARY_HOUR) &&
+    now.minute() === Number(DAILY_SUMMARY_MINUTE)
+  );
 }
 
 function getNextBusinessSummaryDateString() {
-  let target = dayjs().tz('America/Sao_Paulo');
+  let target = dayjs().tz(TZ);
 
   if (target.day() === 5) target = target.add(3, 'day');
   else if (target.day() === 6) target = target.add(2, 'day');
@@ -361,7 +358,7 @@ function getNextBusinessSummaryDateString() {
 }
 
 // ---------------------------------------------------------
-// REDMINE / MATTERMOST
+// REDMINE
 // ---------------------------------------------------------
 async function fetchIssueDetails(issueId) {
   const response = await axios.get(
@@ -374,6 +371,7 @@ async function fetchIssueDetails(issueId) {
 
 async function updateRedmineCustomField(issue, fieldName, value) {
   const fieldId = getCustomFieldId(issue, fieldName);
+
   if (!fieldId) return;
 
   await axios.put(
@@ -399,7 +397,8 @@ async function getRedmineProject(projectId) {
     );
 
     return response.data.project;
-  } catch {
+  } catch (err) {
+    console.error(`Erro ao buscar projeto ${projectId}:`, err.response?.data || err.message);
     return null;
   }
 }
@@ -432,47 +431,80 @@ function isRedmineUserActive(user) {
 
 async function getResponsibleTargets(issue) {
   const assignee = issue.assignee || issue.assigned_to;
+
   if (!assignee) return [];
 
   if (typeof assignee.id === 'string' && assignee.id.includes('@')) {
-    return [{
-      email: assignee.id.trim().toLowerCase(),
-      name: assignee.name || assignee.id
-    }];
+    return [
+      {
+        email: assignee.id.trim().toLowerCase(),
+        name: assignee.name || assignee.id
+      }
+    ];
   }
 
   try {
     const user = await getRedmineUser(assignee.id);
 
     if (isRedmineUserActive(user)) {
-      return [{
-        email: user.mail.toLowerCase(),
-        name: `${user.firstname} ${user.lastname}`.trim()
-      }];
+      return [
+        {
+          email: user.mail.toLowerCase(),
+          name: `${user.firstname} ${user.lastname}`.trim()
+        }
+      ];
     }
   } catch {}
 
   const group = await getRedmineGroup(assignee.id);
+
   if (!group?.users?.length) return [];
 
-  const usersPromises = group.users.map(async (gUser) => {
-    try {
-      const fu = await getRedmineUser(gUser.id);
+  const users = await Promise.all(
+    group.users.map(async gUser => {
+      try {
+        const fullUser = await getRedmineUser(gUser.id);
 
-      if (isRedmineUserActive(fu)) {
-        return {
-          email: fu.mail.toLowerCase(),
-          name: `${fu.firstname} ${fu.lastname}`.trim()
-        };
-      }
-    } catch {}
+        if (isRedmineUserActive(fullUser)) {
+          return {
+            email: fullUser.mail.toLowerCase(),
+            name: `${fullUser.firstname} ${fullUser.lastname}`.trim()
+          };
+        }
+      } catch {}
 
-    return null;
-  });
+      return null;
+    })
+  );
 
-  return (await Promise.all(usersPromises)).filter(Boolean);
+  return users.filter(Boolean);
 }
 
+async function getWhatsAppGroupId(issue) {
+  let groupId = getCustomFieldValue(issue, WHATSAPP_GROUP_FIELD_NAME);
+
+  if (groupId) {
+    return String(groupId).trim();
+  }
+
+  if (!issue.project?.id) return null;
+
+  const project = await getRedmineProject(issue.project.id);
+
+  if (!project) return null;
+
+  groupId = getCustomFieldValue(project, WHATSAPP_GROUP_FIELD_NAME);
+
+  if (groupId) {
+    return String(groupId).trim();
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------
+// MATTERMOST
+// ---------------------------------------------------------
 async function getMattermostBotUser() {
   const response = await axios.get(
     `${MATTERMOST_URL}/api/v4/users/me`,
@@ -504,7 +536,10 @@ async function createDirectChannel(botUserId, targetUserId) {
 async function sendMattermostMessage(channelId, message) {
   await axios.post(
     `${MATTERMOST_URL}/api/v4/posts`,
-    { channel_id: channelId, message },
+    {
+      channel_id: channelId,
+      message
+    },
     { headers: mattermostHeaders }
   );
 }
@@ -523,11 +558,15 @@ async function notifyTargets(targets, message) {
         }
 
         const channel = await createDirectChannel(botUser.id, mmUser.id);
+
         await sendMattermostMessage(channel.id, message);
 
         console.log(`Mattermost enviado para ${target.email}`);
       } catch (error) {
-        console.error(`Erro ao enviar Mattermost para ${target.email}:`, error.response?.data || error.message);
+        console.error(
+          `Erro ao enviar Mattermost para ${target.email}:`,
+          error.response?.data || error.message
+        );
       }
     }
   } catch (err) {
@@ -548,7 +587,9 @@ function buildNotificationMessage(issue, action, source) {
     `Projeto: ${issue.project?.name || ''} | Assunto: ${issue.subject}`,
     meetLink ? `Google Meet: ${meetLink}` : null,
     `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
-  ].filter(Boolean).join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
@@ -560,7 +601,9 @@ function buildAppointmentMessage(issue, alertMinutes, timeLabel) {
     `Projeto: ${issue.project?.name || ''} | Assunto: ${issue.subject} | Horário: ${timeLabel}`,
     meetLink ? `Link do Google Meet: ${meetLink}` : null,
     `[Abrir tarefa no Redmine](${REDMINE_URL}/issues/${issue.id})`
-  ].filter(Boolean).join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
@@ -568,9 +611,12 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
 
   let publicoAlvo = '';
+
   if (publicoAlvoRaw) {
     publicoAlvo = Array.isArray(publicoAlvoRaw)
-      ? publicoAlvoRaw.map(v => typeof v === 'object' ? v.value || v.name : v).join(' / ')
+      ? publicoAlvoRaw
+          .map(v => (typeof v === 'object' ? v.value || v.name : v))
+          .join(' / ')
       : String(publicoAlvoRaw).trim();
   }
 
@@ -579,7 +625,9 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
   msg += `*Projeto:* ${issue.project?.name || ''}\n`;
   msg += `*Assunto:* ${issue.subject}\n`;
 
-  if (publicoAlvo) msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  if (publicoAlvo) {
+    msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  }
 
   msg += `*Horário:* ${timeLabel}\n`;
 
@@ -598,9 +646,12 @@ function buildClientSummaryMessage(issue, timeLabel) {
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
 
   let publicoAlvo = '';
+
   if (publicoAlvoRaw) {
     publicoAlvo = Array.isArray(publicoAlvoRaw)
-      ? publicoAlvoRaw.map(v => typeof v === 'object' ? v.value || v.name : v).join(' / ')
+      ? publicoAlvoRaw
+          .map(v => (typeof v === 'object' ? v.value || v.name : v))
+          .join(' / ')
       : String(publicoAlvoRaw).trim();
   }
 
@@ -609,7 +660,9 @@ function buildClientSummaryMessage(issue, timeLabel) {
   msg += `*Projeto:* ${issue.project?.name || ''}\n`;
   msg += `*Assunto:* ${issue.subject}\n`;
 
-  if (publicoAlvo) msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  if (publicoAlvo) {
+    msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  }
 
   msg += `*Horário:* ${timeLabel}\n`;
 
@@ -623,78 +676,72 @@ function buildClientSummaryMessage(issue, timeLabel) {
 }
 
 // ---------------------------------------------------------
-// NOTIFICAÇÃO COMUM — SOMENTE NOVO / REABERTA
+// NOTIFICAÇÃO COMUM — NOVO / REABERTA
 // ---------------------------------------------------------
 async function processIssueNotification(issue, action, source, journal = null) {
-  if (isStrictMeetStatus(issue)) {
-    return;
-  }
+  if (isStrictMeetStatus(issue)) return;
 
-  if (!shouldNotifyStandardStatus(issue)) {
-    return;
-  }
+  if (!shouldNotifyStandardStatus(issue)) return;
 
   const eventKey = getEventKey(issue, source, journal);
 
-  if (await wasAlreadyNotified(eventKey)) {
-    return;
-  }
+  if (await wasAlreadyNotified(eventKey)) return;
 
   const targets = await getResponsibleTargets(issue);
 
   if (!targets.length) {
-    console.log(`Tarefa #${issue.id} sem responsáveis ativos para notificação comum.`);
+    console.log(`Tarefa #${issue.id} sem responsável ativo para notificação comum.`);
     return;
   }
 
-  await notifyTargets(targets, buildNotificationMessage(issue, action, source));
+  await notifyTargets(
+    targets,
+    buildNotificationMessage(issue, action, source)
+  );
+
   await markAsNotified(eventKey);
 
   console.log(`Notificação comum enviada para tarefa #${issue.id}`);
 }
 
 // ---------------------------------------------------------
-// ALERTAS — SOMENTE AGUARDANDO DATA
+// ALERTAS — AGUARDANDO DATA
 // ---------------------------------------------------------
 async function checkAppointmentAlert(issue) {
   if (!isStrictMeetStatus(issue)) return;
 
   const appointment = parseAppointmentDateTime(issue);
- 
-  if (diffSegundos < -600) {
-   return;
-}
 
-if (diffSegundos < -600) {
-   return;
-}
   if (!appointment) {
-    console.log(`Tarefa #${issue.id} sem data/horário válido.`);
     return;
   }
 
-  const agora = dayjs().tz("America/Sao_Paulo");
-  const dataAgendamento = dayjs(appointment.dateTime).tz("America/Sao_Paulo");
+  const agora = dayjs().tz(TZ);
+  const dataAgendamento = dayjs(appointment.dateTime).tz(TZ);
 
-  const diffSegundos = dataAgendamento.diff(agora, "second");
+  const diffSegundos = dataAgendamento.diff(agora, 'second');
+
+  // Ignora tarefa que já passou há mais de 10 minutos.
+  if (diffSegundos < -600) {
+    return;
+  }
+
+  // Ignora tarefa com mais de 1 hora de antecedência.
+  if (diffSegundos > 3600) {
+    return;
+  }
+
   const windowSeconds = Number(ALERT_WINDOW_SECONDS || 180);
 
   const mmMin1 = Number(ALERT_MINUTES_BEFORE || 10);
   const mmMin2 = Number(ALERT_EXTRA_MINUTES_BEFORE || 2);
   const waMin = Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5);
 
-  const appointmentKey =
-    dayjs(appointment.dateTime)
-      .tz("America/Sao_Paulo")
-      .format("YYYYMMDDHHmm");
+  const appointmentKey = dataAgendamento.format('YYYYMMDDHHmm');
 
   console.log(
     `Verificando tarefa #${issue.id} | Horário ${appointment.timeLabel} | Faltam ${diffSegundos}s`
   );
-
-  // --------------------------------------------------
-  // MATTERMOST
-  // --------------------------------------------------
 
   async function sendMattermostAlert(minutes) {
     const targetSec = minutes * 60;
@@ -703,9 +750,7 @@ if (diffSegundos < -600) {
       diffSegundos <= targetSec &&
       diffSegundos >= targetSec - windowSeconds
     ) {
-
-      const alertKey =
-        `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
+      const alertKey = `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
         return;
@@ -714,59 +759,20 @@ if (diffSegundos < -600) {
       const targets = await getResponsibleTargets(issue);
 
       if (!targets.length) {
-        console.log(
-          `Tarefa #${issue.id} sem responsáveis ativos.`
-        );
+        console.log(`Tarefa #${issue.id} sem responsável ativo para Mattermost.`);
         return;
       }
 
       await notifyTargets(
         targets,
-        buildAppointmentMessage(
-          issue,
-          minutes,
-          appointment.timeLabel
-        )
+        buildAppointmentMessage(issue, minutes, appointment.timeLabel)
       );
 
-      memory.alerts.add(alertKey);
+      await markAppointmentAlertSent(alertKey);
 
-      async function wasAppointmentAlertSent(key) {
-   return memory.alerts.has(key);
-}
-
-const issueCache = new Map();
-
-async function fetchIssueCached(id) {
-
-   const cached = issueCache.get(id);
-
-   if (
-      cached &&
-      Date.now() - cached.timestamp < 30000
-   ) {
-      return cached.issue;
-   }
-
-   const issue = await fetchIssueDetails(id);
-
-   issueCache.set(id,{
-      issue,
-      timestamp: Date.now()
-   });
-
-   return issue;
-}
-
-      console.log(
-        `Mattermost enviado (${minutes} min) para tarefa #${issue.id}`
-      );
+      console.log(`Mattermost enviado (${minutes} min) para tarefa #${issue.id}`);
     }
   }
-
-  // --------------------------------------------------
-  // WHATSAPP
-  // --------------------------------------------------
 
   async function sendWhatsAppAlert(minutes) {
     const targetSec = minutes * 60;
@@ -775,50 +781,39 @@ async function fetchIssueCached(id) {
       diffSegundos <= targetSec &&
       diffSegundos >= targetSec - windowSeconds
     ) {
-
-      const alertKey =
-        `redmine:wa:${issue.id}:${appointmentKey}:${minutes}`;
+      const alertKey = `redmine:wa:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
         return;
       }
 
-      const waGroupId =
-  await getWhatsAppGroupId(issue);
+      const waGroupId = await getWhatsAppGroupId(issue);
 
       if (!waGroupId) {
-        console.log(
-          `Tarefa #${issue.id} sem grupo WhatsApp.`
-        );
+        console.log(`Tarefa #${issue.id} sem grupo WhatsApp.`);
         return;
       }
 
       if (!waSocket) {
-        console.log(
-          `WhatsApp desconectado.`
-        );
+        console.log('WhatsApp desconectado.');
         return;
       }
 
       let groupJid = String(waGroupId).trim();
 
-      if (!groupJid.includes("@")) {
+      if (!groupJid.includes('@')) {
         groupJid = `${groupJid}@g.us`;
       }
 
+      console.log(`Tarefa #${issue.id} usando grupo WhatsApp: ${groupJid}`);
+
       await waSocket.sendMessage(groupJid, {
-        text: buildWhatsAppMessage(
-          issue,
-          minutes,
-          appointment.timeLabel
-        )
+        text: buildWhatsAppMessage(issue, minutes, appointment.timeLabel)
       });
 
       await markAppointmentAlertSent(alertKey);
 
-      console.log(
-        `WhatsApp enviado (${minutes} min) para tarefa #${issue.id}`
-      );
+      console.log(`WhatsApp enviado (${minutes} min) para tarefa #${issue.id}`);
     }
   }
 
@@ -840,15 +835,35 @@ function googleCalendarIsConfigured() {
 }
 
 function getGoogleCalendarClient() {
-  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return google.calendar({ version: 'v3', auth });
+  const auth = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET
+  );
+
+  auth.setCredentials({
+    refresh_token: GOOGLE_REFRESH_TOKEN
+  });
+
+  return google.calendar({
+    version: 'v3',
+    auth
+  });
 }
 
 function getGoogleDriveClient() {
-  const auth = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  auth.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return google.drive({ version: 'v3', auth });
+  const auth = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET
+  );
+
+  auth.setCredentials({
+    refresh_token: GOOGLE_REFRESH_TOKEN
+  });
+
+  return google.drive({
+    version: 'v3',
+    auth
+  });
 }
 
 async function getMeetProjectName(issue) {
@@ -856,11 +871,13 @@ async function getMeetProjectName(issue) {
 
   const project = await getRedmineProject(issue.project.id);
 
-  return getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME)
-    || project?.parent?.name
-    || project?.name
-    || issue.project?.name
-    || '';
+  return (
+    getCustomFieldValue(project, GOOGLE_MEET_PROJECT_FIELD_NAME) ||
+    project?.parent?.name ||
+    project?.name ||
+    issue.project?.name ||
+    ''
+  );
 }
 
 async function findGoogleEventForIssue(calendar, issueId) {
@@ -872,19 +889,26 @@ async function findGoogleEventForIssue(calendar, issueId) {
     showDeleted: false
   });
 
-  return response.data.items?.find(event => event.summary?.startsWith(`#${issueId}`)) || null;
+  return (
+    response.data.items?.find(event =>
+      event.summary?.startsWith(`#${issueId}`)
+    ) || null
+  );
 }
 
 function extractMeetLink(event) {
-  return event.hangoutLink
-    || event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri
-    || null;
+  return (
+    event.hangoutLink ||
+    event.conferenceData?.entryPoints?.find(e => e.entryPointType === 'video')?.uri ||
+    null
+  );
 }
 
 async function deleteGoogleMeet(issueId) {
   if (!googleCalendarIsConfigured()) return;
 
   const calendar = getGoogleCalendarClient();
+
   let eventId = await redisGet(`redmine:meet:event:${issueId}`);
 
   try {
@@ -899,10 +923,13 @@ async function deleteGoogleMeet(issueId) {
         eventId
       });
 
-      console.log(`Evento Google Meet removido da tarefa #${issueId}`);
+      console.log(`Google Meet removido da tarefa #${issueId}`);
     }
   } catch (error) {
-    console.error(`Erro ao excluir Meet da tarefa #${issueId}:`, error.response?.data || error.message);
+    console.error(
+      `Erro ao excluir Meet da tarefa #${issueId}:`,
+      error.response?.data || error.message
+    );
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
     await redisDel(`redmine:meet:signature:${issueId}`);
@@ -925,6 +952,7 @@ async function processGoogleMeet(issue) {
 
   const startDate = appointment.dateTime;
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
+
   const projectName = await getMeetProjectName(issue);
 
   await getOrCreateClientFolderStructure(issue).catch(() => {});
@@ -938,6 +966,7 @@ async function processGoogleMeet(issue) {
   });
 
   const signatureKey = `redmine:meet:signature:${issue.id}`;
+
   const oldSignature = await redisGet(signatureKey);
 
   const calendar = getGoogleCalendarClient();
@@ -947,10 +976,12 @@ async function processGoogleMeet(issue) {
 
   if (eventId) {
     try {
-      event = (await calendar.events.get({
-        calendarId: GOOGLE_CALENDAR_ID,
-        eventId
-      })).data;
+      event = (
+        await calendar.events.get({
+          calendarId: GOOGLE_CALENDAR_ID,
+          eventId
+        })
+      ).data;
     } catch {
       eventId = null;
     }
@@ -964,7 +995,10 @@ async function processGoogleMeet(issue) {
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
 
-    if (meetLink && getCustomFieldValue(issue, 'Google Meet') !== meetLink) {
+    if (
+      meetLink &&
+      getCustomFieldValue(issue, 'Google Meet') !== meetLink
+    ) {
       await updateRedmineCustomField(issue, 'Google Meet', meetLink);
     }
 
@@ -976,11 +1010,11 @@ async function processGoogleMeet(issue) {
     description: `Tarefa Redmine: #${issue.id}\n${REDMINE_URL}/issues/${issue.id}`,
     start: {
       dateTime: startDate.toISOString(),
-      timeZone: 'America/Sao_Paulo'
+      timeZone: TZ
     },
     end: {
       dateTime: endDate.toISOString(),
-      timeZone: 'America/Sao_Paulo'
+      timeZone: TZ
     },
     extendedProperties: {
       private: {
@@ -1008,7 +1042,9 @@ async function processGoogleMeet(issue) {
           conferenceData: {
             createRequest: {
               requestId: `redmine-${issue.id}-${Date.now()}`,
-              conferenceSolutionKey: { type: 'hangoutsMeet' }
+              conferenceSolutionKey: {
+                type: 'hangoutsMeet'
+              }
             }
           }
         }
@@ -1030,7 +1066,10 @@ async function processGoogleMeet(issue) {
 
     console.log(`Google Meet sincronizado para tarefa #${issue.id}`);
   } catch (error) {
-    console.error(`Erro ao sincronizar Meet da tarefa #${issue.id}:`, error.response?.data || error.message);
+    console.error(
+      `Erro ao sincronizar Google Meet da tarefa #${issue.id}:`,
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -1038,9 +1077,14 @@ async function processGoogleMeet(issue) {
 // GOOGLE DRIVE
 // ---------------------------------------------------------
 async function getOrCreateFolder(drive, name, parentId) {
-  let query = `name = '${name.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  let query =
+    `name = '${name.replace(/'/g, "\\'")}' ` +
+    `and mimeType = 'application/vnd.google-apps.folder' ` +
+    `and trashed = false`;
 
-  if (parentId) query += ` and '${parentId}' in parents`;
+  if (parentId) {
+    query += ` and '${parentId}' in parents`;
+  }
 
   const res = await drive.files.list({
     q: query,
@@ -1049,7 +1093,9 @@ async function getOrCreateFolder(drive, name, parentId) {
 
   const found = res.data.files || res.data.items || [];
 
-  if (found.length > 0) return found[0].id;
+  if (found.length > 0) {
+    return found[0].id;
+  }
 
   const metadata = {
     name,
@@ -1075,15 +1121,24 @@ async function getOrCreateClientFolderStructure(issue) {
 
     const sincroniza = getCustomFieldValue(project, 'Sincroniza G-Drive');
 
-    if (!sincroniza || String(sincroniza).trim().toLowerCase() !== 'sim') {
+    if (
+      !sincroniza ||
+      String(sincroniza).trim().toLowerCase() !== 'sim'
+    ) {
       return null;
     }
 
     const personalizacaoRaw = getCustomFieldValue(project, 'Personalização');
-    const nomeFantasiaRaw = getCustomFieldValue(project, 'Nome Fantasia') || project.name;
+    const nomeFantasiaRaw =
+      getCustomFieldValue(project, 'Nome Fantasia') || project.name;
 
-    const personalizacao = personalizacaoRaw ? String(personalizacaoRaw).trim() : '';
-    const nomeFantasia = nomeFantasiaRaw ? String(nomeFantasiaRaw).trim() : '';
+    const personalizacao = personalizacaoRaw
+      ? String(personalizacaoRaw).trim()
+      : '';
+
+    const nomeFantasia = nomeFantasiaRaw
+      ? String(nomeFantasiaRaw).trim()
+      : '';
 
     const folderName = personalizacao
       ? `${personalizacao} - ${nomeFantasia}`
@@ -1115,7 +1170,7 @@ async function getOrCreateClientFolderStructure(issue) {
       arquivosFolderId
     };
   } catch (err) {
-    console.error('Erro ao criar estrutura no Drive:', err.response?.data || err.message);
+    console.error('Erro ao criar estrutura Drive:', err.response?.data || err.message);
     return null;
   }
 }
@@ -1143,8 +1198,6 @@ async function processMeetRecordings() {
       try {
         const issue = await fetchIssueDetails(issueId);
 
-        if (!issue) continue;
-
         const structure = await getOrCreateClientFolderStructure(issue);
 
         if (structure?.treinamentosFolderId) {
@@ -1158,11 +1211,17 @@ async function processMeetRecordings() {
           console.log(`Gravação movida para tarefa #${issueId}`);
         }
       } catch (err) {
-        console.error(`Erro ao processar gravação da tarefa #${issueId}:`, err.response?.data || err.message);
+        console.error(
+          `Erro ao mover gravação da tarefa #${issueId}:`,
+          err.response?.data || err.message
+        );
       }
     }
   } catch (error) {
-    console.error('Erro geral no processamento de gravações:', error.response?.data || error.message);
+    console.error(
+      'Erro geral no processamento de gravações:',
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -1197,6 +1256,7 @@ async function pollingRedmineIssues() {
 
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
+
         const issueWithUrl = {
           ...issue,
           url: `${REDMINE_URL}/issues/${issue.id}`
@@ -1216,14 +1276,17 @@ async function pollingRedmineIssues() {
         if (err.response?.status === 404) {
           await deleteGoogleMeet(issueSummary.id);
         } else {
-          console.error(`Erro no polling da tarefa #${issueSummary.id}:`, err.response?.data || err.message);
+          console.error(
+            `Erro no polling da tarefa #${issueSummary.id}:`,
+            err.response?.data || err.message
+          );
         }
       }
     }
 
     lastPollingTimestamp = Date.now();
   } catch (error) {
-    console.error('Erro geral no polling Redmine:', error.response?.data || error.message);
+    console.error('Erro geral no polling:', error.response?.data || error.message);
   }
 }
 
@@ -1252,16 +1315,23 @@ async function fetchIssuesByDate(dateStr) {
 
     const combined = [...byStartDate, ...byDueDate];
 
-    return Array.from(new Map(combined.map(i => [i.id, i])).values());
+    return Array.from(
+      new Map(combined.map(issue => [issue.id, issue])).values()
+    );
   } catch (error) {
-    console.error('Erro ao buscar tarefas por data:', error.response?.data || error.message);
+    console.error(
+      'Erro ao buscar tarefas por data:',
+      error.response?.data || error.message
+    );
+
     return [];
   }
 }
 
 async function pollingAppointmentAlerts() {
   try {
-    const today = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
+    const today = dayjs().tz(TZ).format('YYYY-MM-DD');
+
     const issues = await fetchIssuesByDate(today);
 
     for (const issueSummary of issues) {
@@ -1275,16 +1345,22 @@ async function pollingAppointmentAlerts() {
 
         await checkAppointmentAlert(issueWithUrl);
       } catch (err) {
-        console.error(`Erro ao verificar alerta da tarefa #${issueSummary.id}:`, err.response?.data || err.message);
+        console.error(
+          `Erro ao verificar alerta da tarefa #${issueSummary.id}:`,
+          err.response?.data || err.message
+        );
       }
     }
   } catch (error) {
-    console.error('Erro geral no polling de alertas:', error.response?.data || error.message);
+    console.error(
+      'Erro geral no polling de alertas:',
+      error.response?.data || error.message
+    );
   }
 }
 
 // ---------------------------------------------------------
-// RESUMO MATTERMOST — PRÓXIMO DIA ÚTIL
+// RESUMO MATTERMOST
 // ---------------------------------------------------------
 async function processDailySummary() {
   if (!isDailySummaryTime()) return;
@@ -1304,16 +1380,21 @@ async function processDailySummary() {
       if (!isStrictMeetStatus(issue)) continue;
 
       const appointment = parseAppointmentDateTime(issue);
+
       if (!appointment) continue;
 
       const targets = await getResponsibleTargets(issue);
+
       if (!targets.length) continue;
 
       const projectName = await getMeetProjectName(issue);
       const meetLink = getCustomFieldValue(issue, 'Google Meet');
 
       const sortKey = `${issue.start_date || issue.due_date || ''} ${appointment.timeLabel}`;
-      const lineText = `- ${appointment.timeLabel}: #${issue.id} - ${projectName} - ${issue.subject}${meetLink ? ` (Meet: ${meetLink})` : ''}`;
+
+      const lineText =
+        `- ${appointment.timeLabel}: #${issue.id} - ${projectName} - ${issue.subject}` +
+        `${meetLink ? ` (Meet: ${meetLink})` : ''}`;
 
       for (const target of targets) {
         if (!groupedByEmail.has(target.email)) {
@@ -1346,18 +1427,23 @@ async function processDailySummary() {
 
     console.log(`Resumo Mattermost enviado para ${targetDate}`);
   } catch (error) {
-    console.error('Erro no resumo Mattermost:', error.response?.data || error.message);
+    console.error(
+      'Erro no resumo Mattermost:',
+      error.response?.data || error.message
+    );
   }
 }
 
 // ---------------------------------------------------------
-// RESUMO WHATSAPP — CLIENTE
+// RESUMO WHATSAPP CLIENTE
 // ---------------------------------------------------------
 async function processClientMorningSummary() {
   if (CLIENT_SUMMARY_ENABLED !== 'true') return;
 
-  const now = dayjs().tz('America/Sao_Paulo');
-  const [tHour, tMinute] = String(CLIENT_SUMMARY_TIME || '08:30').split(':').map(Number);
+  const now = dayjs().tz(TZ);
+  const [tHour, tMinute] = String(CLIENT_SUMMARY_TIME || '08:30')
+    .split(':')
+    .map(Number);
 
   if (now.hour() !== tHour || now.minute() !== tMinute) return;
 
@@ -1376,13 +1462,10 @@ async function processClientMorningSummary() {
         if (!isStrictMeetStatus(issue)) continue;
 
         const appointment = parseAppointmentDateTime(issue);
+
         if (!appointment) continue;
 
-        const waGroupId =
-  await getWhatsAppGroupId(issue);
-  console.log(
-  `Tarefa #${issue.id} usando grupo WhatsApp: ${waGroupId}`
-);
+        const waGroupId = await getWhatsAppGroupId(issue);
 
         if (!waGroupId || !waSocket) continue;
 
@@ -1398,13 +1481,19 @@ async function processClientMorningSummary() {
 
         console.log(`Resumo WhatsApp enviado para tarefa #${issue.id}`);
       } catch (err) {
-        console.error(`Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`, err.response?.data || err.message);
+        console.error(
+          `Erro no resumo WhatsApp da tarefa #${issueSummary.id}:`,
+          err.response?.data || err.message
+        );
       }
     }
 
     await markAsNotified(summaryKey);
   } catch (error) {
-    console.error('Erro geral no resumo WhatsApp:', error.response?.data || error.message);
+    console.error(
+      'Erro geral no resumo WhatsApp:',
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -1412,6 +1501,7 @@ async function processClientMorningSummary() {
 // EXPRESS
 // ---------------------------------------------------------
 const app = express();
+
 app.use(express.json());
 
 app.get('/health', (req, res) => {
@@ -1425,6 +1515,28 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/debug-alerts/:id', async (req, res) => {
+  try {
+    const issue = await fetchIssueDetails(req.params.id);
+    const appointment = parseAppointmentDateTime(issue);
+    const waGroupId = await getWhatsAppGroupId(issue);
+
+    res.json({
+      issue: issue.id,
+      status: issue.status?.name,
+      date: issue.start_date || issue.due_date,
+      horario: appointment?.timeLabel || null,
+      dataCompleta: appointment?.dateTime || null,
+      grupoWhatsapp: waGroupId,
+      googleMeet: getCustomFieldValue(issue, 'Google Meet')
+    });
+  } catch (err) {
+    res.status(500).json({
+      erro: err.response?.data || err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
 
@@ -1434,9 +1546,19 @@ app.listen(PORT, () => {
   processClientMorningSummary();
   processMeetRecordings();
 
-  setInterval(pollingRedmineIssues, Number(POLLING_INTERVAL_SECONDS) * 1000);
-  setInterval(pollingAppointmentAlerts, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
+  setInterval(
+    pollingRedmineIssues,
+    Number(POLLING_INTERVAL_SECONDS) * 1000
+  );
+
+  setInterval(
+    pollingAppointmentAlerts,
+    Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000
+  );
+
   setInterval(processDailySummary, 60 * 1000);
+
   setInterval(processClientMorningSummary, 60 * 1000);
+
   setInterval(processMeetRecordings, 5 * 60 * 1000);
 });
