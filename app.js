@@ -51,7 +51,7 @@ const {
   DAILY_SUMMARY_MINUTE = 45,
 
   CLIENT_SUMMARY_ENABLED = 'true',
-  CLIENT_SUMMARY_TIME = '10:30',
+  CLIENT_SUMMARY_TIME = '08:30',
 
   NOTIFY_STATUSES = 'Novo,Reaberta',
   MEET_STATUS_NAME = 'Aguardando Data',
