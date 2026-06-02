@@ -303,7 +303,13 @@ async function getNotificationMarker(key) {
   if (!value) return null;
 
   try {
-    return JSON.parse(value);
+    const parsed = JSON.parse(value);
+
+    if (parsed && typeof parsed === 'object') {
+      return parsed;
+    }
+
+    return { value };
   } catch (_) {
     return { value };
   }
