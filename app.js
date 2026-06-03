@@ -130,6 +130,41 @@ function getWhatsAppRuntimeStatus() {
   };
 }
 
+function unwrapWhatsAppMessage(message) {
+  let current = message;
+
+  while (
+    current?.ephemeralMessage?.message ||
+    current?.viewOnceMessage?.message ||
+    current?.viewOnceMessageV2?.message ||
+    current?.documentWithCaptionMessage?.message
+  ) {
+    current =
+      current.ephemeralMessage?.message ||
+      current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message ||
+      current.documentWithCaptionMessage?.message;
+  }
+
+  return current || {};
+}
+
+function getWhatsAppMessageText(message) {
+  const content = unwrapWhatsAppMessage(message);
+
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
+    content.buttonsResponseMessage?.selectedButtonId ||
+    content.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    content.templateButtonReplyMessage?.selectedId ||
+    ''
+  );
+}
+
 function scheduleWhatsAppReconnect(reason) {
   if (waReconnectTimer) return;
 
@@ -212,27 +247,31 @@ async function initWhatsApp() {
     waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
+      for (const msg of messages) {
+        if (!msg.message) continue;
 
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        '';
+        const text = getWhatsAppMessageText(msg.message);
+        const from = msg.key.remoteJid;
 
-      const from = msg.key.remoteJid;
+        logWhatsAppDebug('WhatsApp: mensagem recebida', {
+          from,
+          participant: msg.key.participant || null,
+          fromMe: Boolean(msg.key.fromMe),
+          text
+        });
 
-      if (text.trim().toLowerCase() === '!id') {
-        try {
-          await waSocket.sendMessage(
-            from,
-            {
-              text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
-            },
-            { quoted: msg }
-          );
-        } catch (err) {
-          console.error('Erro ao responder !id:', describeError(err));
+        if (text.trim().toLowerCase() === '!id') {
+          try {
+            await waSocket.sendMessage(
+              from,
+              {
+                text: `🆔 *ID deste bate-papo/grupo:*\n\`${from}\``
+              },
+              { quoted: msg }
+            );
+          } catch (err) {
+            console.error('Erro ao responder !id:', describeError(err));
+          }
         }
       }
     });
