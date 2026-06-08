@@ -606,7 +606,7 @@ function isDailySummaryTime() {
 
   const now = dayjs().tz(TZ);
 
-  if (now.day() === 0 || now.day() === 6) return false;
+  if (isWeekendDate(now)) return false;
 
   return (
     now.hour() === Number(DAILY_SUMMARY_HOUR) &&
@@ -622,6 +622,11 @@ function getNextBusinessSummaryDateString() {
   else target = target.add(1, 'day');
 
   return target.format('YYYY-MM-DD');
+}
+
+function isWeekendDate(date) {
+  const day = date.day();
+  return day === 0 || day === 6;
 }
 
 // ---------------------------------------------------------
@@ -1973,6 +1978,14 @@ async function processClientMorningSummary(options = {}) {
   result.targetDate = targetDate;
   result.summaryKey = summaryKey;
 
+  if (!force && isWeekendDate(now)) {
+    result.reason = 'weekend';
+    logWhatsAppDebug(
+      `[Resumo WhatsApp] Ignorado no fim de semana. Compromissos de ${targetDate} são gerados no dia útil anterior.`
+    );
+    return result;
+  }
+
   if (resetNotified) {
     await clearNotificationMarker(summaryKey);
     result.clearedNotified = true;
@@ -1981,6 +1994,12 @@ async function processClientMorningSummary(options = {}) {
 
   result.notifiedMarker = await getNotificationMarker(summaryKey);
   result.alreadyNotified = Boolean(result.notifiedMarker);
+
+  if (result.alreadyNotified && !force) {
+    result.reason = 'already_notified';
+    logWhatsAppDebug(`[Resumo WhatsApp] Ignorado: ${summaryKey} já foi notificado.`);
+    return result;
+  }
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
