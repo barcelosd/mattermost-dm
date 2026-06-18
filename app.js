@@ -1626,30 +1626,105 @@ async function processMeetRecordings() {
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
-async function fetchRecentIssues() {
+async function fetchRecentIssuesPage(offset = 0, limit = Number(POLLING_LIMIT)) {
   const response = await axios.get(`${REDMINE_URL}/issues.json`, {
     headers: redmineHeaders,
     params: {
       status_id: '*',
       sort: 'updated_on:desc',
-      limit: Number(POLLING_LIMIT)
+      limit,
+      offset
     }
   });
 
   return response.data.issues || [];
 }
 
+async function fetchRecentIssuesSince(timestamp) {
+  const issues = [];
+  const pageLimit = Math.max(Number(POLLING_LIMIT) || 20, 100);
+
+  for (let offset = 0; ; offset += pageLimit) {
+    const page = await fetchRecentIssuesPage(offset, pageLimit);
+
+    if (!page.length) break;
+
+    for (const issueSummary of page) {
+      const updatedAt = new Date(issueSummary.updated_on).getTime();
+
+      if (updatedAt < timestamp) {
+        return issues;
+      }
+
+      issues.push(issueSummary);
+    }
+
+    if (page.length < pageLimit) break;
+  }
+
+  return issues;
+}
+
+async function backfillGoogleMeetIssues() {
+  if (!googleCalendarIsConfigured()) return;
+
+  const issues = [];
+  const pageLimit = Math.max(Number(POLLING_LIMIT) || 20, 100);
+
+  for (let offset = 0; ; offset += pageLimit) {
+    const page = await fetchRecentIssuesPage(offset, pageLimit);
+
+    if (!page.length) break;
+
+    issues.push(
+      ...page.filter(issueSummary => isStrictMeetStatus(issueSummary))
+    );
+
+    if (page.length < pageLimit) break;
+  }
+
+  for (const issueSummary of issues) {
+    try {
+      const issue = await fetchIssueDetails(issueSummary.id);
+      const signatureKey = `redmine:meet:signature:${issue.id}`;
+      const eventKey = `redmine:meet:event:${issue.id}`;
+      const meetLink = getCustomFieldValue(issue, 'Google Meet');
+
+      if (
+        meetLink &&
+        (await redisGet(signatureKey)) &&
+        (await redisGet(eventKey))
+      ) {
+        continue;
+      }
+
+      const issueWithUrl = {
+        ...issue,
+        url: `${REDMINE_URL}/issues/${issue.id}`
+      };
+
+      await processGoogleMeet(issueWithUrl);
+    } catch (err) {
+      console.error(
+        `Erro no backfill do Meet para a tarefa #${issueSummary.id}:`,
+        err.response?.data || err.message
+      );
+      await notifyAttention(
+        `meet_backfill_error:${issueSummary.id}`,
+        'Erro no backfill do Google Meet',
+        { issueId: issueSummary.id, error: err.response?.data || err.message }
+      );
+    }
+  }
+}
+
 async function pollingRedmineIssues() {
   if (POLLING_ENABLED !== 'true') return;
 
   try {
-    const issues = await fetchRecentIssues();
+    const issues = await fetchRecentIssuesSince(lastPollingTimestamp);
 
     for (const issueSummary of issues) {
-      const updatedAt = new Date(issueSummary.updated_on).getTime();
-
-      if (updatedAt < lastPollingTimestamp) continue;
-
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
 
@@ -2284,25 +2359,35 @@ app.listen(PORT, () => {
     errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
   });
 
-  pollingRedmineIssues();
-  pollingAppointmentAlerts();
-  processDailySummary();
-  processClientMorningSummary();
-  processMeetRecordings();
+  (async () => {
+    await backfillGoogleMeetIssues();
+    lastPollingTimestamp = Date.now();
+    await pollingAppointmentAlerts();
+    await processDailySummary();
+    await processClientMorningSummary();
+    await processMeetRecordings();
 
-  setInterval(
-    pollingRedmineIssues,
-    Number(POLLING_INTERVAL_SECONDS) * 1000
-  );
+    setInterval(
+      pollingRedmineIssues,
+      Number(POLLING_INTERVAL_SECONDS) * 1000
+    );
 
-  setInterval(
-    pollingAppointmentAlerts,
-    Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000
-  );
+    setInterval(
+      pollingAppointmentAlerts,
+      Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000
+    );
 
-  setInterval(processDailySummary, 60 * 1000);
+    setInterval(processDailySummary, 60 * 1000);
 
-  setInterval(processClientMorningSummary, 60 * 1000);
+    setInterval(processClientMorningSummary, 60 * 1000);
 
-  setInterval(processMeetRecordings, 5 * 60 * 1000);
+    setInterval(processMeetRecordings, 5 * 60 * 1000);
+  })().catch(async (error) => {
+    console.error('Erro ao iniciar rotinas agendadas:', error?.response?.data || error.message);
+    await notifyAttention(
+      'scheduler_startup_error',
+      'Erro ao iniciar rotinas agendadas',
+      error?.response?.data || error.message
+    );
+  });
 });
