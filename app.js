@@ -1625,6 +1625,16 @@ async function processMeetRecordings() {
 // POLLING REDMINE
 // ---------------------------------------------------------
 let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
+// Pequena sobreposição para não perder atualizações na borda de segundo/minuto
+// sem precisar aumentar muito o volume de leitura.
+const POLLING_LOOKBACK_MS = 3000;
+
+function getNextPollingTimestamp(previousTimestamp, pollStartedAt, maxUpdatedAt = null) {
+  const baseTimestamp = maxUpdatedAt ?? pollStartedAt;
+  const nextTimestamp = baseTimestamp - POLLING_LOOKBACK_MS;
+
+  return Math.max(previousTimestamp, nextTimestamp);
+}
 
 async function fetchRecentIssuesPage(offset = 0, limit = Number(POLLING_LIMIT)) {
   const response = await axios.get(`${REDMINE_URL}/issues.json`, {
@@ -1643,6 +1653,8 @@ async function fetchRecentIssuesPage(offset = 0, limit = Number(POLLING_LIMIT)) 
 async function fetchRecentIssuesSince(timestamp) {
   const issues = [];
   const pageLimit = Math.max(Number(POLLING_LIMIT) || 20, 100);
+  const threshold = Math.max(0, timestamp - POLLING_LOOKBACK_MS);
+  let maxUpdatedAt = null;
 
   for (let offset = 0; ; offset += pageLimit) {
     const page = await fetchRecentIssuesPage(offset, pageLimit);
@@ -1652,8 +1664,12 @@ async function fetchRecentIssuesSince(timestamp) {
     for (const issueSummary of page) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
 
-      if (updatedAt < timestamp) {
-        return issues;
+      if (!Number.isNaN(updatedAt)) {
+        maxUpdatedAt = maxUpdatedAt === null ? updatedAt : Math.max(maxUpdatedAt, updatedAt);
+      }
+
+      if (updatedAt < threshold) {
+        return { issues, maxUpdatedAt };
       }
 
       issues.push(issueSummary);
@@ -1662,7 +1678,7 @@ async function fetchRecentIssuesSince(timestamp) {
     if (page.length < pageLimit) break;
   }
 
-  return issues;
+  return { issues, maxUpdatedAt };
 }
 
 async function backfillGoogleMeetIssues() {
@@ -1722,7 +1738,8 @@ async function pollingRedmineIssues() {
   if (POLLING_ENABLED !== 'true') return;
 
   try {
-    const issues = await fetchRecentIssuesSince(lastPollingTimestamp);
+    const pollStartedAt = Date.now();
+    const { issues, maxUpdatedAt } = await fetchRecentIssuesSince(lastPollingTimestamp);
 
     for (const issueSummary of issues) {
       try {
@@ -1760,7 +1777,11 @@ async function pollingRedmineIssues() {
       }
     }
 
-    lastPollingTimestamp = Date.now();
+    lastPollingTimestamp = getNextPollingTimestamp(
+      lastPollingTimestamp,
+      pollStartedAt,
+      maxUpdatedAt
+    );
   } catch (error) {
     console.error('Erro geral no polling:', error.response?.data || error.message);
     await notifyAttention(
