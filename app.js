@@ -677,7 +677,12 @@ async function getRedmineProject(projectId) {
   try {
     const response = await axios.get(
       `${REDMINE_URL}/projects/${projectId}.json`,
-      { headers: redmineHeaders }
+      {
+        headers: redmineHeaders,
+        params: {
+          include: 'custom_fields'
+        }
+      }
     );
 
     return response.data.project;
@@ -1545,12 +1550,10 @@ async function getOrCreateClientFolderStructure(issue) {
 
     if (!project) return null;
 
-    const sincroniza = getCustomFieldValue(project, 'Sincroniza G-Drive');
-
-    if (
-      !sincroniza ||
-      String(sincroniza).trim().toLowerCase() !== 'sim'
-    ) {
+    if (!shouldSyncGoogleDriveProject(project)) {
+      console.log(
+        `Projeto ${project.id} não está habilitado para sincronização no Google Drive.`
+      );
       return null;
     }
 
@@ -1581,6 +1584,10 @@ async function getOrCreateClientFolderStructure(issue) {
       : personalizacao
         ? `${personalizacao} - ${nomeFantasia}`
         : nomeFantasia;
+
+    console.log(
+      `Estrutura Drive tarefa #${issue.id}: personalizacao="${personalizacao}", pasta="${folderName}"`
+    );
 
     const clientFolderId = await getOrCreateFolder(
       drive,
@@ -1670,6 +1677,22 @@ function isTrainingVideoFile(file) {
   return mimeType === 'video/mp4' || name.endsWith('.mp4');
 }
 
+function shouldSyncGoogleDriveProject(project) {
+  const sincronizaRaw = getCustomFieldValue(project, 'Sincroniza G-Drive');
+
+  if (!sincronizaRaw) {
+    return true;
+  }
+
+  const value = normalizeText(sincronizaRaw);
+
+  if (['nao', 'não', 'no', 'false', '0', 'off'].includes(value)) {
+    return false;
+  }
+
+  return value === 'sim' || value === 'yes' || value === 'true' || value === '1';
+}
+
 function formatVideoDuration(durationMillis) {
   const totalSeconds = Math.max(0, Math.round(Number(durationMillis || 0) / 1000));
   const hours = Math.floor(totalSeconds / 3600);
@@ -1714,7 +1737,10 @@ async function processMeetRecordings() {
 
       const match = String(file.name || '').match(/#(\d+)/);
 
-      if (!match) continue;
+      if (!match) {
+        console.log(`Arquivo ignorado por não ter tarefa no nome: ${file.name}`);
+        continue;
+      }
 
       const issueId = match[1];
 
@@ -1723,56 +1749,59 @@ async function processMeetRecordings() {
 
         const structure = await getOrCreateClientFolderStructure(issue);
 
-        if (structure?.treinamentosFolderId) {
-          let videoDuration = null;
-
-          if (isTrainingVideoFile(file)) {
-            try {
-              videoDuration = await getDriveVideoDurationLabel(drive, file.id);
-            } catch (durationErr) {
-              console.error(
-                `Erro ao ler duração do vídeo da tarefa #${issueId}:`,
-                durationErr.response?.data || durationErr.message
-              );
-            }
-          }
-
-          await drive.files.update({
-            fileId: file.id,
-            addParents: structure.treinamentosFolderId,
-            removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-            fields: 'id, parents'
-          });
-
-          if (isTrainingVideoFile(file)) {
-            try {
-              await addRedmineIssueNote(
-                issueId,
-                videoDuration
-                  ? `Vídeo organizado automaticamente no Google Drive. Duração detectada: ${videoDuration}.`
-                  : 'Vídeo organizado automaticamente no Google Drive. Não foi possível identificar a duração.'
-              );
-            } catch (noteErr) {
-              console.error(
-                `Erro ao criar journal na tarefa #${issueId}:`,
-                noteErr.response?.data || noteErr.message
-              );
-              await notifyAttention(
-                `redmine_video_journal_error:${issueId}`,
-                'Erro ao criar journal com duração do vídeo',
-                {
-                  issueId,
-                  fileId: file.id,
-                  fileName: file.name,
-                  duration: videoDuration,
-                  error: noteErr.response?.data || noteErr.message
-                }
-              );
-            }
-          }
-
-          console.log(`Arquivo movido para Treinamentos na tarefa #${issueId}`);
+        if (!structure?.treinamentosFolderId) {
+          console.log(`Estrutura Treinamentos não encontrada para tarefa #${issueId}.`);
+          continue;
         }
+
+        let videoDuration = null;
+
+        if (isTrainingVideoFile(file)) {
+          try {
+            videoDuration = await getDriveVideoDurationLabel(drive, file.id);
+          } catch (durationErr) {
+            console.error(
+              `Erro ao ler duração do vídeo da tarefa #${issueId}:`,
+              durationErr.response?.data || durationErr.message
+            );
+          }
+        }
+
+        await drive.files.update({
+          fileId: file.id,
+          addParents: structure.treinamentosFolderId,
+          removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+          fields: 'id, parents'
+        });
+
+        if (isTrainingVideoFile(file)) {
+          try {
+            await addRedmineIssueNote(
+              issueId,
+              videoDuration
+                ? `Vídeo organizado automaticamente no Google Drive. Duração detectada: ${videoDuration}.`
+                : 'Vídeo organizado automaticamente no Google Drive. Não foi possível identificar a duração.'
+            );
+          } catch (noteErr) {
+            console.error(
+              `Erro ao criar journal na tarefa #${issueId}:`,
+              noteErr.response?.data || noteErr.message
+            );
+            await notifyAttention(
+              `redmine_video_journal_error:${issueId}`,
+              'Erro ao criar journal com duração do vídeo',
+              {
+                issueId,
+                fileId: file.id,
+                fileName: file.name,
+                duration: videoDuration,
+                error: noteErr.response?.data || noteErr.message
+              }
+            );
+          }
+        }
+
+        console.log(`Arquivo movido para Treinamentos na tarefa #${issueId}`);
       } catch (err) {
         console.error(
           `Erro ao mover arquivo da tarefa #${issueId}:`,
