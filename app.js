@@ -2478,7 +2478,9 @@ app.listen(PORT, () => {
 
   (async () => {
     await backfillGoogleMeetIssues();
-    lastPollingTimestamp = Date.now();
+    await backfillGoogleMeetIssues();
+// lastPollingTimestamp = Date.now();  // remover/comentar
+    await pollingRedmineIssues();
     await pollingAppointmentAlerts();
     await processDailySummary();
     await processClientMorningSummary();
