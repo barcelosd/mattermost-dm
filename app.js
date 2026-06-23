@@ -1,3 +1,7 @@
+console.log("🚀 O Bot NewNorte está iniciando o processo de boot...");
+require('dotenv').config();
+// ... resto do seu código
+
 require('dotenv').config();
 
 const express = require('express');
@@ -95,7 +99,7 @@ async function initWhatsApp() {
   waSocket = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
+    logger: pino({ level: 'info' }),
     browser: ["Bot NewNorte", "Chrome", "1.0.0"]
   });
 
@@ -518,7 +522,9 @@ async function pollingRedmineIssues() {
         const issue = await fetchIssueDetails(issueSummary.id); // [cite: 786]
         // Processar notificações comuns (Novo, Reaberta)...
         // processIssueNotification(issue...);
-      } catch (err) {}
+      } catch (err) {
+  console.error("[ERRO NO POLLING]:", err.message || err);
+}
     }
   } catch (err) {}
 }
@@ -536,9 +542,13 @@ async function pollingAppointmentAlerts() {
       try {
         const issue = await fetchIssueDetails(issueSummary.id);
         await checkAppointmentAlert(issue);
-      } catch (err) {}
+      } catch (err) {
+  console.error("[ERRO NO POLLING]:", err.message || err);
+}
     }
-  } catch (err) {}
+  } catch (err) {
+  console.error("[ERRO NO POLLING]:", err.message || err);
+}
 }
 
 // ---------------------------------------------------------
