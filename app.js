@@ -2406,6 +2406,56 @@ app.get('/debug-alerts/:id', async (req, res) => {
   }
 });
 
+app.get('/debug-meet/:id', async (req, res) => {
+  try {
+    const issue = await fetchIssueDetails(req.params.id);
+
+    const issueWithUrl = {
+      ...issue,
+      url: `${REDMINE_URL}/issues/${issue.id}`
+    };
+
+    await processGoogleMeet(issueWithUrl);
+
+    res.json({
+      success: true,
+      issue: issue.id,
+      status: issue.status?.name,
+      startDate: issue.start_date,
+      dueDate: issue.due_date,
+      horario: getCustomFieldValue(issue, ALERT_FIELD_NAME),
+      estimatedHours: issue.estimated_hours,
+      googleMeet: getCustomFieldValue(issue, 'Google Meet')
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.response?.data || err.message
+    });
+  }
+});
+
+app.get('/debug-google', async (req, res) => {
+  try {
+    const calendar = getGoogleCalendarClient();
+    const result = await calendar.calendarList.list();
+
+    res.json({
+      success: true,
+      calendarId: GOOGLE_CALENDAR_ID,
+      calendars: result.data.items.map(c => ({
+        id: c.id,
+        summary: c.summary
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
   console.log('Configuração carregada:', {
