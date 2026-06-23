@@ -1313,9 +1313,43 @@ async function deleteGoogleMeet(issueId) {
     await redisSetRemove('redmine:meet:issues', String(issueId));
   }
 }
-
+console.log(
+  `[MEET] Processando #${issue.id}`,
+  {
+    status: issue.status?.name,
+    start_date: issue.start_date,
+    due_date: issue.due_date,
+    horario: getCustomFieldValue(issue, ALERT_FIELD_NAME),
+    estimated_hours: issue.estimated_hours
+  }
+);
 async function processGoogleMeet(issue) {
-  if (!googleCalendarIsConfigured()) return;
+ if (!googleCalendarIsConfigured()) {
+  console.log('[MEET] Google Calendar não configurado');
+  return;
+}
+
+app.get('/debug-google', async (req, res) => {
+  try {
+    const calendar = getGoogleCalendarClient();
+
+    const result = await calendar.calendarList.list();
+
+    res.json({
+      success: true,
+      calendars: result.data.items.map(c => ({
+        id: c.id,
+        summary: c.summary
+      }))
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.response?.data || err.message
+    });
+  }
+});
 
   const isMeet = isStrictMeetStatus(issue);
   const appointment = parseAppointmentDateTime(issue);
