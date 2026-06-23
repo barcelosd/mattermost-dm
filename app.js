@@ -1729,9 +1729,11 @@ function createDriveMoveTraceLogger(trace, enabled) {
 
     trace.push(entry);
 
-    if (enabled) {
-      console.log(`[DriveMove][${stage}]`, details || '');
-    }
+    const prefix = enabled ? '[DriveMove][debug]' : '[DriveMove]';
+    console.log(
+      `${prefix} ${stage}`,
+      details ? JSON.stringify(details) : ''
+    );
   };
 }
 
@@ -1743,6 +1745,7 @@ async function processMeetRecordings(options = {}) {
   const logTrace = createDriveMoveTraceLogger(trace, debug);
 
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleDriveIsConfigured()) {
+    console.log('[DriveMove] rotina ignorada: configuração incompleta');
     logTrace('skip_not_configured', {
       hasRecordingsFolder: Boolean(GOOGLE_DRIVE_RECORDINGS_FOLDER_ID),
       googleDriveConfigured: googleDriveIsConfigured()
@@ -1757,6 +1760,9 @@ async function processMeetRecordings(options = {}) {
 
   try {
     const drive = getGoogleDriveClient();
+    console.log(
+      `[DriveMove] iniciando processamento | dryRun=${dryRun} | issueId=${issueIdFilter || 'todos'}`
+    );
     logTrace('start', {
       recordingsFolderId: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
       issueIdFilter,
@@ -1769,6 +1775,7 @@ async function processMeetRecordings(options = {}) {
     });
 
     const files = res.data.files || res.data.items || [];
+    console.log(`[DriveMove] arquivos encontrados: ${files.length}`);
     logTrace('listed_files', { count: files.length });
 
     for (const file of files) {
@@ -1795,10 +1802,10 @@ async function processMeetRecordings(options = {}) {
 
       const match = String(file.name || '').match(/#(\d+)/);
 
-      if (!match) {
-        console.log(`Arquivo ignorado por não ter tarefa no nome: ${file.name}`);
-        continue;
-      }
+        if (!match) {
+          console.log(`Arquivo ignorado por não ter tarefa no nome: ${file.name}`);
+          continue;
+        }
 
       const issueId = match[1];
 
@@ -1929,6 +1936,9 @@ async function processMeetRecordings(options = {}) {
       }
     }
 
+    console.log(
+      `[DriveMove] processamento finalizado | arquivos=${files.length} | issueId=${issueIdFilter || 'todos'}`
+    );
     logTrace('finished', { count: files.length });
 
     return {
@@ -1943,6 +1953,7 @@ async function processMeetRecordings(options = {}) {
       'Erro geral no processamento de gravações:',
       error.response?.data || error.message
     );
+    console.error('[DriveMove] falha geral no processamento de gravações');
     logTrace('general_error', {
       error: error.response?.data || error.message
     });
