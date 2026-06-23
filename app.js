@@ -1,3 +1,16 @@
+// 🚨 FORÇAR CAPTURA DE ERROS OCULTOS NO RENDER
+process.on('uncaughtException', (err) => {
+  console.error('💥 CRASH CRÍTICO (Uncaught Exception):', err.message || err);
+  console.error(err.stack);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 REJEIÇÃO NÃO TRATADA (Unhandled Rejection) em:', promise, 'razão:', reason);
+});
+
+console.log("🚀 [BOOT] Iniciando leitura do arquivo e carregando dependências...");
+
 console.log("🚀 O Bot NewNorte está iniciando o processo de boot...");
 require('dotenv').config();
 // ... resto do seu código
@@ -75,7 +88,7 @@ const {
 } = process.env;
 
 const TZ = 'America/Sao_Paulo';
-const WA_AUTH_DIR = path.join(__dirname, '.wwebjs_auth');
+const WA_AUTH_DIR = '/tmp/.wwebjs_auth';
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
