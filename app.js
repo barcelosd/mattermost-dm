@@ -1608,62 +1608,64 @@ async function getOrCreateClientFolderStructure(issue) {
 }
 
 async function processMeetRecordings() {
-  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
+  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) {
+    console.log('[DRIVE] Não executou: falta GOOGLE_DRIVE_RECORDINGS_FOLDER_ID ou Google não configurado.');
+    return;
+  }
 
   try {
     const drive = getGoogleDriveClient();
 
+    console.log('[DRIVE] Verificando pasta de gravações:', GOOGLE_DRIVE_RECORDINGS_FOLDER_ID);
+
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name)'
+      fields: 'files(id, name, parents)'
     });
 
-    const files = res.data.files || res.data.items || [];
+    const files = res.data.files || [];
+
+    console.log('[DRIVE] Arquivos encontrados:', files.map(f => ({
+      id: f.id,
+      name: f.name
+    })));
 
     for (const file of files) {
       const match = file.name.match(/#(\d+)/);
 
-      if (!match) continue;
+      if (!match) {
+        console.log(`[DRIVE] Ignorado sem número da tarefa no nome: ${file.name}`);
+        continue;
+      }
 
       const issueId = match[1];
 
       try {
-        const issue = await fetchIssueDetails(issueId);
+        console.log(`[DRIVE] Processando arquivo ${file.name} para tarefa #${issueId}`);
 
+        const issue = await fetchIssueDetails(issueId);
         const structure = await getOrCreateClientFolderStructure(issue);
 
-        if (structure?.treinamentosFolderId) {
-          await drive.files.update({
-            fileId: file.id,
-            addParents: structure.treinamentosFolderId,
-            removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-            fields: 'id, parents'
-          });
-
-          console.log(`Gravação movida para tarefa #${issueId}`);
+        if (!structure?.treinamentosFolderId) {
+          console.log(`[DRIVE] Não moveu #${issueId}: estrutura/pasta Treinamentos não criada.`);
+          continue;
         }
+
+        await drive.files.update({
+          fileId: file.id,
+          addParents: structure.treinamentosFolderId,
+          removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+          fields: 'id, parents'
+        });
+
+        console.log(`[DRIVE] Arquivo movido com sucesso: ${file.name} → Treinamentos`);
+
       } catch (err) {
-        console.error(
-          `Erro ao mover gravação da tarefa #${issueId}:`,
-          err.response?.data || err.message
-        );
-        await notifyAttention(
-          `drive_recording_move_error:${issueId}`,
-          'Erro ao mover gravação no Google Drive',
-          { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
-        );
+        console.error(`[DRIVE] Erro ao mover ${file.name}:`, err.response?.data || err.message);
       }
     }
   } catch (error) {
-    console.error(
-      'Erro geral no processamento de gravações:',
-      error.response?.data || error.message
-    );
-    await notifyAttention(
-      'drive_recordings_general_error',
-      'Erro geral no processamento de gravações',
-      error.response?.data || error.message
-    );
+    console.error('[DRIVE] Erro geral:', error.response?.data || error.message);
   }
 }
 
@@ -2475,6 +2477,22 @@ app.listen(PORT, () => {
     errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
     errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
   });
+
+  app.get('/debug-drive', async (req, res) => {
+  try {
+    await processMeetRecordings();
+
+    res.json({
+      success: true,
+      message: 'Verificação do Drive executada. Veja os logs do Render.'
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.response?.data || err.message
+    });
+  }
+});
 
   (async () => {
     await backfillGoogleMeetIssues();
