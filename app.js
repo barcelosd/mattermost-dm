@@ -1719,11 +1719,49 @@ async function getDriveVideoDurationLabel(drive, fileId) {
   return formatVideoDuration(durationMillis);
 }
 
-async function processMeetRecordings() {
-  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleDriveIsConfigured()) return;
+function createDriveMoveTraceLogger(trace, enabled) {
+  return (stage, details = null) => {
+    const entry = {
+      at: dayjs().tz(TZ).format('YYYY-MM-DD HH:mm:ss'),
+      stage,
+      ...(details ? { details } : {})
+    };
+
+    trace.push(entry);
+
+    if (enabled) {
+      console.log(`[DriveMove][${stage}]`, details || '');
+    }
+  };
+}
+
+async function processMeetRecordings(options = {}) {
+  const debug = options.debug === true;
+  const dryRun = options.dryRun === true;
+  const issueIdFilter = options.issueId ? String(options.issueId).trim() : null;
+  const trace = [];
+  const logTrace = createDriveMoveTraceLogger(trace, debug);
+
+  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleDriveIsConfigured()) {
+    logTrace('skip_not_configured', {
+      hasRecordingsFolder: Boolean(GOOGLE_DRIVE_RECORDINGS_FOLDER_ID),
+      googleDriveConfigured: googleDriveIsConfigured()
+    });
+
+    return {
+      ok: false,
+      reason: 'not_configured',
+      trace
+    };
+  }
 
   try {
     const drive = getGoogleDriveClient();
+    logTrace('start', {
+      recordingsFolderId: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+      issueIdFilter,
+      dryRun
+    });
 
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
@@ -1731,8 +1769,28 @@ async function processMeetRecordings() {
     });
 
     const files = res.data.files || res.data.items || [];
+    logTrace('listed_files', { count: files.length });
 
     for (const file of files) {
+      logTrace('file_seen', {
+        fileId: file.id,
+        fileName: file.name,
+        mimeType: file.mimeType
+      });
+
+      if (issueIdFilter) {
+        const fileIssueMatch = String(file.name || '').match(/#(\d+)/);
+
+        if (!fileIssueMatch || String(fileIssueMatch[1]) !== issueIdFilter) {
+          logTrace('file_filtered_out', {
+            fileId: file.id,
+            fileName: file.name,
+            reason: 'issue_filter'
+          });
+          continue;
+        }
+      }
+
       if (!isTrainingSourceFile(file)) continue;
 
       const match = String(file.name || '').match(/#(\d+)/);
@@ -1745,48 +1803,98 @@ async function processMeetRecordings() {
       const issueId = match[1];
 
       try {
+        logTrace('issue_fetch_start', { issueId });
         const issue = await fetchIssueDetails(issueId);
+        logTrace('issue_fetch_ok', {
+          issueId,
+          projectId: issue?.project?.id || null,
+          subject: issue?.subject || null
+        });
 
         const structure = await getOrCreateClientFolderStructure(issue);
+        logTrace('structure_result', {
+          issueId,
+          hasStructure: Boolean(structure),
+          clientFolderId: structure?.clientFolderId || null,
+          treinamentosFolderId: structure?.treinamentosFolderId || null,
+          arquivosFolderId: structure?.arquivosFolderId || null
+        });
 
         if (!structure?.treinamentosFolderId) {
           console.log(`Estrutura Treinamentos não encontrada para tarefa #${issueId}.`);
+          logTrace('skip_missing_trainings_folder', { issueId });
           continue;
         }
 
         let videoDuration = null;
 
         if (isTrainingVideoFile(file)) {
+          logTrace('video_duration_start', { issueId, fileId: file.id });
           try {
             videoDuration = await getDriveVideoDurationLabel(drive, file.id);
+            logTrace('video_duration_ok', { issueId, videoDuration });
           } catch (durationErr) {
             console.error(
               `Erro ao ler duração do vídeo da tarefa #${issueId}:`,
               durationErr.response?.data || durationErr.message
             );
+            logTrace('video_duration_error', {
+              issueId,
+              error: durationErr.response?.data || durationErr.message
+            });
           }
         }
 
-        await drive.files.update({
-          fileId: file.id,
-          addParents: structure.treinamentosFolderId,
-          removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-          fields: 'id, parents'
-        });
+        if (dryRun) {
+          logTrace('move_dry_run', {
+            issueId,
+            fileId: file.id,
+            destinationFolderId: structure.treinamentosFolderId
+          });
+        } else {
+          logTrace('move_start', {
+            issueId,
+            fileId: file.id,
+            destinationFolderId: structure.treinamentosFolderId
+          });
+          await drive.files.update({
+            fileId: file.id,
+            addParents: structure.treinamentosFolderId,
+            removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+            fields: 'id, parents'
+          });
+          logTrace('move_ok', {
+            issueId,
+            fileId: file.id,
+            destinationFolderId: structure.treinamentosFolderId
+          });
+        }
 
         if (isTrainingVideoFile(file)) {
           try {
-            await addRedmineIssueNote(
-              issueId,
-              videoDuration
-                ? `Vídeo organizado automaticamente no Google Drive. Duração detectada: ${videoDuration}.`
-                : 'Vídeo organizado automaticamente no Google Drive. Não foi possível identificar a duração.'
-            );
+            if (dryRun) {
+              logTrace('journal_dry_run', {
+                issueId,
+                videoDuration
+              });
+            } else {
+              await addRedmineIssueNote(
+                issueId,
+                videoDuration
+                  ? `Vídeo organizado automaticamente no Google Drive. Duração detectada: ${videoDuration}.`
+                  : 'Vídeo organizado automaticamente no Google Drive. Não foi possível identificar a duração.'
+              );
+              logTrace('journal_ok', { issueId, videoDuration });
+            }
           } catch (noteErr) {
             console.error(
               `Erro ao criar journal na tarefa #${issueId}:`,
               noteErr.response?.data || noteErr.message
             );
+            logTrace('journal_error', {
+              issueId,
+              error: noteErr.response?.data || noteErr.message
+            });
             await notifyAttention(
               `redmine_video_journal_error:${issueId}`,
               'Erro ao criar journal com duração do vídeo',
@@ -1802,11 +1910,17 @@ async function processMeetRecordings() {
         }
 
         console.log(`Arquivo movido para Treinamentos na tarefa #${issueId}`);
+        logTrace('file_done', { issueId, fileId: file.id });
       } catch (err) {
         console.error(
           `Erro ao mover arquivo da tarefa #${issueId}:`,
           err.response?.data || err.message
         );
+        logTrace('file_error', {
+          issueId,
+          fileId: file.id,
+          error: err.response?.data || err.message
+        });
         await notifyAttention(
           `drive_recording_move_error:${issueId}`,
           'Erro ao mover arquivo no Google Drive',
@@ -1814,16 +1928,36 @@ async function processMeetRecordings() {
         );
       }
     }
+
+    logTrace('finished', { count: files.length });
+
+    return {
+      ok: true,
+      dryRun,
+      issueIdFilter,
+      processedFiles: files.length,
+      trace
+    };
   } catch (error) {
     console.error(
       'Erro geral no processamento de gravações:',
       error.response?.data || error.message
     );
+    logTrace('general_error', {
+      error: error.response?.data || error.message
+    });
     await notifyAttention(
       'drive_recordings_general_error',
       'Erro geral no processamento de gravações',
       error.response?.data || error.message
     );
+
+    return {
+      ok: false,
+      reason: 'general_error',
+      error: error.response?.data || error.message,
+      trace
+    };
   }
 }
 
@@ -2562,6 +2696,26 @@ app.get('/debug-alerts/:id', async (req, res) => {
   } catch (err) {
     res.status(500).json({
       erro: describeError(err)
+    });
+  }
+});
+
+app.get('/debug-drive-recordings', async (req, res) => {
+  try {
+    const dryRun = req.query.dryRun !== 'false';
+    const issueId = req.query.issueId ? String(req.query.issueId).trim() : null;
+    const debug = req.query.debug !== 'false';
+
+    const result = await processMeetRecordings({
+      debug,
+      dryRun,
+      issueId
+    });
+
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(500).json({
+      error: describeError(err)
     });
   }
 });
