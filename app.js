@@ -659,6 +659,18 @@ async function updateRedmineCustomField(issue, fieldName, value) {
   setCustomFieldValue(issue, fieldName, value);
 }
 
+async function addRedmineIssueNote(issueId, notes) {
+  await axios.put(
+    `${REDMINE_URL}/issues/${issueId}.json`,
+    {
+      issue: {
+        notes
+      }
+    },
+    { headers: redmineHeaders }
+  );
+}
+
 async function getRedmineProject(projectId) {
   if (!projectId) return null;
 
@@ -1205,6 +1217,15 @@ function googleCalendarIsConfigured() {
   );
 }
 
+function googleDriveIsConfigured() {
+  return Boolean(
+    GOOGLE_CLIENT_ID &&
+    GOOGLE_CLIENT_SECRET &&
+    GOOGLE_REFRESH_TOKEN &&
+    GOOGLE_DRIVE_CLIENTES_FOLDER_ID
+  );
+}
+
 function getGoogleCalendarClient() {
   const auth = new google.auth.OAuth2(
     GOOGLE_CLIENT_ID,
@@ -1492,6 +1513,30 @@ async function getOrCreateFolder(drive, name, parentId) {
   return folder.data.id;
 }
 
+async function findFolderByPersonalizacao(drive, personalizacao, parentId) {
+  if (!personalizacao || !parentId) return null;
+
+  const searchValue = String(personalizacao).trim();
+
+  const response = await drive.files.list({
+    q:
+      `'${parentId}' in parents ` +
+      `and mimeType = 'application/vnd.google-apps.folder' ` +
+      `and trashed = false ` +
+      `and name contains '${searchValue.replace(/'/g, "\\'")}'`,
+    fields: 'files(id, name)'
+  });
+
+  const folders = response.data.files || response.data.items || [];
+  const normalizedSearch = normalizeText(searchValue);
+
+  return (
+    folders.find(folder => normalizeText(folder.name).startsWith(normalizedSearch)) ||
+    folders.find(folder => normalizeText(folder.name).includes(normalizedSearch)) ||
+    null
+  );
+}
+
 async function getOrCreateClientFolderStructure(issue) {
   if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID || !issue?.project?.id) return null;
 
@@ -1521,11 +1566,21 @@ async function getOrCreateClientFolderStructure(issue) {
       ? String(nomeFantasiaRaw).trim()
       : '';
 
-    const folderName = personalizacao
-      ? `${personalizacao} - ${nomeFantasia}`
-      : nomeFantasia;
-
     const drive = getGoogleDriveClient();
+
+    const existingFolder = personalizacao
+      ? await findFolderByPersonalizacao(
+          drive,
+          personalizacao,
+          GOOGLE_DRIVE_CLIENTES_FOLDER_ID
+        )
+      : null;
+
+    const folderName = existingFolder
+      ? existingFolder.name
+      : personalizacao
+        ? `${personalizacao} - ${nomeFantasia}`
+        : nomeFantasia;
 
     const clientFolderId = await getOrCreateFolder(
       drive,
@@ -1561,21 +1616,103 @@ async function getOrCreateClientFolderStructure(issue) {
   }
 }
 
+function isTrainingSourceFile(file) {
+  const name = String(file?.name || '').toLowerCase();
+  const mimeType = String(file?.mimeType || '').toLowerCase();
+
+  const allowedMimeTypes = new Set([
+    'video/mp4',
+    'application/vnd.google-apps.document',
+    'application/vnd.google-apps.spreadsheet',
+    'application/vnd.google-apps.presentation',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/msword',
+    'application/vnd.ms-excel',
+    'application/vnd.ms-powerpoint',
+    'application/pdf',
+    'text/plain',
+    'application/rtf',
+    'application/vnd.oasis.opendocument.text',
+    'application/vnd.oasis.opendocument.spreadsheet',
+    'application/vnd.oasis.opendocument.presentation'
+  ]);
+
+  const allowedExtensions = [
+    '.mp4',
+    '.doc',
+    '.docx',
+    '.docs',
+    '.xls',
+    '.xlsx',
+    '.ppt',
+    '.pptx',
+    '.pdf',
+    '.txt',
+    '.rtf',
+    '.odt',
+    '.ods',
+    '.odp'
+  ];
+
+  return (
+    name.includes('#') &&
+    (allowedMimeTypes.has(mimeType) ||
+      allowedExtensions.some(extension => name.endsWith(extension)))
+  );
+}
+
+function isTrainingVideoFile(file) {
+  const name = String(file?.name || '').toLowerCase();
+  const mimeType = String(file?.mimeType || '').toLowerCase();
+
+  return mimeType === 'video/mp4' || name.endsWith('.mp4');
+}
+
+function formatVideoDuration(durationMillis) {
+  const totalSeconds = Math.max(0, Math.round(Number(durationMillis || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+async function getDriveVideoDurationLabel(drive, fileId) {
+  const response = await drive.files.get({
+    fileId,
+    fields: 'id, videoMediaMetadata(durationMillis)'
+  });
+
+  const durationMillis = response.data.videoMediaMetadata?.durationMillis;
+
+  if (!durationMillis) return null;
+
+  return formatVideoDuration(durationMillis);
+}
+
 async function processMeetRecordings() {
-  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
+  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleDriveIsConfigured()) return;
 
   try {
     const drive = getGoogleDriveClient();
 
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name)'
+      fields: 'files(id, name, mimeType)'
     });
 
     const files = res.data.files || res.data.items || [];
 
     for (const file of files) {
-      const match = file.name.match(/#(\d+)/);
+      if (!isTrainingSourceFile(file)) continue;
+
+      const match = String(file.name || '').match(/#(\d+)/);
 
       if (!match) continue;
 
@@ -1587,6 +1724,19 @@ async function processMeetRecordings() {
         const structure = await getOrCreateClientFolderStructure(issue);
 
         if (structure?.treinamentosFolderId) {
+          let videoDuration = null;
+
+          if (isTrainingVideoFile(file)) {
+            try {
+              videoDuration = await getDriveVideoDurationLabel(drive, file.id);
+            } catch (durationErr) {
+              console.error(
+                `Erro ao ler duração do vídeo da tarefa #${issueId}:`,
+                durationErr.response?.data || durationErr.message
+              );
+            }
+          }
+
           await drive.files.update({
             fileId: file.id,
             addParents: structure.treinamentosFolderId,
@@ -1594,16 +1744,43 @@ async function processMeetRecordings() {
             fields: 'id, parents'
           });
 
-          console.log(`Gravação movida para tarefa #${issueId}`);
+          if (isTrainingVideoFile(file)) {
+            try {
+              await addRedmineIssueNote(
+                issueId,
+                videoDuration
+                  ? `Vídeo organizado automaticamente no Google Drive. Duração detectada: ${videoDuration}.`
+                  : 'Vídeo organizado automaticamente no Google Drive. Não foi possível identificar a duração.'
+              );
+            } catch (noteErr) {
+              console.error(
+                `Erro ao criar journal na tarefa #${issueId}:`,
+                noteErr.response?.data || noteErr.message
+              );
+              await notifyAttention(
+                `redmine_video_journal_error:${issueId}`,
+                'Erro ao criar journal com duração do vídeo',
+                {
+                  issueId,
+                  fileId: file.id,
+                  fileName: file.name,
+                  duration: videoDuration,
+                  error: noteErr.response?.data || noteErr.message
+                }
+              );
+            }
+          }
+
+          console.log(`Arquivo movido para Treinamentos na tarefa #${issueId}`);
         }
       } catch (err) {
         console.error(
-          `Erro ao mover gravação da tarefa #${issueId}:`,
+          `Erro ao mover arquivo da tarefa #${issueId}:`,
           err.response?.data || err.message
         );
         await notifyAttention(
           `drive_recording_move_error:${issueId}`,
-          'Erro ao mover gravação no Google Drive',
+          'Erro ao mover arquivo no Google Drive',
           { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
         );
       }
