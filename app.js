@@ -296,12 +296,11 @@ async function initWhatsApp() {
 // ---------------------------------------------------------
 // REDIS / CACHE LOCAL
 // ---------------------------------------------------------
-const redis = REDIS_URL
-  ? new Redis(REDIS_URL, {
-      maxRetriesPerRequest: 1,
-      enableReadyCheck: false
-    })
-  : null;
+const redis = new Redis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+  lazyConnect: true
+});
 
 const memory = {
   values: new Map(),
@@ -1485,7 +1484,7 @@ async function getOrCreateFolder(drive, name, parentId) {
 
   const res = await drive.files.list({
     q: query,
-    fields: 'files(id)'
+    fields: 'files(id, name, mimeType, parents, webViewLink, videoMediaMetadata(durationMillis))'
   });
 
   const found = res.data.files || res.data.items || [];
@@ -1637,6 +1636,14 @@ async function processMeetRecordings() {
 
       const issueId = match[1];
 
+      const isVideo =
+  file.mimeType?.startsWith('video/') ||
+  Boolean(file.videoMediaMetadata?.durationMillis);
+
+if (!isVideo) {
+  console.log(`[DRIVE] Arquivo movido sem journal, pois não é vídeo: ${file.name}`);
+}
+
       try {
         const issue = await fetchIssueDetails(issueId);
         const structure = await getOrCreateClientFolderStructure(issue);
@@ -1659,15 +1666,25 @@ async function processMeetRecordings() {
           file.videoMediaMetadata?.durationMillis
         );
 
-        const note = [
-          `Gravação do Google Meet movida para a pasta Treinamentos.`,
-          ``,
-          `Arquivo: ${file.name}`,
-          `Duração do vídeo: ${durationText}`,
-          file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
-        ].filter(Boolean).join('\n');
+        const isVideo =
+  file.mimeType?.startsWith('video/') ||
+  Boolean(file.videoMediaMetadata?.durationMillis);
 
-        await addRedmineJournalNote(issueId, note);
+if (isVideo) {
+  const durationText = formatDurationFromMillis(
+    file.videoMediaMetadata?.durationMillis
+  );
+
+  const note = [
+    `Gravação do Google Meet movida para a pasta Treinamentos.`,
+    ``,
+    `Arquivo: ${file.name}`,
+    `Duração do vídeo: ${durationText}`,
+    file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
+  ].filter(Boolean).join('\n');
+
+  await addRedmineJournalNote(issueId, note);
+}
 
       } catch (err) {
         console.error(`[DRIVE] Erro ao mover ${file.name}:`, err.response?.data || err.message);
