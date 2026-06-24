@@ -1274,11 +1274,10 @@ function extractMeetLink(event) {
   );
 }
 
-async function deleteGoogleMeet(issueId) {
+async function deleteGoogleMeet(issueId, issue = null) {
   if (!googleCalendarIsConfigured()) return;
 
   const calendar = getGoogleCalendarClient();
-
   let eventId = await redisGet(`redmine:meet:event:${issueId}`);
 
   try {
@@ -1295,15 +1294,16 @@ async function deleteGoogleMeet(issueId) {
 
       console.log(`Google Meet removido da tarefa #${issueId}`);
     }
+
+    if (issue && getCustomFieldValue(issue, 'Google Meet')) {
+      await updateRedmineCustomField(issue, 'Google Meet', '');
+      console.log(`Campo Google Meet limpo na tarefa #${issueId}`);
+    }
+
   } catch (error) {
     console.error(
       `Erro ao excluir Meet da tarefa #${issueId}:`,
       error.response?.data || error.message
-    );
-    await notifyAttention(
-      `meet_delete_error:${issueId}`,
-      'Erro ao excluir evento do Google Meet',
-      { issueId, error: error.response?.data || error.message }
     );
   } finally {
     await redisDel(`redmine:meet:event:${issueId}`);
@@ -1328,7 +1328,7 @@ async function processGoogleMeet(issue) {
 
     if (hasKnownMeet) {
       console.log(`[MEET] Removendo Meet inválido da tarefa #${issue.id}`);
-      await deleteGoogleMeet(issue.id);
+      await deleteGoogleMeet(issue.id, issue);
     }
 
     return;
@@ -1683,7 +1683,13 @@ if (isVideo) {
     file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
   ].filter(Boolean).join('\n');
 
+  const isVideo =
+  file.mimeType?.startsWith('video/') ||
+  Boolean(file.videoMediaMetadata?.durationMillis);
+
+if (isVideo) {
   await addRedmineJournalNote(issueId, note);
+}
 }
 
       } catch (err) {
