@@ -1335,8 +1335,6 @@ async function processGoogleMeet(issue) {
     return;
   }
 
-  console.log(`[MEET] Sincronizando tarefa #${issue.id}`);
-
   const startDate = appointment.dateTime;
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
 
@@ -1356,9 +1354,25 @@ async function processGoogleMeet(issue) {
   const signatureKey = `redmine:meet:signature:${issue.id}`;
   const oldSignature = await redisGet(signatureKey);
 
-  const calendar = getGoogleCalendarClient();
-
   let eventId = await redisGet(`redmine:meet:event:${issue.id}`);
+
+  // Otimização: se já existe evento salvo e a assinatura não mudou,
+  // não consulta o Google Calendar novamente.
+  if (eventId && oldSignature === signature) {
+    const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
+
+    if (
+      meetLink &&
+      getCustomFieldValue(issue, 'Google Meet') !== meetLink
+    ) {
+      await updateRedmineCustomField(issue, 'Google Meet', meetLink);
+      console.log(`Campo Google Meet restaurado na tarefa #${issue.id}`);
+    }
+
+    return;
+  }
+
+  const calendar = getGoogleCalendarClient();
   let event = null;
 
   if (eventId) {
@@ -1377,19 +1391,6 @@ async function processGoogleMeet(issue) {
   if (!eventId) {
     event = await findGoogleEventForIssue(calendar, issue.id);
     eventId = event?.id || null;
-  }
-
-  if (eventId && oldSignature === signature) {
-    const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
-
-    if (
-      meetLink &&
-      getCustomFieldValue(issue, 'Google Meet') !== meetLink
-    ) {
-      await updateRedmineCustomField(issue, 'Google Meet', meetLink);
-    }
-
-    return;
   }
 
   const requestBody = {
@@ -1605,14 +1606,15 @@ async function addRedmineJournalNote(issueId, note) {
 }
 async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) {
-    console.log('[DRIVE] Não executou: falta GOOGLE_DRIVE_RECORDINGS_FOLDER_ID ou Google não configurado.');
+    // Log detalhado removido: essa rotina roda a cada 5 minutos.
     return;
   }
 
   try {
     const drive = getGoogleDriveClient();
 
-    console.log('[DRIVE] Verificando pasta de gravações:', GOOGLE_DRIVE_RECORDINGS_FOLDER_ID);
+    // Log detalhado removido:
+    // console.log('[DRIVE] Verificando pasta de gravações:', GOOGLE_DRIVE_RECORDINGS_FOLDER_ID);
 
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
@@ -1621,24 +1623,21 @@ async function processMeetRecordings() {
 
     const files = res.data.files || [];
 
-    console.log('[DRIVE] Arquivos encontrados:', files.map(f => ({
-      id: f.id,
-      name: f.name
-    })));
+    // Log detalhado removido:
+    // console.log('[DRIVE] Arquivos encontrados:', files.map(f => ({ id: f.id, name: f.name })));
 
     for (const file of files) {
       const match = file.name.match(/#(\d+)/);
 
       if (!match) {
-        console.log(`[DRIVE] Ignorado sem número da tarefa no nome: ${file.name}`);
+        // Log detalhado removido para evitar ruído com arquivos sem identificação.
+        // console.log(`[DRIVE] Ignorado sem número da tarefa no nome: ${file.name}`);
         continue;
       }
 
       const issueId = match[1];
 
       try {
-        console.log(`[DRIVE] Processando arquivo ${file.name} para tarefa #${issueId}`);
-
         const issue = await fetchIssueDetails(issueId);
         const structure = await getOrCreateClientFolderStructure(issue);
 
@@ -1655,19 +1654,20 @@ async function processMeetRecordings() {
         });
 
         console.log(`[DRIVE] Arquivo movido com sucesso: ${file.name} → Treinamentos`);
-      const durationText = formatDurationFromMillis(
-  file.videoMediaMetadata?.durationMillis
-);
 
-const note = [
-  `Gravação do Google Meet movida para a pasta Treinamentos.`,
-  ``,
-  `Arquivo: ${file.name}`,
-  `Duração do vídeo: ${durationText}`,
-  file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
-].filter(Boolean).join('\n');
+        const durationText = formatDurationFromMillis(
+          file.videoMediaMetadata?.durationMillis
+        );
 
-await addRedmineJournalNote(issueId, note);
+        const note = [
+          `Gravação do Google Meet movida para a pasta Treinamentos.`,
+          ``,
+          `Arquivo: ${file.name}`,
+          `Duração do vídeo: ${durationText}`,
+          file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
+        ].filter(Boolean).join('\n');
+
+        await addRedmineJournalNote(issueId, note);
 
       } catch (err) {
         console.error(`[DRIVE] Erro ao mover ${file.name}:`, err.response?.data || err.message);
@@ -1806,20 +1806,21 @@ async function pollingRedmineIssues() {
     return;
   }
 
+  const startedAt = Date.now();
+  const stats = {
+    fetched: 0,
+    processed: 0,
+    errors: 0
+  };
+
   try {
     const limit = Math.max(Number(POLLING_LIMIT) || 20, 100);
-
     const issues = await fetchRecentIssuesPage(0, limit);
 
-    console.log(
-      '[POLLING] Tarefas retornadas pelo Redmine:',
-      issues.map(i => ({
-        id: i.id,
-        status: i.status?.name,
-        assigned_to: i.assigned_to?.name || null,
-        updated_on: i.updated_on
-      }))
-    );
+    stats.fetched = issues.length;
+
+    // Logs detalhados removidos para reduzir ruído:
+    // console.log('[POLLING] Tarefas retornadas pelo Redmine:', issues.map(...));
 
     for (const issueSummary of issues) {
       try {
@@ -1830,42 +1831,19 @@ async function pollingRedmineIssues() {
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
 
-        console.log(
-          `[POLLING] Processando tarefa #${issue.id}`,
-          {
-            status: issue.status?.name,
-            assigned_to: issue.assigned_to?.name || issue.assignee?.name || null,
-            shouldNotify: shouldNotifyStandardStatus(issue),
-            isMeetStatus: isStrictMeetStatus(issue),
-            start_date: issue.start_date || null,
-            due_date: issue.due_date || null,
-            horario: getCustomFieldValue(issue, ALERT_FIELD_NAME),
-            estimated_hours: issue.estimated_hours || null
-          }
-        );
+        stats.processed += 1;
+
+        // Log detalhado removido para evitar excesso:
+        // console.log(`[POLLING] Processando tarefa #${issue.id}`, {...});
 
         await processGoogleMeet(issueWithUrl);
 
         const lastJournal = getLastJournal(issueWithUrl);
 
-        const eventKey = getEventKey(
-          issueWithUrl,
-          'Polling',
-          lastJournal
-        );
-
-        const alreadyNotified = await wasAlreadyNotified(eventKey);
-
-        console.log(
-          `[NOTIFY] Diagnóstico #${issue.id}`,
-          {
-            eventKey,
-            alreadyNotified,
-            lastJournalId: lastJournal?.id || null,
-            shouldNotify: shouldNotifyStandardStatus(issueWithUrl),
-            isMeetStatus: isStrictMeetStatus(issueWithUrl)
-          }
-        );
+        // Diagnóstico removido após validação:
+        // const eventKey = getEventKey(issueWithUrl, 'Polling', lastJournal);
+        // const alreadyNotified = await wasAlreadyNotified(eventKey);
+        // console.log(`[NOTIFY] Diagnóstico #${issue.id}`, {...});
 
         await processIssueNotification(
           issueWithUrl,
@@ -1875,6 +1853,8 @@ async function pollingRedmineIssues() {
         );
 
       } catch (err) {
+        stats.errors += 1;
+
         if (err.response?.status === 404) {
           await deleteGoogleMeet(issueSummary.id);
         } else {
@@ -1893,6 +1873,12 @@ async function pollingRedmineIssues() {
           );
         }
       }
+    }
+
+    if (stats.errors > 0) {
+      console.log(
+        `[POLLING] Concluído com erro(s): buscadas=${stats.fetched}, processadas=${stats.processed}, erros=${stats.errors}, tempoMs=${Date.now() - startedAt}`
+      );
     }
   } catch (error) {
     console.error(
@@ -2614,7 +2600,6 @@ app.listen(PORT, () => {
   console.log('[POLLING] Intervalo registrado.');
 
   setInterval(() => {
-    console.log('[POLLING] Disparando polling automático.');
     pollingRedmineIssues().catch(err => {
       console.error('[POLLING] Erro no intervalo:', err.response?.data || err.message);
     });
@@ -2645,7 +2630,6 @@ app.listen(PORT, () => {
   }, 5 * 60 * 1000);
 
   setTimeout(() => {
-    console.log('[POLLING] Primeira execução.');
     pollingRedmineIssues().catch(err => {
       console.error('[POLLING] Erro primeira execução:', err.response?.data || err.message);
     });
