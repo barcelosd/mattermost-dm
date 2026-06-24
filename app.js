@@ -2476,6 +2476,32 @@ app.get('/debug-google', async (req, res) => {
   }
 });
 
+app.get('/debug-mattermost/:id', async (req, res) => {
+  try {
+    const issue = await fetchIssueDetails(req.params.id);
+    const targets = await getResponsibleTargets(issue);
+    const lastJournal = getLastJournal(issue);
+    const eventKey = getEventKey(issue, 'Debug', lastJournal);
+    const alreadyNotified = await wasAlreadyNotified(eventKey);
+
+    res.json({
+      issue: issue.id,
+      status: issue.status?.name,
+      shouldNotifyStandardStatus: shouldNotifyStandardStatus(issue),
+      isStrictMeetStatus: isStrictMeetStatus(issue),
+      assignedTo: issue.assigned_to || issue.assignee || null,
+      targets,
+      eventKey,
+      alreadyNotified
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
   console.log('Configuração carregada:', {
