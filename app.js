@@ -2579,33 +2579,13 @@ app.get('/debug-notify/:id', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Servidor rodando com sucesso na porta ${PORT}`);
-  console.log('Configuração carregada:', {
-    timezone: TZ,
-    pollingEnabled: POLLING_ENABLED,
-    pollingIntervalSeconds: Number(POLLING_INTERVAL_SECONDS),
-    alertPollingIntervalSeconds: Number(ALERT_POLLING_INTERVAL_SECONDS),
-    alertFieldName: ALERT_FIELD_NAME,
-    meetStatusName: MEET_STATUS_NAME,
-    whatsappAlertMinutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
-    clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
-    clientSummaryTime: CLIENT_SUMMARY_TIME,
-    whatsappGroupFieldName: WHATSAPP_GROUP_FIELD_NAME,
-    whatsappDebugLogs: WHATSAPP_DEBUG_LOGS,
-    whatsappAuthDir: WA_AUTH_DIR,
-    errorNotificationEnabled: ERROR_NOTIFICATION_ENABLED,
-    errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
-    errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
-  });
-
-  app.get('/debug-drive', async (req, res) => {
+app.get('/debug-polling-now', async (req, res) => {
   try {
-    await processMeetRecordings();
+    await pollingRedmineIssues();
 
     res.json({
       success: true,
-      message: 'Verificação do Drive executada. Veja os logs do Render.'
+      message: 'Polling executado manualmente. Veja os logs do Render.'
     });
   } catch (err) {
     res.status(500).json({
@@ -2615,36 +2595,59 @@ app.listen(PORT, () => {
   }
 });
 
-  (async () => {
-    await backfillGoogleMeetIssues();
-// lastPollingTimestamp = Date.now();  // remover/comentar
-    await pollingRedmineIssues();
-    await pollingAppointmentAlerts();
-    await processDailySummary();
-    await processClientMorningSummary();
-    await processMeetRecordings();
+app.listen(PORT, () => {
+  console.log(`Servidor rodando com sucesso na porta ${PORT}`);
 
-    setInterval(
-      pollingRedmineIssues,
-      Number(POLLING_INTERVAL_SECONDS) * 1000
-    );
-
-    setInterval(
-      pollingAppointmentAlerts,
-      Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000
-    );
-
-    setInterval(processDailySummary, 60 * 1000);
-
-    setInterval(processClientMorningSummary, 60 * 1000);
-
-    setInterval(processMeetRecordings, 5 * 60 * 1000);
-  })().catch(async (error) => {
-    console.error('Erro ao iniciar rotinas agendadas:', error?.response?.data || error.message);
-    await notifyAttention(
-      'scheduler_startup_error',
-      'Erro ao iniciar rotinas agendadas',
-      error?.response?.data || error.message
-    );
+  console.log('Configuração carregada:', {
+    pollingEnabled: POLLING_ENABLED,
+    pollingIntervalSeconds: Number(POLLING_INTERVAL_SECONDS),
+    pollingLimit: Number(POLLING_LIMIT),
+    notifyStatuses: NOTIFY_STATUSES,
+    meetStatusName: MEET_STATUS_NAME
   });
+
+  if (POLLING_ENABLED !== 'true') {
+    console.log('[POLLING] Não iniciado: POLLING_ENABLED diferente de true.');
+    return;
+  }
+
+  console.log('[POLLING] Intervalo registrado.');
+
+  setInterval(() => {
+    console.log('[POLLING] Disparando polling automático.');
+    pollingRedmineIssues().catch(err => {
+      console.error('[POLLING] Erro no intervalo:', err.response?.data || err.message);
+    });
+  }, Number(POLLING_INTERVAL_SECONDS) * 1000);
+
+  setInterval(() => {
+    pollingAppointmentAlerts().catch(err => {
+      console.error('[ALERTAS] Erro no intervalo:', err.response?.data || err.message);
+    });
+  }, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
+
+  setInterval(() => {
+    processDailySummary().catch(err => {
+      console.error('[SUMMARY] Erro:', err.response?.data || err.message);
+    });
+  }, 60 * 1000);
+
+  setInterval(() => {
+    processClientMorningSummary().catch(err => {
+      console.error('[WHATSAPP SUMMARY] Erro:', err.response?.data || err.message);
+    });
+  }, 60 * 1000);
+
+  setInterval(() => {
+    processMeetRecordings().catch(err => {
+      console.error('[DRIVE] Erro:', err.response?.data || err.message);
+    });
+  }, 5 * 60 * 1000);
+
+  setTimeout(() => {
+    console.log('[POLLING] Primeira execução.');
+    pollingRedmineIssues().catch(err => {
+      console.error('[POLLING] Erro primeira execução:', err.response?.data || err.message);
+    });
+  }, 10000);
 });
