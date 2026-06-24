@@ -1606,7 +1606,34 @@ async function getOrCreateClientFolderStructure(issue) {
     return null;
   }
 }
+function formatDurationFromMillis(durationMillis) {
+  if (!durationMillis) return 'não informado';
 
+  const totalSeconds = Math.round(Number(durationMillis) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, '0')}min ${String(seconds).padStart(2, '0')}s`;
+  }
+
+  return `${minutes}min ${String(seconds).padStart(2, '0')}s`;
+}
+
+async function addRedmineJournalNote(issueId, note) {
+  await axios.put(
+    `${REDMINE_URL}/issues/${issueId}.json`,
+    {
+      issue: {
+        notes: note
+      }
+    },
+    { headers: redmineHeaders }
+  );
+
+  console.log(`[REDMINE] Journal criado na tarefa #${issueId}`);
+}
 async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) {
     console.log('[DRIVE] Não executou: falta GOOGLE_DRIVE_RECORDINGS_FOLDER_ID ou Google não configurado.');
@@ -1620,7 +1647,7 @@ async function processMeetRecordings() {
 
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name, parents)'
+      fields: 'files(id, name, parents, webViewLink, videoMediaMetadata(durationMillis))'
     });
 
     const files = res.data.files || [];
@@ -1659,6 +1686,19 @@ async function processMeetRecordings() {
         });
 
         console.log(`[DRIVE] Arquivo movido com sucesso: ${file.name} → Treinamentos`);
+      const durationText = formatDurationFromMillis(
+  file.videoMediaMetadata?.durationMillis
+);
+
+const note = [
+  `Gravação do Google Meet movida para a pasta Treinamentos.`,
+  ``,
+  `Arquivo: ${file.name}`,
+  `Duração do vídeo: ${durationText}`,
+  file.webViewLink ? `Link do arquivo: ${file.webViewLink}` : null
+].filter(Boolean).join('\n');
+
+await addRedmineJournalNote(issueId, note);
 
       } catch (err) {
         console.error(`[DRIVE] Erro ao mover ${file.name}:`, err.response?.data || err.message);
