@@ -2476,23 +2476,22 @@ app.get('/debug-google', async (req, res) => {
   }
 });
 
-app.get('/debug-mattermost/:id', async (req, res) => {
+app.get('/debug-send-mattermost/:id', async (req, res) => {
   try {
     const issue = await fetchIssueDetails(req.params.id);
     const targets = await getResponsibleTargets(issue);
-    const lastJournal = getLastJournal(issue);
-    const eventKey = getEventKey(issue, 'Debug', lastJournal);
-    const alreadyNotified = await wasAlreadyNotified(eventKey);
+
+    await notifyTargets(
+      targets,
+      buildNotificationMessage(issue, 'Teste manual', 'Debug')
+    );
 
     res.json({
+      success: true,
       issue: issue.id,
       status: issue.status?.name,
-      shouldNotifyStandardStatus: shouldNotifyStandardStatus(issue),
-      isStrictMeetStatus: isStrictMeetStatus(issue),
       assignedTo: issue.assigned_to || issue.assignee || null,
-      targets,
-      eventKey,
-      alreadyNotified
+      targets
     });
   } catch (err) {
     res.status(500).json({
