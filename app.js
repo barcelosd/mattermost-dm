@@ -1844,11 +1844,7 @@ const maxUpdatedAt = null;
       }
     }
 
-    lastPollingTimestamp = getNextPollingTimestamp(
-      lastPollingTimestamp,
-      pollStartedAt,
-      maxUpdatedAt
-    );
+    ;
   } catch (error) {
     console.error('Erro geral no polling:', error.response?.data || error.message);
     await notifyAttention(
