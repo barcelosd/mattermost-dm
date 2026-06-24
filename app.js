@@ -1805,7 +1805,8 @@ async function pollingRedmineIssues() {
 
   try {
     const pollStartedAt = Date.now();
-    const { issues, maxUpdatedAt } = await fetchRecentIssuesSince(lastPollingTimestamp);
+    const issues = await fetchRecentIssuesPage(0, Number(POLLING_LIMIT));
+const maxUpdatedAt = null;
 
     for (const issueSummary of issues) {
       try {
@@ -2567,7 +2568,6 @@ app.listen(PORT, () => {
 });
 
   (async () => {
-    await backfillGoogleMeetIssues();
     await backfillGoogleMeetIssues();
 // lastPollingTimestamp = Date.now();  // remover/comentar
     await pollingRedmineIssues();
