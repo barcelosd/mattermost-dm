@@ -1315,62 +1315,27 @@ async function deleteGoogleMeet(issueId) {
 }
 
 async function processGoogleMeet(issue) {
-
-  console.log(
-
-    `[MEET] Processando #${issue.id}`,
-
-    {
-
-      status: issue.status?.name,
-
-      start_date: issue.start_date,
-
-      due_date: issue.due_date,
-
-      horario: getCustomFieldValue(issue, ALERT_FIELD_NAME),
-
-      estimated_hours: issue.estimated_hours
-
-    }
-
-  );
-  if (!googleCalendarIsConfigured()) {
-  console.log('[MEET] Google Calendar não configurado');
-  return;
-}
-
-app.get('/debug-google', async (req, res) => {
-  try {
-    const calendar = getGoogleCalendarClient();
-
-    const result = await calendar.calendarList.list();
-
-    res.json({
-      success: true,
-      calendars: result.data.items.map(c => ({
-        id: c.id,
-        summary: c.summary
-      }))
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.response?.data || err.message
-    });
-  }
-});
-
+  if (!googleCalendarIsConfigured()) return;
 
   const isMeet = isStrictMeetStatus(issue);
   const appointment = parseAppointmentDateTime(issue);
   const estimatedMinutes = getEstimatedMinutes(issue);
 
   if (!isMeet || !appointment || !estimatedMinutes) {
-    await deleteGoogleMeet(issue.id);
+    const hasKnownMeet =
+      await redisGet(`redmine:meet:event:${issue.id}`) ||
+      await redisGet(`redmine:meet:link:${issue.id}`) ||
+      getCustomFieldValue(issue, 'Google Meet');
+
+    if (hasKnownMeet) {
+      console.log(`[MEET] Removendo Meet inválido da tarefa #${issue.id}`);
+      await deleteGoogleMeet(issue.id);
+    }
+
     return;
   }
+
+  console.log(`[MEET] Sincronizando tarefa #${issue.id}`);
 
   const startDate = appointment.dateTime;
   const endDate = new Date(startDate.getTime() + estimatedMinutes * 60000);
@@ -1379,7 +1344,8 @@ app.get('/debug-google', async (req, res) => {
 
   await getOrCreateClientFolderStructure(issue).catch(() => {});
 
-  const summary = `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
+  const summary =
+    `#${issue.id} - ${projectName} - ${issue.subject} - ${appointment.timeLabel}`;
 
   const signature = JSON.stringify({
     summary,
@@ -1388,7 +1354,6 @@ app.get('/debug-google', async (req, res) => {
   });
 
   const signatureKey = `redmine:meet:signature:${issue.id}`;
-
   const oldSignature = await redisGet(signatureKey);
 
   const calendar = getGoogleCalendarClient();
@@ -1455,6 +1420,8 @@ app.get('/debug-google', async (req, res) => {
       });
 
       event = response.data;
+      console.log(`Google Meet atualizado para tarefa #${issue.id}`);
+
     } else {
       const response = await calendar.events.insert({
         calendarId: GOOGLE_CALENDAR_ID,
@@ -1473,6 +1440,7 @@ app.get('/debug-google', async (req, res) => {
       });
 
       event = response.data;
+      console.log(`Google Meet criado para tarefa #${issue.id}`);
     }
 
     const meetLink = extractMeetLink(event);
@@ -1492,6 +1460,7 @@ app.get('/debug-google', async (req, res) => {
       `Erro ao sincronizar Google Meet da tarefa #${issue.id}:`,
       error.response?.data || error.message
     );
+
     await notifyAttention(
       `meet_sync_error:${issue.id}`,
       'Erro ao sincronizar Google Meet',
@@ -1780,9 +1749,18 @@ async function backfillGoogleMeetIssues() {
 
     if (!page.length) break;
 
-    issues.push(
-      ...page.filter(issueSummary => isStrictMeetStatus(issueSummary))
-    );
+  issues.push(
+  ...page.filter(issueSummary => {
+    if (!isStrictMeetStatus(issueSummary)) return false;
+
+    const date = issueSummary.start_date || issueSummary.due_date;
+    if (!date) return false;
+
+    const today = dayjs().tz(TZ).format('YYYY-MM-DD');
+
+    return date >= today;
+  })
+);
 
     if (page.length < pageLimit) break;
   }
