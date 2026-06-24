@@ -2501,6 +2501,35 @@ app.get('/debug-send-mattermost/:id', async (req, res) => {
   }
 });
 
+app.get('/debug-notify/:id', async (req, res) => {
+  try {
+    const issue = await fetchIssueDetails(req.params.id);
+
+    const lastJournal = getLastJournal(issue);
+
+    const eventKey = getEventKey(
+      issue,
+      'Polling',
+      lastJournal
+    );
+
+    res.json({
+      issue: issue.id,
+      status: issue.status?.name,
+      shouldNotify: shouldNotifyStandardStatus(issue),
+      isMeetStatus: isStrictMeetStatus(issue),
+      eventKey,
+      alreadyNotified: await wasAlreadyNotified(eventKey),
+      lastJournalId: lastJournal?.id || null
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.response?.data || err.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
   console.log('Configuração carregada:', {
