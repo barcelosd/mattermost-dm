@@ -1801,12 +1801,25 @@ async function backfillGoogleMeetIssues() {
 }
 
 async function pollingRedmineIssues() {
-  if (POLLING_ENABLED !== 'true') return;
+  if (POLLING_ENABLED !== 'true') {
+    console.log('[POLLING] Ignorado: POLLING_ENABLED não está true.');
+    return;
+  }
 
   try {
-    const pollStartedAt = Date.now();
-    const issues = await fetchRecentIssuesPage(0, Number(POLLING_LIMIT));
-const maxUpdatedAt = null;
+    const limit = Math.max(Number(POLLING_LIMIT) || 20, 100);
+
+    const issues = await fetchRecentIssuesPage(0, limit);
+
+    console.log(
+      '[POLLING] Tarefas retornadas pelo Redmine:',
+      issues.map(i => ({
+        id: i.id,
+        status: i.status?.name,
+        assigned_to: i.assigned_to?.name || null,
+        updated_on: i.updated_on
+      }))
+    );
 
     for (const issueSummary of issues) {
       try {
@@ -1817,9 +1830,42 @@ const maxUpdatedAt = null;
           url: `${REDMINE_URL}/issues/${issue.id}`
         };
 
+        console.log(
+          `[POLLING] Processando tarefa #${issue.id}`,
+          {
+            status: issue.status?.name,
+            assigned_to: issue.assigned_to?.name || issue.assignee?.name || null,
+            shouldNotify: shouldNotifyStandardStatus(issue),
+            isMeetStatus: isStrictMeetStatus(issue),
+            start_date: issue.start_date || null,
+            due_date: issue.due_date || null,
+            horario: getCustomFieldValue(issue, ALERT_FIELD_NAME),
+            estimated_hours: issue.estimated_hours || null
+          }
+        );
+
         await processGoogleMeet(issueWithUrl);
 
         const lastJournal = getLastJournal(issueWithUrl);
+
+        const eventKey = getEventKey(
+          issueWithUrl,
+          'Polling',
+          lastJournal
+        );
+
+        const alreadyNotified = await wasAlreadyNotified(eventKey);
+
+        console.log(
+          `[NOTIFY] Diagnóstico #${issue.id}`,
+          {
+            eventKey,
+            alreadyNotified,
+            lastJournalId: lastJournal?.id || null,
+            shouldNotify: shouldNotifyStandardStatus(issueWithUrl),
+            isMeetStatus: isStrictMeetStatus(issueWithUrl)
+          }
+        );
 
         await processIssueNotification(
           issueWithUrl,
@@ -1827,6 +1873,7 @@ const maxUpdatedAt = null;
           'Polling',
           lastJournal
         );
+
       } catch (err) {
         if (err.response?.status === 404) {
           await deleteGoogleMeet(issueSummary.id);
@@ -1835,18 +1882,24 @@ const maxUpdatedAt = null;
             `Erro no polling da tarefa #${issueSummary.id}:`,
             err.response?.data || err.message
           );
+
           await notifyAttention(
             `polling_issue_error:${issueSummary.id}`,
             'Erro no polling de tarefa do Redmine',
-            { issueId: issueSummary.id, error: err.response?.data || err.message }
+            {
+              issueId: issueSummary.id,
+              error: err.response?.data || err.message
+            }
           );
         }
       }
     }
-
-    ;
   } catch (error) {
-    console.error('Erro geral no polling:', error.response?.data || error.message);
+    console.error(
+      'Erro geral no polling:',
+      error.response?.data || error.message
+    );
+
     await notifyAttention(
       'polling_general_error',
       'Erro geral no polling do Redmine',
@@ -1854,7 +1907,6 @@ const maxUpdatedAt = null;
     );
   }
 }
-
 async function fetchIssuesByDate(dateStr) {
   async function fetchByField(field) {
     const response = await axios.get(`${REDMINE_URL}/issues.json`, {
