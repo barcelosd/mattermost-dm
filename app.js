@@ -2035,7 +2035,13 @@ async function pollingAppointmentAlerts() {
       }
     }
 
-    logWhatsAppDebug(`[Alertas] Resumo ${today}:`, stats);
+    if (
+  stats.sentMattermost > 0 ||
+  stats.sentWhatsapp > 0 ||
+  stats.errors > 0
+) {
+  console.log(`[Alertas] ${today}`, stats);
+}
   } catch (error) {
     console.error(
       'Erro geral no polling de alertas:',
