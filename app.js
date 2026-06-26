@@ -680,9 +680,16 @@ async function ensureCalendarEvent(issue) {
     return;
   }
 
+  // Só removemos evento quando a issue foi carregada com detalhes suficientes.
+  // A listagem do Redmine pode vir sem campos customizados em alguns ambientes.
+  const hasCustomFieldsArray = Array.isArray(issue.custom_fields);
   const signature = getCalendarSignature(issue);
 
   if (!signature) {
+    if (!hasCustomFieldsArray) {
+      console.warn(`[GOOGLE] Issue #${issue.id} sem custom_fields no payload; não vou excluir evento para evitar remoção indevida.`);
+      return;
+    }
     await clearCalendarEvent(issue, 'faltam requisitos: status Aguardando Data, Horário ou Tempo estimado');
     return;
   }
@@ -776,6 +783,15 @@ async function fetchRecentIssues(params = {}) {
   return response.data.issues || [];
 }
 
+async function fetchIssueById(issueId) {
+  const response = await redmine.get(`/issues/${issueId}.json`, {
+    params: {
+      include: 'journals'
+    }
+  });
+  return response.data.issue;
+}
+
 function getLastJournalUpdatedAt(issue) {
   const journalDates = (issue.journals || [])
     .map(j => dayjs(j.created_on || j.updated_on))
@@ -803,25 +819,41 @@ async function fetchChangedIssuesForCalendar() {
     }
   }
 
-  let issues;
+  let issueSummaries;
+  const dateFilter = `>=${since.tz(TZ).format('YYYY-MM-DD')}`;
+
   try {
-    issues = await fetchRecentIssues({
+    // O Redmine costuma aceitar filtro de data, mas não ISO com hora.
+    // Por isso usamos YYYY-MM-DD e filtramos a hora exata localmente pelos journals/updated_on.
+    issueSummaries = await fetchRecentIssues({
       status_id: '*',
-      updated_on: `>=${since.toISOString()}`
+      updated_on: dateFilter
     });
   } catch (err) {
     console.warn('[REDMINE] Filtro updated_on não aceito; usando últimas tarefas alteradas.', err.response?.data || err.message);
-    issues = await fetchRecentIssues({ status_id: '*' });
+    issueSummaries = await fetchRecentIssues({ status_id: '*' });
+  }
+
+  const changedSummaries = issueSummaries.filter(issue => {
+    const lastJournal = getLastJournalUpdatedAt(issue);
+    const updated = dayjs(issue.updated_on);
+    if (!lastJournal && !updated.isValid()) return true;
+    return (lastJournal && lastJournal.isAfter(since)) || (updated.isValid() && updated.isAfter(since));
+  });
+
+  const detailedIssues = [];
+  for (const issue of changedSummaries) {
+    try {
+      detailedIssues.push(await fetchIssueById(issue.id));
+    } catch (err) {
+      console.warn(`[REDMINE] Não consegui carregar detalhes da issue #${issue.id}; pulando sync do calendário.`, err.response?.data || err.message);
+    }
   }
 
   const nowIso = dayjs().toISOString();
   if (redis) await redis.set(redisKey, nowIso, 'EX', 7 * 24 * 60 * 60);
 
-  return issues.filter(issue => {
-    const lastJournal = getLastJournalUpdatedAt(issue);
-    if (!lastJournal) return true;
-    return lastJournal.isAfter(since) || dayjs(issue.updated_on).isAfter(since);
-  });
+  return detailedIssues;
 }
 
 async function pollingRedmineIssues() {
