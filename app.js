@@ -15,6 +15,8 @@ const {
   DisconnectReason
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -58,6 +60,7 @@ const {
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
   GOOGLE_MEET_FIELD_NAME = 'Google Meet',
 
+  WHATSAPP_AUTH_DIR = './baileys_auth',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
   WHATSAPP_ENABLED = 'true',
   GOOGLE_CALENDAR_ENABLED = 'true',
@@ -455,7 +458,10 @@ async function sendIssueDM(issue, message) {
 async function startWhatsapp() {
   if (String(WHATSAPP_ENABLED).toLowerCase() !== 'true') return;
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('./baileys_auth');
+    const authDir = path.resolve(WHATSAPP_AUTH_DIR || './baileys_auth');
+    fs.mkdirSync(authDir, { recursive: true });
+    console.log(`[WHATSAPP] Usando pasta de autenticação: ${authDir}`);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     sock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
@@ -503,13 +509,13 @@ function getGoogleCalendarClient() {
 
 async function updateIssueCustomField(issue, fieldName, value) {
   const field = getCustomField(issue, fieldName);
-  if (!field?.id || !value) return false;
+  if (!field?.id) return false;
 
   try {
     await redmine.put(`/issues/${issue.id}.json`, {
       issue: {
         custom_fields: [
-          { id: field.id, value }
+          { id: field.id, value: value == null ? '' : String(value) }
         ]
       }
     });
@@ -527,6 +533,140 @@ function getMeetLinkFromCalendarEvent(event) {
     '';
 }
 
+
+function getCalendarRedisKey(issueId) {
+  return `redmine:issue:${issueId}:calendar-event-id`;
+}
+
+function getCalendarSignature(issue) {
+  const status = issue.status?.name || '';
+  const start = parseIssueDateTime(issue);
+  const estimatedHours = Number(issue.estimated_hours);
+  if (!isSameStatus(status, MEET_STATUS_NAME) || !start || !estimatedHours || estimatedHours <= 0) {
+    return '';
+  }
+  return [
+    normalize(status),
+    start.format('YYYY-MM-DDTHH:mm'),
+    Number(estimatedHours).toFixed(2),
+    getIssueDateStr(issue),
+    getIssueTimeStr(issue)
+  ].join('|');
+}
+
+function shouldHaveCalendarEvent(issue) {
+  return Boolean(getCalendarSignature(issue));
+}
+
+async function findCalendarEventForIssue(calendar, issue) {
+  if (!calendar || !GOOGLE_CALENDAR_ID) return null;
+
+  const cachedId = redis ? await redis.get(getCalendarRedisKey(issue.id)) : '';
+  if (cachedId) {
+    try {
+      const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: cachedId });
+      if (event?.data?.status !== 'cancelled') return event.data;
+    } catch (err) {
+      if (err.response?.status !== 404 && err.code !== 404) {
+        console.warn(`[GOOGLE] Não consegui ler evento salvo da issue #${issue.id}:`, err.response?.data || err.message);
+      }
+    }
+  }
+
+  const privateProperty = `redmineIssueId=${issue.id}`;
+  try {
+    const res = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      privateExtendedProperty: privateProperty,
+      singleEvents: true,
+      maxResults: 10,
+      orderBy: 'updated'
+    });
+    const event = (res.data?.items || []).find(e => e.status !== 'cancelled');
+    if (event?.id) {
+      if (redis) await redis.set(getCalendarRedisKey(issue.id), event.id, 'EX', ttlSeconds);
+      return event;
+    }
+  } catch (err) {
+    console.warn(`[GOOGLE] Busca por extendedProperty falhou para issue #${issue.id}:`, err.response?.data || err.message);
+  }
+
+  // Compatibilidade com eventos criados antes dessa correção.
+  try {
+    const res = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      q: `#${issue.id}`,
+      singleEvents: true,
+      maxResults: 10,
+      orderBy: 'updated'
+    });
+    const event = (res.data?.items || []).find(e =>
+      e.status !== 'cancelled' &&
+      (String(e.summary || '').includes(`#${issue.id}`) || String(e.description || '').includes(`/issues/${issue.id}`))
+    );
+    if (event?.id) {
+      if (redis) await redis.set(getCalendarRedisKey(issue.id), event.id, 'EX', ttlSeconds);
+      return event;
+    }
+  } catch (err) {
+    console.warn(`[GOOGLE] Busca textual falhou para issue #${issue.id}:`, err.response?.data || err.message);
+  }
+
+  return null;
+}
+
+async function clearCalendarEvent(issue, reason) {
+  if (String(GOOGLE_CALENDAR_ENABLED).toLowerCase() !== 'true' || !GOOGLE_CALENDAR_ID) return;
+
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) {
+    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não consegui excluir evento.');
+    return;
+  }
+
+  const event = await findCalendarEventForIssue(calendar, issue);
+  if (!event?.id) {
+    const meet = getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
+    if (meet) await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
+    return;
+  }
+
+  try {
+    await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId: event.id });
+    console.log(`[GOOGLE] Evento da issue #${issue.id} excluído (${reason}).`);
+    if (redis) {
+      await redis.del(getCalendarRedisKey(issue.id));
+      await redis.del(`redmine:issue:${issue.id}:calendar-signature`);
+    }
+    await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
+  } catch (err) {
+    if (err.response?.status === 404 || err.code === 404) {
+      if (redis) await redis.del(getCalendarRedisKey(issue.id));
+      await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
+      return;
+    }
+    console.error(`[GOOGLE] Falha ao excluir evento da issue #${issue.id}:`, err.response?.data || err.message);
+  }
+}
+
+function buildCalendarEventRequest(issue, start, estimatedHours) {
+  const end = start.add(estimatedHours, 'hour');
+  const projectName = getCustomValue(issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
+  const summary = `${projectName ? projectName + ' - ' : ''}#${issue.id} ${issue.subject}`;
+
+  return {
+    summary,
+    description: `${formatIssueLine(issue)}`,
+    start: { dateTime: start.toISOString(), timeZone: TZ },
+    end: { dateTime: end.toISOString(), timeZone: TZ },
+    extendedProperties: {
+      private: {
+        redmineIssueId: String(issue.id)
+      }
+    }
+  };
+}
+
 async function ensureCalendarEvent(issue) {
   if (String(GOOGLE_CALENDAR_ENABLED).toLowerCase() !== 'true') return;
   if (!GOOGLE_CALENDAR_ID) {
@@ -534,51 +674,72 @@ async function ensureCalendarEvent(issue) {
     return;
   }
 
-  if (!isSameStatus(issue.status?.name, MEET_STATUS_NAME)) return;
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) {
+    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não sincronizei evento.');
+    return;
+  }
+
+  const signature = getCalendarSignature(issue);
+
+  if (!signature) {
+    await clearCalendarEvent(issue, 'faltam requisitos: status Aguardando Data, Horário ou Tempo estimado');
+    return;
+  }
 
   const start = parseIssueDateTime(issue);
   const estimatedHours = Number(issue.estimated_hours);
-  if (!start) {
-    logSkip(`#${issue.id}`, 'sem data/horário válido para criar Google Calendar. Verifique Início/start_date e campo Horário.');
-    return;
-  }
-  if (!estimatedHours || estimatedHours <= 0) {
-    logSkip(`#${issue.id}`, 'sem Tempo estimado válido para criar Google Calendar.');
-    return;
+  const cachedSignatureKey = `redmine:issue:${issue.id}:calendar-signature`;
+  const cachedSignature = redis ? await redis.get(cachedSignatureKey) : '';
+
+  const existingEvent = await findCalendarEventForIssue(calendar, issue);
+  const eventBody = buildCalendarEventRequest(issue, start, estimatedHours);
+
+  if (existingEvent?.id) {
+    if (cachedSignature === signature) {
+      logSkip(`#${issue.id}`, 'evento do Google Calendar já sincronizado.');
+      return;
+    }
+
+    try {
+      const response = await calendar.events.patch({
+        calendarId: GOOGLE_CALENDAR_ID,
+        eventId: existingEvent.id,
+        conferenceDataVersion: 1,
+        requestBody: eventBody
+      });
+
+      const meetLink = getMeetLinkFromCalendarEvent(response.data) || getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
+      if (meetLink && meetLink !== getCustomValue(issue, GOOGLE_MEET_FIELD_NAME)) {
+        await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
+      }
+
+      if (redis) {
+        await redis.set(getCalendarRedisKey(issue.id), existingEvent.id, 'EX', ttlSeconds);
+        await redis.set(cachedSignatureKey, signature, 'EX', ttlSeconds);
+      }
+
+      console.log(`[GOOGLE] Evento atualizado para issue #${issue.id}: ${start.format('DD/MM/YYYY HH:mm')} (${estimatedHours}h).`);
+      return;
+    } catch (err) {
+      console.error(`[GOOGLE] Falha ao atualizar evento da issue #${issue.id}:`, err.response?.data || err.message);
+      return;
+    }
   }
 
-  const calendar = getGoogleCalendarClient();
-  if (!calendar) {
-    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não marquei como criado para tentar novamente no próximo polling.');
-    return;
-  }
-
-  const existingMeet = getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
-  if (existingMeet) {
-    logSkip(`#${issue.id}`, `campo "${GOOGLE_MEET_FIELD_NAME}" já possui valor; não criarei outro evento.`);
-    return;
-  }
-
-  const key = `redmine:issue:${issue.id}:calendar-created`;
-  const first = await redisSetOnce(key, '1', 15 * 60);
+  const createLockKey = `redmine:issue:${issue.id}:calendar-create-lock`;
+  const first = await redisSetOnce(createLockKey, '1', 5 * 60);
   if (!first) return;
-
-  const end = start.add(estimatedHours, 'hour');
-  const projectName = getCustomValue(issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
-  const summary = `${projectName ? projectName + ' - ' : ''}#${issue.id} ${issue.subject}`;
 
   try {
     const response = await calendar.events.insert({
       calendarId: GOOGLE_CALENDAR_ID,
       conferenceDataVersion: 1,
       requestBody: {
-        summary,
-        description: `${formatIssueLine(issue)}`,
-        start: { dateTime: start.toISOString(), timeZone: TZ },
-        end: { dateTime: end.toISOString(), timeZone: TZ },
+        ...eventBody,
         conferenceData: {
           createRequest: {
-            requestId: `redmine-${issue.id}`,
+            requestId: `redmine-${issue.id}-${Date.now()}`,
             conferenceSolutionKey: { type: 'hangoutsMeet' }
           }
         }
@@ -593,11 +754,13 @@ async function ensureCalendarEvent(issue) {
     }
 
     if (redis) {
-      await redis.set(key, response.data?.id || '1', 'EX', ttlSeconds);
+      await redis.set(getCalendarRedisKey(issue.id), response.data?.id || '1', 'EX', ttlSeconds);
+      await redis.set(cachedSignatureKey, signature, 'EX', ttlSeconds);
+      await redis.del(createLockKey);
     }
   } catch (err) {
     console.error('[GOOGLE] Falha ao criar evento:', err.response?.data || err.message);
-    if (redis) await redis.del(key); // permite nova tentativa se houve falha real
+    if (redis) await redis.del(createLockKey);
   }
 }
 
@@ -611,6 +774,54 @@ async function fetchRecentIssues(params = {}) {
     }
   });
   return response.data.issues || [];
+}
+
+function getLastJournalUpdatedAt(issue) {
+  const journalDates = (issue.journals || [])
+    .map(j => dayjs(j.created_on || j.updated_on))
+    .filter(d => d.isValid());
+
+  if (journalDates.length) {
+    return journalDates.reduce((latest, current) => current.isAfter(latest) ? current : latest);
+  }
+
+  const updated = dayjs(issue.updated_on);
+  return updated.isValid() ? updated : null;
+}
+
+async function fetchChangedIssuesForCalendar() {
+  const minutesBack = Math.max(30, Math.ceil(getDynamicPollingIntervalInSeconds() / 60) + 10);
+  const fallbackSince = dayjs().subtract(minutesBack, 'minute');
+  const redisKey = 'redmine:calendar-sync:last-scan';
+  let since = fallbackSince;
+
+  if (redis) {
+    const cached = await redis.get(redisKey);
+    const parsed = cached ? dayjs(cached) : null;
+    if (parsed?.isValid()) {
+      since = parsed.subtract(2, 'minute'); // margem para fuso/latência
+    }
+  }
+
+  let issues;
+  try {
+    issues = await fetchRecentIssues({
+      status_id: '*',
+      updated_on: `>=${since.toISOString()}`
+    });
+  } catch (err) {
+    console.warn('[REDMINE] Filtro updated_on não aceito; usando últimas tarefas alteradas.', err.response?.data || err.message);
+    issues = await fetchRecentIssues({ status_id: '*' });
+  }
+
+  const nowIso = dayjs().toISOString();
+  if (redis) await redis.set(redisKey, nowIso, 'EX', 7 * 24 * 60 * 60);
+
+  return issues.filter(issue => {
+    const lastJournal = getLastJournalUpdatedAt(issue);
+    if (!lastJournal) return true;
+    return lastJournal.isAfter(since) || dayjs(issue.updated_on).isAfter(since);
+  });
 }
 
 async function pollingRedmineIssues() {
@@ -633,7 +844,10 @@ async function pollingRedmineIssues() {
       }
     }
 
-    // Quando a tarefa já nasce/pré-existe como Aguardando Data, com horário e tempo estimado, cria Calendar/Meet.
+  }
+
+  const changedForCalendar = await fetchChangedIssuesForCalendar();
+  for (const issue of changedForCalendar) {
     await ensureCalendarEvent(issue);
   }
 }
