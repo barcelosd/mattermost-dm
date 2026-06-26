@@ -56,6 +56,7 @@ const {
   GOOGLE_CLIENT_SECRET,
   GOOGLE_REFRESH_TOKEN,
   GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
+  GOOGLE_MEET_FIELD_NAME = 'Google Meet',
 
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
   WHATSAPP_ENABLED = 'true',
@@ -114,7 +115,9 @@ function getCustomValue(issue, name) {
 }
 
 function getIssueDateStr(issue) {
-  return getCustomValue(issue, 'Data') || issue.due_date || '';
+  // No Redmine, a tela mostra "Início", que na API vem como start_date.
+  // Mantemos compatibilidade com campo personalizado "Data" e também due_date.
+  return getCustomValue(issue, 'Data') || issue.start_date || issue.due_date || '';
 }
 
 function getIssueTimeStr(issue) {
@@ -498,30 +501,74 @@ function getGoogleCalendarClient() {
   return google.calendar({ version: 'v3', auth: oauth2 });
 }
 
+async function updateIssueCustomField(issue, fieldName, value) {
+  const field = getCustomField(issue, fieldName);
+  if (!field?.id || !value) return false;
+
+  try {
+    await redmine.put(`/issues/${issue.id}.json`, {
+      issue: {
+        custom_fields: [
+          { id: field.id, value }
+        ]
+      }
+    });
+    console.log(`[REDMINE] Campo "${fieldName}" atualizado na issue #${issue.id}`);
+    return true;
+  } catch (err) {
+    console.error(`[REDMINE] Falha ao atualizar campo "${fieldName}" da issue #${issue.id}:`, err.response?.data || err.message);
+    return false;
+  }
+}
+
+function getMeetLinkFromCalendarEvent(event) {
+  return event?.hangoutLink ||
+    (event?.conferenceData?.entryPoints || []).find(p => p.entryPointType === 'video')?.uri ||
+    '';
+}
+
 async function ensureCalendarEvent(issue) {
   if (String(GOOGLE_CALENDAR_ENABLED).toLowerCase() !== 'true') return;
-  if (!GOOGLE_CALENDAR_ID) return;
-
-  const start = parseIssueDateTime(issue);
-  if (!start || !issue.estimated_hours) return;
-  if (!isSameStatus(issue.status?.name, MEET_STATUS_NAME)) return;
-
-  const key = `redmine:issue:${issue.id}:calendar-created`;
-  const first = await redisSetOnce(key, '1');
-  if (!first) return;
-
-  const calendar = getGoogleCalendarClient();
-  if (!calendar) {
-    console.warn('[GOOGLE] Credenciais do Calendar ausentes.');
+  if (!GOOGLE_CALENDAR_ID) {
+    console.warn('[GOOGLE] GOOGLE_CALENDAR_ID ausente.');
     return;
   }
 
-  const end = start.add(Number(issue.estimated_hours) || 1, 'hour');
+  if (!isSameStatus(issue.status?.name, MEET_STATUS_NAME)) return;
+
+  const start = parseIssueDateTime(issue);
+  const estimatedHours = Number(issue.estimated_hours);
+  if (!start) {
+    logSkip(`#${issue.id}`, 'sem data/horário válido para criar Google Calendar. Verifique Início/start_date e campo Horário.');
+    return;
+  }
+  if (!estimatedHours || estimatedHours <= 0) {
+    logSkip(`#${issue.id}`, 'sem Tempo estimado válido para criar Google Calendar.');
+    return;
+  }
+
+  const calendar = getGoogleCalendarClient();
+  if (!calendar) {
+    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não marquei como criado para tentar novamente no próximo polling.');
+    return;
+  }
+
+  const existingMeet = getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
+  if (existingMeet) {
+    logSkip(`#${issue.id}`, `campo "${GOOGLE_MEET_FIELD_NAME}" já possui valor; não criarei outro evento.`);
+    return;
+  }
+
+  const key = `redmine:issue:${issue.id}:calendar-created`;
+  const first = await redisSetOnce(key, '1', 15 * 60);
+  if (!first) return;
+
+  const end = start.add(estimatedHours, 'hour');
   const projectName = getCustomValue(issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
   const summary = `${projectName ? projectName + ' - ' : ''}#${issue.id} ${issue.subject}`;
 
   try {
-    await calendar.events.insert({
+    const response = await calendar.events.insert({
       calendarId: GOOGLE_CALENDAR_ID,
       conferenceDataVersion: 1,
       requestBody: {
@@ -531,13 +578,23 @@ async function ensureCalendarEvent(issue) {
         end: { dateTime: end.toISOString(), timeZone: TZ },
         conferenceData: {
           createRequest: {
-            requestId: `redmine-${issue.id}-${Date.now()}`,
+            requestId: `redmine-${issue.id}`,
             conferenceSolutionKey: { type: 'hangoutsMeet' }
           }
         }
       }
     });
-    console.log(`[GOOGLE] Evento criado para issue #${issue.id}`);
+
+    const meetLink = getMeetLinkFromCalendarEvent(response.data);
+    console.log(`[GOOGLE] Evento criado para issue #${issue.id}${meetLink ? `: ${meetLink}` : ''}`);
+
+    if (meetLink) {
+      await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
+    }
+
+    if (redis) {
+      await redis.set(key, response.data?.id || '1', 'EX', ttlSeconds);
+    }
   } catch (err) {
     console.error('[GOOGLE] Falha ao criar evento:', err.response?.data || err.message);
     if (redis) await redis.del(key); // permite nova tentativa se houve falha real
