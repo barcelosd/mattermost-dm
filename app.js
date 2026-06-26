@@ -216,42 +216,237 @@ function formatIssueLine(issue) {
   return `#${issue.id} - ${issue.subject}\nStatus: ${issue.status?.name || '-'}\nResponsável: ${assigned}\nLink: ${redmineIssueUrl(issue)}`;
 }
 
-function redmineUserToMattermostUsername(issue) {
-  const loginField = getCustomValue(issue, 'Mattermost') || getCustomValue(issue, 'Usuário Mattermost');
-  if (loginField) return loginField.replace(/^@/, '');
-  const name = issue.assigned_to?.name || '';
-  return name
+function looksLikeEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function normalizeMattermostUsername(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^@/, '')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '.')
     .replace(/^\.+|\.+$/g, '');
 }
 
-async function sendMattermostDM(username, message) {
+async function getRedmineUserEmailById(userId) {
+  if (!userId) return '';
+
+  const cacheKey = `redmine:user:${userId}:email`;
+  if (redis) {
+    const cached = await redis.get(cacheKey);
+    if (cached) return cached;
+  }
+
+  try {
+    const res = await redmine.get(`/users/${userId}.json`);
+    const email = String(res.data?.user?.mail || res.data?.user?.email || '').trim().toLowerCase();
+    if (looksLikeEmail(email)) {
+      if (redis) await redis.set(cacheKey, email, 'EX', 24 * 60 * 60);
+      return email;
+    }
+  } catch (err) {
+    console.warn(`[REDMINE] Não foi possível buscar e-mail do usuário ${userId}:`, err.response?.data || err.message);
+  }
+
+  return '';
+}
+
+async function getRedmineGroupMemberEmails(groupId) {
+  if (!groupId) return [];
+
+  const cacheKey = `redmine:group:${groupId}:member_emails`;
+  if (redis) {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (_) {}
+    }
+  }
+
+  const emails = new Set();
+
+  // Preferencial: /users.json?group_id=ID costuma trazer o e-mail quando a API key tem permissão de admin.
+  try {
+    let offset = 0;
+    const limit = 100;
+
+    while (true) {
+      const res = await redmine.get('/users.json', {
+        params: { group_id: groupId, status: 1, limit, offset }
+      });
+
+      const users = res.data?.users || [];
+      for (const user of users) {
+        const email = String(user.mail || user.email || '').trim().toLowerCase();
+        if (looksLikeEmail(email)) emails.add(email);
+      }
+
+      const total = Number(res.data?.total_count || users.length);
+      offset += limit;
+      if (!users.length || offset >= total) break;
+    }
+  } catch (err) {
+    console.warn(`[REDMINE] Não foi possível listar usuários do grupo ${groupId} via /users.json?group_id:`, err.response?.data || err.message);
+  }
+
+  // Fallback: /groups/:id.json?include=users retorna membros, mas normalmente sem e-mail.
+  // Por isso buscamos /users/:id.json para cada membro.
+  if (!emails.size) {
+    try {
+      const res = await redmine.get(`/groups/${groupId}.json`, { params: { include: 'users' } });
+      const users = res.data?.group?.users || [];
+
+      for (const user of users) {
+        const email = await getRedmineUserEmailById(user.id);
+        if (looksLikeEmail(email)) emails.add(email);
+      }
+    } catch (err) {
+      const status = err.response?.status;
+      if (status !== 404) {
+        console.warn(`[REDMINE] Não foi possível buscar membros do grupo ${groupId}:`, err.response?.data || err.message);
+      }
+    }
+  }
+
+  const result = Array.from(emails);
+  if (redis && result.length) {
+    await redis.set(cacheKey, JSON.stringify(result), 'EX', 15 * 60);
+  }
+
+  return result;
+}
+
+async function getRedmineAssignedUserEmail(issue) {
+  const explicitEmail =
+    getCustomValue(issue, 'E-mail') ||
+    getCustomValue(issue, 'Email') ||
+    getCustomValue(issue, 'Mattermost Email') ||
+    getCustomValue(issue, 'E-mail Mattermost');
+
+  if (looksLikeEmail(explicitEmail)) return explicitEmail.trim().toLowerCase();
+
+  const assignedId = issue.assigned_to?.id;
+  if (!assignedId) return '';
+
+  const email = await getRedmineUserEmailById(assignedId);
+  if (email) return email;
+
+  const assignedName = String(issue.assigned_to?.name || '').trim();
+  if (looksLikeEmail(assignedName)) return assignedName.toLowerCase();
+
+  return '';
+}
+
+async function getRedmineAssigneeEmails(issue) {
+  const assignedId = issue.assigned_to?.id;
+  if (!assignedId) return [];
+
+  // Primeiro tenta como grupo. Se não for grupo, a lista voltará vazia e cairemos no usuário individual.
+  const groupEmails = await getRedmineGroupMemberEmails(assignedId);
+  if (groupEmails.length) {
+    console.log(`[REDMINE] Issue #${issue.id} atribuída ao grupo "${issue.assigned_to?.name}". ${groupEmails.length} membro(s) encontrado(s).`);
+    return groupEmails;
+  }
+
+  const email = await getRedmineAssignedUserEmail(issue);
+  return email ? [email] : [];
+}
+
+function redmineUserToMattermostUsername(issue) {
+  const loginField = getCustomValue(issue, 'Mattermost') || getCustomValue(issue, 'Usuário Mattermost');
+  if (loginField && !looksLikeEmail(loginField)) return normalizeMattermostUsername(loginField);
+  return normalizeMattermostUsername(issue.assigned_to?.name || '');
+}
+
+async function getMattermostUserByEmail(email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!looksLikeEmail(normalizedEmail)) return null;
+
+  const cacheKey = `mattermost:user:email:${normalizedEmail}`;
+  if (redis) {
+    const cachedId = await redis.get(cacheKey);
+    if (cachedId) return { id: cachedId, email: normalizedEmail };
+  }
+
+  const user = await mattermost.get(`/users/email/${encodeURIComponent(normalizedEmail)}`);
+  if (redis && user.data?.id) await redis.set(cacheKey, user.data.id, 'EX', 24 * 60 * 60);
+  return user.data;
+}
+
+async function getMattermostUserByUsername(username) {
+  const normalizedUsername = normalizeMattermostUsername(username);
+  if (!normalizedUsername) return null;
+
+  const cacheKey = `mattermost:user:username:${normalizedUsername}`;
+  if (redis) {
+    const cachedId = await redis.get(cacheKey);
+    if (cachedId) return { id: cachedId, username: normalizedUsername };
+  }
+
+  const user = await mattermost.get(`/users/username/${encodeURIComponent(normalizedUsername)}`);
+  if (redis && user.data?.id) await redis.set(cacheKey, user.data.id, 'EX', 24 * 60 * 60);
+  return user.data;
+}
+
+async function sendMattermostDMToUser(user, label, message) {
+  const me = await mattermost.get('/users/me');
+  const channel = await mattermost.post('/channels/direct', [me.data.id, user.id]);
+  await mattermost.post('/posts', { channel_id: channel.data.id, message });
+  console.log(`[MATTERMOST] DM enviada para ${label}`);
+  return true;
+}
+
+async function sendMattermostDM(identifier, message) {
   if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
     console.warn('[MATTERMOST] MATTERMOST_URL ou MATTERMOST_TOKEN ausente.');
     return false;
   }
-  if (!username) {
-    console.warn('[MATTERMOST] Usuário Mattermost não identificado.');
+
+  const value = String(identifier || '').trim();
+  if (!value) {
+    console.warn('[MATTERMOST] Usuário/e-mail Mattermost não identificado.');
     return false;
   }
 
   try {
-    const me = await mattermost.get('/users/me');
-    const user = await mattermost.get(`/users/username/${encodeURIComponent(username)}`);
-    const channel = await mattermost.post('/channels/direct', [me.data.id, user.data.id]);
-    await mattermost.post('/posts', { channel_id: channel.data.id, message });
-    console.log(`[MATTERMOST] DM enviada para @${username}`);
-    return true;
+    if (looksLikeEmail(value)) {
+      const user = await getMattermostUserByEmail(value);
+      return sendMattermostDMToUser(user, value, message);
+    }
+
+    const user = await getMattermostUserByUsername(value);
+    return sendMattermostDMToUser(user, `@${normalizeMattermostUsername(value)}`, message);
   } catch (err) {
-    console.error(`[MATTERMOST] Falha ao enviar DM para @${username}:`, err.response?.data || err.message);
+    console.error(`[MATTERMOST] Falha ao enviar DM para ${value}:`, err.response?.data || err.message);
     return false;
   }
 }
 
 async function sendIssueDM(issue, message) {
-  return sendMattermostDM(redmineUserToMattermostUsername(issue), message);
+  const emails = await getRedmineAssigneeEmails(issue);
+
+  if (emails.length) {
+    let sent = 0;
+
+    for (const email of emails) {
+      const ok = await sendMattermostDM(email, message);
+      if (ok) sent += 1;
+    }
+
+    if (emails.length > 1) {
+      console.log(`[MATTERMOST] Issue #${issue.id}: DM enviada para ${sent}/${emails.length} membro(s) do grupo "${issue.assigned_to?.name}".`);
+    }
+
+    return sent > 0;
+  }
+
+  const username = redmineUserToMattermostUsername(issue);
+  console.warn(`[MATTERMOST] E-mail do responsável/grupo da issue #${issue.id} não encontrado. Tentando fallback por username: @${username}`);
+  return sendMattermostDM(username, message);
 }
 
 async function startWhatsapp() {
