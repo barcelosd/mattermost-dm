@@ -1351,10 +1351,21 @@ async function processGoogleMeet(issue) {
   });
 
   const signatureKey = `redmine:meet:signature:${issue.id}`;
-  const oldSignature = await redisGet(signatureKey);
+async function redisMGet(keys) {
+  if (redis) return redis.mget(keys);
+  return keys.map(key => memory.values.get(key) || null);
+}
+const [oldSignature, eventIdCached, meetLinkCached] = await redisMGet([
 
-  let eventId = await redisGet(`redmine:meet:event:${issue.id}`);
+  `redmine:meet:signature:${issue.id}`,
 
+  `redmine:meet:event:${issue.id}`,
+
+  `redmine:meet:link:${issue.id}`
+
+]);
+
+let eventId = eventIdCached;
   // Otimização: se já existe evento salvo e a assinatura não mudou,
   // não consulta o Google Calendar novamente.
   if (eventId && oldSignature === signature) {
@@ -1859,7 +1870,11 @@ async function pollingRedmineIssues() {
         // Log detalhado removido para evitar excesso:
         // console.log(`[POLLING] Processando tarefa #${issue.id}`, {...});
 
-        await processGoogleMeet(issueWithUrl);
+        const hasMeetField = Boolean(getCustomFieldValue(issueWithUrl, 'Google Meet'));
+
+if (isStrictMeetStatus(issueWithUrl) || hasMeetField) {
+  await processGoogleMeet(issueWithUrl);
+}
 
         const lastJournal = getLastJournal(issueWithUrl);
 
