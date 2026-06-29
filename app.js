@@ -50,59 +50,20 @@ const {
   DAILY_SUMMARY_MINUTE = 45,
   CLIENT_SUMMARY_TIME = '08:30',
   MEET_STATUS_NAME = 'Aguardando Data',
-  MATTERMOST_REDMINE_LOGIN_FIELD_NAME = 'Login Mattermost'
+  MATTERMOST_REDMINE_LOGIN_FIELD_NAME = 'Login Mattermost',
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN,
+  GOOGLE_CALENDAR_ID,
+  GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
+  GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
+  GOOGLE_MEET_FIELD_NAME = 'Google Meet',
+  GOOGLE_DRIVE_SYNC_FIELD_NAME = 'Sincroniza G-Drive',
+  GOOGLE_DRIVE_FOLDER_FIELD_NAME = 'Pasta G-Drive',
+  GOOGLE_DRIVE_CLIENT_NAME_FIELD_NAME = 'Personalização - Nome Fantasia'
 } = process.env;
 
 const app = express();
-
-axios.defaults.timeout = Number(process.env.HTTP_TIMEOUT_MS || 30000);
-
-// Retry simples para falhas transitórias comuns no Render/Redmine/Mattermost.
-// ECONNRESET normalmente significa que o servidor remoto fechou a conexão antes da resposta.
-function isTransientNetworkError(error) {
-  const code = error && error.code;
-  const status = error && error.response && error.response.status;
-
-  return (
-    code === 'ECONNRESET' ||
-    code === 'ETIMEDOUT' ||
-    code === 'ECONNABORTED' ||
-    code === 'EAI_AGAIN' ||
-    code === 'ENOTFOUND' ||
-    code === 'ECONNREFUSED' ||
-    status === 408 ||
-    status === 429 ||
-    (status >= 500 && status <= 599)
-  );
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function withHttpRetry(operation, label, maxAttempts = Number(process.env.HTTP_RETRY_ATTEMPTS || 3)) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error;
-
-      if (!isTransientNetworkError(error) || attempt >= maxAttempts) {
-        throw error;
-      }
-
-      const waitMs = Math.min(1000 * attempt, 5000);
-      console.warn(`[HTTP RETRY] ${label} falhou (${error.code || (error.response && error.response.status) || error.message}). Tentativa ${attempt + 1}/${maxAttempts} em ${waitMs}ms.`);
-      await sleep(waitMs);
-    }
-  }
-
-  throw lastError;
-}
-
-
 app.use(express.json());
 
 const redis = new Redis(REDIS_URL);
@@ -181,12 +142,9 @@ async function getMattermostUserIdFromIssue(issue) {
   const login = cleanValue(mattermostLoginField && mattermostLoginField.value);
 
   if (login) {
-    const response = await withHttpRetry(
-    () => axios.get(`${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(login)}`, {
+    const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(login)}`, {
       headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
-    }),
-    `Mattermost usuário ${login}`
-  );
+    });
     return response.data.id;
   }
 
@@ -195,33 +153,24 @@ async function getMattermostUserIdFromIssue(issue) {
   const assignedName = issue.assigned_to && issue.assigned_to.name ? issue.assigned_to.name : '';
   if (!assignedName) return null;
 
-  const search = await withHttpRetry(
-    () => axios.post(
-      `${MATTERMOST_URL}/api/v4/users/search`,
-      { term: assignedName },
-      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
-    ),
-    `Mattermost busca usuário ${assignedName}`
+  const search = await axios.post(
+    `${MATTERMOST_URL}/api/v4/users/search`,
+    { term: assignedName },
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
   );
 
   return search.data && search.data[0] ? search.data[0].id : null;
 }
 
 async function createMattermostDirectChannel(userId) {
-  const me = await withHttpRetry(
-    () => axios.get(`${MATTERMOST_URL}/api/v4/users/me`, {
-      headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
-    }),
-    'Mattermost users/me'
-  );
+  const me = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, {
+    headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
+  });
 
-  const response = await withHttpRetry(
-    () => axios.post(
-      `${MATTERMOST_URL}/api/v4/channels/direct`,
-      [me.data.id, userId],
-      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
-    ),
-    `Mattermost canal direto ${userId}`
+  const response = await axios.post(
+    `${MATTERMOST_URL}/api/v4/channels/direct`,
+    [me.data.id, userId],
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
   );
 
   return response.data;
@@ -232,13 +181,10 @@ async function sendMattermostDirectMessage(userId, message) {
 
   const channel = await createMattermostDirectChannel(userId);
 
-  await withHttpRetry(
-    () => axios.post(
-      `${MATTERMOST_URL}/api/v4/posts`,
-      { channel_id: channel.id, message },
-      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
-    ),
-    `Mattermost post canal ${channel.id}`
+  await axios.post(
+    `${MATTERMOST_URL}/api/v4/posts`,
+    { channel_id: channel.id, message },
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
   );
 
   return true;
@@ -251,19 +197,16 @@ async function fetchRedmineIssues(params = {}) {
   let totalCount = null;
 
   do {
-    const response = await withHttpRetry(
-      () => axios.get(`${REDMINE_URL}/issues.json`, {
-        headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
-        params: {
-          status_id: '*',
-          sort: 'due_date:asc,updated_on:desc',
-          ...params,
-          limit,
-          offset
-        }
-      }),
-      `Redmine issues offset ${offset}`
-    );
+    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+      headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
+      params: {
+        status_id: '*',
+        sort: 'due_date:asc,updated_on:desc',
+        ...params,
+        limit,
+        offset
+      }
+    });
 
     const data = response.data || {};
     const issues = data.issues || [];
@@ -433,14 +376,7 @@ async function trySendTimedAlert({ issue, appointmentAt, channel, minutesBefore,
 
   if (await redis.get(alertKey)) return false;
 
-  let sent = false;
-  try {
-    sent = await sendFn(issue, appointmentAt, minutesBefore);
-  } catch (error) {
-    console.error(`[ALERTAS] Erro ao enviar ${channel} ${minutesBefore}min da tarefa #${issue.id}: ${error.code || error.message}`);
-    return false;
-  }
-
+  const sent = await sendFn(issue, appointmentAt, minutesBefore);
   if (!sent) return false;
 
   await redis.set(alertKey, 'true', 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
@@ -456,69 +392,454 @@ async function pollingAppointmentAlerts() {
   console.log('[ALERTAS] Verificando proximidade de horários...');
 
   const hoje = dayjs().tz(TZ).startOf('day');
+  const issues = await fetchRedmineIssues({
+    limit: 100,
+    status_id: '*',
+    sort: 'due_date:asc,updated_on:desc'
+  });
 
-  let issues = [];
-  try {
-    issues = await fetchRedmineIssues({
-      limit: 100,
-      status_id: '*',
-      sort: 'due_date:asc,updated_on:desc'
+  for (const issue of issues) {
+    const statusName = issue.status ? issue.status.name : '';
+    if (statusName !== MEET_STATUS_NAME) continue;
+
+    const issueDateStr = getIssueDate(issue);
+    const issueTimeStr = getIssueTime(issue);
+
+    if (!issueDateStr || !issueTimeStr) continue;
+
+    const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
+    if (!appointmentAt) {
+      console.warn(`[ALERTAS] Data/hora inválida na tarefa #${issue.id}: ${issueDateStr} ${issueTimeStr}`);
+      continue;
+    }
+
+    // Ignora compromissos passados para reduzir leitura/escrita no Redis.
+    if (appointmentAt.isBefore(dayjs().tz(TZ))) continue;
+
+    const issueDate = appointmentAt.startOf('day');
+    if (issueDate.isBefore(hoje)) continue;
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'mattermost',
+      minutesBefore: Number(ALERT_MINUTES_BEFORE),
+      sendFn: sendMattermostAppointmentAlert
     });
-  } catch (error) {
-    console.error(`[ALERTAS] Falha ao consultar Redmine: ${error.code || error.message}`);
-    return;
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'mattermost',
+      minutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE),
+      sendFn: sendMattermostAppointmentAlert
+    });
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'whatsapp',
+      minutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE),
+      sendFn: sendWhatsappAppointmentAlert
+    });
   }
+}
+
+
+// ---------------------------------------------------------
+// GOOGLE CALENDAR / MEET
+// ---------------------------------------------------------
+function hasEstimatedHours(issue) {
+  return issue.estimated_hours && Number(issue.estimated_hours) > 0;
+}
+
+function getGoogleMeetField(issue) {
+  return getCustomField(issue, GOOGLE_MEET_FIELD_NAME);
+}
+
+function buildCalendarSignature(issue, appointmentAt) {
+  const durationMinutes = Math.round(Number(issue.estimated_hours || 0) * 60);
+  const endAt = appointmentAt.add(durationMinutes, 'minute');
+
+  return JSON.stringify({
+    id: issue.id,
+    start: appointmentAt.toISOString(),
+    end: endAt.toISOString(),
+    subject: issue.subject || '',
+    estimated_hours: Number(issue.estimated_hours || 0)
+  });
+}
+
+function getGoogleAuthClient() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+    throw new Error('Credenciais Google ausentes: confira GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET e GOOGLE_REFRESH_TOKEN.');
+  }
+
+  const oauth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    'https://developers.google.com/oauthplayground'
+  );
+
+  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  return oauth2Client;
+}
+
+function getGoogleCalendarClient() {
+  const auth = getGoogleAuthClient();
+  return google.calendar({ version: 'v3', auth });
+}
+
+function getGoogleDriveClient() {
+  const auth = getGoogleAuthClient();
+  return google.drive({ version: 'v3', auth });
+}
+
+function normalizeGoogleDriveYes(value) {
+  return cleanValue(value).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '') === 'sim';
+}
+
+function getProjectIdentifier(issue) {
+  if (!issue.project) return null;
+  return issue.project.identifier || issue.project.id || null;
+}
+
+async function fetchRedmineProject(issue) {
+  const projectIdentifier = getProjectIdentifier(issue);
+  if (!projectIdentifier) return null;
+
+  const response = await axios.get(`${REDMINE_URL}/projects/${encodeURIComponent(projectIdentifier)}.json`, {
+    headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
+    params: { include: 'custom_fields' }
+  });
+
+  return response.data && response.data.project ? response.data.project : null;
+}
+
+function getCustomFieldFromEntity(entity, fieldName) {
+  return (entity && entity.custom_fields || []).find(f => f.name === fieldName);
+}
+
+function getProjectCustomField(project, issue, fieldName) {
+  return getCustomFieldFromEntity(project, fieldName) || getCustomField(issue, fieldName);
+}
+
+function escapeDriveQueryValue(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+async function findGoogleDriveFolderByName(parentFolderId, folderName) {
+  const drive = getGoogleDriveClient();
+  const safeName = escapeDriveQueryValue(folderName);
+
+  const response = await drive.files.list({
+    q: [
+      `'${parentFolderId}' in parents`,
+      `name = '${safeName}'`,
+      `mimeType = 'application/vnd.google-apps.folder'`,
+      `trashed = false`
+    ].join(' and '),
+    fields: 'files(id,name,webViewLink)',
+    pageSize: 1,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
+  });
+
+  return response.data.files && response.data.files[0] ? response.data.files[0] : null;
+}
+
+async function createGoogleDriveClientFolder(parentFolderId, folderName) {
+  const drive = getGoogleDriveClient();
+
+  const response = await drive.files.create({
+    requestBody: {
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentFolderId]
+    },
+    fields: 'id,name,webViewLink',
+    supportsAllDrives: true
+  });
+
+  return response.data;
+}
+
+async function updateRedmineProjectDriveFolderField(issue, project, folderValue) {
+  const folderField = getProjectCustomField(project, issue, GOOGLE_DRIVE_FOLDER_FIELD_NAME);
+  if (!folderField || !folderField.id) {
+    console.warn(`[G-DRIVE] Campo "${GOOGLE_DRIVE_FOLDER_FIELD_NAME}" não encontrado no projeto/tarefa da #${issue.id}.`);
+    return false;
+  }
+
+  const projectIdentifier = getProjectIdentifier(issue);
+  if (!projectIdentifier) {
+    console.warn(`[G-DRIVE] Projeto não identificado para atualizar "${GOOGLE_DRIVE_FOLDER_FIELD_NAME}" na tarefa #${issue.id}.`);
+    return false;
+  }
+
+  await axios.put(
+    `${REDMINE_URL}/projects/${encodeURIComponent(projectIdentifier)}.json`,
+    {
+      project: {
+        custom_fields: [
+          {
+            id: folderField.id,
+            value: folderValue
+          }
+        ]
+      }
+    },
+    {
+      headers: {
+        'X-Redmine-API-Key': REDMINE_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+
+  return true;
+}
+
+async function ensureGoogleDriveClientFolderForIssue(issue) {
+  if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID) {
+    console.warn('[G-DRIVE] GOOGLE_DRIVE_CLIENTES_FOLDER_ID ausente. Pasta do cliente não será criada.');
+    return null;
+  }
+
+  const project = await fetchRedmineProject(issue);
+  if (!project) {
+    console.warn(`[G-DRIVE] Projeto não encontrado para a tarefa #${issue.id}.`);
+    return null;
+  }
+
+  const syncField = getProjectCustomField(project, issue, GOOGLE_DRIVE_SYNC_FIELD_NAME);
+  const syncValue = syncField && syncField.value;
+  if (!normalizeGoogleDriveYes(syncValue)) {
+    console.log(`[G-DRIVE] Projeto da tarefa #${issue.id} não está com "${GOOGLE_DRIVE_SYNC_FIELD_NAME}" = Sim.`);
+    return null;
+  }
+
+  const folderField = getProjectCustomField(project, issue, GOOGLE_DRIVE_FOLDER_FIELD_NAME);
+  const currentFolderValue = cleanValue(folderField && folderField.value);
+  if (currentFolderValue) {
+    return currentFolderValue;
+  }
+
+  const clientNameField =
+    getProjectCustomField(project, issue, GOOGLE_DRIVE_CLIENT_NAME_FIELD_NAME) ||
+    getProjectCustomField(project, issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
+
+  const clientFolderName = cleanValue(clientNameField && clientNameField.value);
+  if (!clientFolderName) {
+    console.warn(`[G-DRIVE] Campo "${GOOGLE_DRIVE_CLIENT_NAME_FIELD_NAME}" vazio no projeto/tarefa #${issue.id}.`);
+    return null;
+  }
+
+  const creatingKey = `redmine:gdrive:project:${project.id || getProjectIdentifier(issue)}:creating-folder`;
+  if (await redis.get(creatingKey)) return null;
+
+  await redis.set(creatingKey, 'true', 'EX', 5 * 60);
+  try {
+    const existingFolder = await findGoogleDriveFolderByName(GOOGLE_DRIVE_CLIENTES_FOLDER_ID, clientFolderName);
+    const folder = existingFolder || await createGoogleDriveClientFolder(GOOGLE_DRIVE_CLIENTES_FOLDER_ID, clientFolderName);
+    const folderValue = folder.webViewLink || folder.id;
+
+    await updateRedmineProjectDriveFolderField(issue, project, folderValue);
+
+    console.log(`[G-DRIVE] Pasta do cliente ${existingFolder ? 'localizada' : 'criada'} para a tarefa #${issue.id}: ${folder.name} (${folder.id})`);
+    return folderValue;
+  } finally {
+    await redis.del(creatingKey);
+  }
+}
+
+function buildGoogleCalendarEvent(issue, appointmentAt) {
+  const durationMinutes = Math.round(Number(issue.estimated_hours || 0) * 60);
+  const endAt = appointmentAt.add(durationMinutes, 'minute');
+
+  const projectField = getCustomField(issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
+  const projectName = cleanValue(projectField && projectField.value);
+  const redmineUrl = `${REDMINE_URL}/issues/${issue.id}`;
+
+  return {
+    summary: `#${issue.id} - ${issue.subject || 'Compromisso Redmine'}`,
+    description: [
+      `Tarefa Redmine: ${redmineUrl}`,
+      projectName ? `Projeto/Cliente: ${projectName}` : '',
+      issue.description ? `\nDescrição:\n${issue.description}` : ''
+    ].filter(Boolean).join('\n'),
+    start: {
+      dateTime: appointmentAt.toISOString(),
+      timeZone: TZ
+    },
+    end: {
+      dateTime: endAt.toISOString(),
+      timeZone: TZ
+    },
+    conferenceData: {
+      createRequest: {
+        requestId: `redmine-${issue.id}-${appointmentAt.format('YYYYMMDDHHmm')}`,
+        conferenceSolutionKey: { type: 'hangoutsMeet' }
+      }
+    },
+    extendedProperties: {
+      private: {
+        redmineIssueId: String(issue.id)
+      }
+    }
+  };
+}
+
+async function updateRedmineGoogleMeetField(issue, meetLink) {
+  const meetField = getGoogleMeetField(issue);
+  if (!meetField || !meetField.id) {
+    console.warn(`[GOOGLE MEET] Campo "${GOOGLE_MEET_FIELD_NAME}" não encontrado na tarefa #${issue.id}.`);
+    return false;
+  }
+
+  await axios.put(
+    `${REDMINE_URL}/issues/${issue.id}.json`,
+    {
+      issue: {
+        custom_fields: [
+          {
+            id: meetField.id,
+            value: meetLink
+          }
+        ]
+      }
+    },
+    {
+      headers: {
+        'X-Redmine-API-Key': REDMINE_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+
+  return true;
+}
+
+async function createGoogleCalendarEventForIssue(issue, appointmentAt) {
+  await ensureGoogleDriveClientFolderForIssue(issue);
+
+  const calendar = getGoogleCalendarClient();
+  const calendarId = GOOGLE_CALENDAR_ID || 'primary';
+  const event = buildGoogleCalendarEvent(issue, appointmentAt);
+
+  const response = await calendar.events.insert({
+    calendarId,
+    conferenceDataVersion: 1,
+    requestBody: event
+  });
+
+  const createdEvent = response.data || {};
+  const meetLink = createdEvent.hangoutLink ||
+    (createdEvent.conferenceData && createdEvent.conferenceData.entryPoints || [])
+      .find(entry => entry.entryPointType === 'video')?.uri;
+
+  if (!meetLink) {
+    throw new Error(`Evento criado para #${issue.id}, mas o Google não retornou link do Meet.`);
+  }
+
+  await updateRedmineGoogleMeetField(issue, meetLink);
+
+  const signature = buildCalendarSignature(issue, appointmentAt);
+  await redis.set(`redmine:calendar:${issue.id}:eventId`, createdEvent.id, 'EX', Number(REDIS_TTL_DAYS) * 86400);
+  await redis.set(`redmine:calendar:${issue.id}:signature`, signature, 'EX', Number(REDIS_TTL_DAYS) * 86400);
+
+  console.log(`[GOOGLE MEET] Evento criado para a tarefa #${issue.id}: ${meetLink}`);
+}
+
+async function updateGoogleCalendarEventForIssue(issue, appointmentAt, eventId) {
+  const calendar = getGoogleCalendarClient();
+  const calendarId = GOOGLE_CALENDAR_ID || 'primary';
+  const event = buildGoogleCalendarEvent(issue, appointmentAt);
+
+  const response = await calendar.events.patch({
+    calendarId,
+    eventId,
+    conferenceDataVersion: 1,
+    requestBody: event
+  });
+
+  const updatedEvent = response.data || {};
+  const meetLink = updatedEvent.hangoutLink ||
+    (updatedEvent.conferenceData && updatedEvent.conferenceData.entryPoints || [])
+      .find(entry => entry.entryPointType === 'video')?.uri;
+
+  const currentMeetField = getGoogleMeetField(issue);
+  const currentMeetLink = cleanValue(currentMeetField && currentMeetField.value);
+  if (meetLink && meetLink !== currentMeetLink) {
+    await updateRedmineGoogleMeetField(issue, meetLink);
+  }
+
+  const signature = buildCalendarSignature(issue, appointmentAt);
+  await redis.set(`redmine:calendar:${issue.id}:signature`, signature, 'EX', Number(REDIS_TTL_DAYS) * 86400);
+
+  console.log(`[GOOGLE MEET] Evento atualizado para a tarefa #${issue.id}.`);
+}
+
+async function processGoogleCalendarEvents() {
+  console.log('[GOOGLE MEET] Verificando tarefas para criação/atualização de agenda...');
+
+  const issues = await fetchAwaitingDateIssues({
+    limit: 100,
+    status_id: '*',
+    sort: 'due_date:asc,updated_on:desc'
+  });
+
+  const now = dayjs().tz(TZ);
 
   for (const issue of issues) {
     try {
-      const statusName = issue.status ? issue.status.name : '';
-      if (statusName !== MEET_STATUS_NAME) continue;
+      if ((issue.status && issue.status.name) !== MEET_STATUS_NAME) continue;
+      if (!hasEstimatedHours(issue)) continue;
 
       const issueDateStr = getIssueDate(issue);
       const issueTimeStr = getIssueTime(issue);
-
       if (!issueDateStr || !issueTimeStr) continue;
 
       const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
-      if (!appointmentAt) {
-        console.warn(`[ALERTAS] Data/hora inválida na tarefa #${issue.id}: ${issueDateStr} ${issueTimeStr}`);
+      if (!appointmentAt || appointmentAt.isBefore(now)) continue;
+
+      const meetField = getGoogleMeetField(issue);
+      const meetLink = cleanValue(meetField && meetField.value);
+      const signature = buildCalendarSignature(issue, appointmentAt);
+      const signatureKey = `redmine:calendar:${issue.id}:signature`;
+      const eventIdKey = `redmine:calendar:${issue.id}:eventId`;
+
+      if (!meetLink) {
+        const creatingKey = `redmine:calendar:${issue.id}:creating`;
+        const alreadyCreating = await redis.get(creatingKey);
+        if (alreadyCreating) continue;
+
+        await redis.set(creatingKey, 'true', 'EX', 5 * 60);
+        try {
+          await createGoogleCalendarEventForIssue(issue, appointmentAt);
+        } finally {
+          await redis.del(creatingKey);
+        }
         continue;
       }
 
-      // Ignora compromissos passados para reduzir leitura/escrita no Redis.
-      if (appointmentAt.isBefore(dayjs().tz(TZ))) continue;
+      const previousSignature = await redis.get(signatureKey);
+      if (previousSignature === signature) continue;
 
-      const issueDate = appointmentAt.startOf('day');
-      if (issueDate.isBefore(hoje)) continue;
+      const eventId = await redis.get(eventIdKey);
+      if (!eventId) {
+        await redis.set(signatureKey, signature, 'EX', Number(REDIS_TTL_DAYS) * 86400);
+        console.warn(`[GOOGLE MEET] Tarefa #${issue.id} já possui link do Meet, mas não há eventId no Redis. Não será criado duplicado.`);
+        continue;
+      }
 
-      await trySendTimedAlert({
-        issue,
-        appointmentAt,
-        channel: 'mattermost',
-        minutesBefore: Number(ALERT_MINUTES_BEFORE),
-        sendFn: sendMattermostAppointmentAlert
-      });
-
-      await trySendTimedAlert({
-        issue,
-        appointmentAt,
-        channel: 'mattermost',
-        minutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE),
-        sendFn: sendMattermostAppointmentAlert
-      });
-
-      await trySendTimedAlert({
-        issue,
-        appointmentAt,
-        channel: 'whatsapp',
-        minutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE),
-        sendFn: sendWhatsappAppointmentAlert
-      });
-    } catch (error) {
-      console.error(`[ALERTAS] Falha ao processar tarefa #${issue && issue.id ? issue.id : 'desconhecida'}: ${error.code || error.message}`);
+      await updateGoogleCalendarEventForIssue(issue, appointmentAt, eventId);
+    } catch (err) {
+      console.error(`[GOOGLE MEET ERRO] Tarefa #${issue.id}:`, err.response?.data || err.message);
     }
   }
 }
+
 
 // ---------------------------------------------------------
 // OUTRAS ROTINAS EM PARALELO (SUMMARIES E DRIVE MOVER)
@@ -701,6 +1022,10 @@ setInterval(() => {
 setInterval(() => {
   processClientMorningSummary().catch(err => console.error('[WHATSAPP SUMMARY ERR]:', err.message));
 }, 60 * 1000);
+
+setInterval(() => {
+  processGoogleCalendarEvents().catch(err => console.error('[GOOGLE MEET ERR]:', err.message));
+}, Number(ALERT_POLLING_INTERVAL_SECONDS) * 1000);
 
 setInterval(() => {
   processMeetRecordings().catch(err => console.error('[DRIVE ERR]:', err.message));
