@@ -59,8 +59,8 @@ const {
   GOOGLE_DRIVE_MEET_PROCESSED_FOLDER_ID,
   DRIVE_MOVER_INTERVAL_SECONDS = 300,
   DRIVE_MOVER_LIMIT = 10,
-  PRODUCT_CONFIG_FIELD_NAME = 'Configuração do Produto',
-  PERSONALIZATION_NUMBER_FIELD_NAME = 'Número da Personalização',
+  PROJECT_PERSONALIZATION_FIELD_NAME = 'Personalização',
+  PERSONALIZATION_NUMBER_FIELD_NAME = 'Personalização',
   TRAININGS_FOLDER_NAME = 'Treinamentos'
 } = process.env;
 
@@ -288,6 +288,7 @@ async function pollingAppointmentAlerts(issues) {
 // GOOGLE DRIVE - ORGANIZAÇÃO DE GRAVAÇÕES DO MEET
 // ---------------------------------------------------------
 const redmineIssueByIdCache = new Map();
+const redmineProjectByIdCache = new Map();
 
 function normalizeDriveName(value) {
   return String(value || '')
@@ -361,12 +362,72 @@ async function fetchRedmineIssueById(issueId) {
 
   const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, {
     headers: getRedmineHeaders(),
-    params: { include: 'children,attachments,journals' }
+    params: { include: 'children,attachments,journals,custom_fields' }
   });
 
   const issue = response.data.issue;
   redmineIssueByIdCache.set(String(issueId), { issue, fetchedAt: now });
   return issue;
+}
+
+async function fetchRedmineProjectById(projectId) {
+  if (!projectId) return null;
+
+  const cacheKey = String(projectId);
+  const cached = redmineProjectByIdCache.get(cacheKey);
+  const now = Date.now();
+
+  if (cached && now - cached.fetchedAt < 60 * 60 * 1000) {
+    return cached.project;
+  }
+
+  const response = await axios.get(`${REDMINE_URL}/projects/${projectId}.json`, {
+    headers: getRedmineHeaders(),
+    params: { include: 'custom_fields' }
+  });
+
+  const project = response.data.project;
+  redmineProjectByIdCache.set(cacheKey, { project, fetchedAt: now });
+  return project;
+}
+
+function extractFirstNumber(value) {
+  const text = Array.isArray(value) ? value.filter(Boolean).join(', ') : String(value || '');
+  const match = text.match(/\d+/);
+  return match ? match[0] : null;
+}
+
+async function getProjectPersonalizationNumberFromIssue(issue) {
+  const projectId = issue?.project?.id;
+  const projectName = issue?.project?.name || 'não informado';
+
+  if (!projectId) {
+    console.log(`[DRIVE] Task #${issue?.id || '?'} sem projeto informado no retorno do Redmine.`);
+    return null;
+  }
+
+  const project = await fetchRedmineProjectById(projectId);
+  const fieldValue = getCustomFieldValue(project, [
+    PROJECT_PERSONALIZATION_FIELD_NAME,
+    PERSONALIZATION_NUMBER_FIELD_NAME,
+    'Personalização',
+    'Personalizacao',
+    'Número Personalização',
+    'Numero Personalizacao',
+    'Número da Personalização',
+    'Numero da Personalizacao'
+  ]);
+
+  const personalizationNumber = extractFirstNumber(fieldValue);
+  if (!personalizationNumber) {
+    console.log(
+      `[DRIVE] Projeto "${projectName}" da Task #${issue?.id || '?'} sem campo personalizado de personalização preenchido. ` +
+      `Verifique o campo "${PROJECT_PERSONALIZATION_FIELD_NAME}" na configuração do projeto.`
+    );
+    return null;
+  }
+
+  return personalizationNumber;
 }
 
 async function findFolderByName(drive, name, parentId = null) {
@@ -549,23 +610,10 @@ async function processMeetRecordings() {
       const issue = await fetchRedmineIssueById(issueId);
       const projectName = issue?.project?.name || '';
 
-      const productConfig = getCustomFieldValue(issue, [
-        PRODUCT_CONFIG_FIELD_NAME,
-        'Configuração Produto',
-        'Configuracao do Produto',
-        'Produto'
-      ]);
-
-      const personalizationNumber = getCustomFieldValue(issue, [
-        PERSONALIZATION_NUMBER_FIELD_NAME,
-        'Personalização',
-        'Personalizacao',
-        'Número Personalização',
-        'Numero Personalizacao'
-      ]) || productConfig;
+      const personalizationNumber = await getProjectPersonalizationNumberFromIssue(issue);
 
       if (!personalizationNumber) {
-        console.log(`[DRIVE] Task #${issueId} sem número de personalização/configuração do produto.`);
+        console.log(`[DRIVE] Task #${issueId} sem número de personalização no campo personalizado do projeto.`);
         continue;
       }
 
