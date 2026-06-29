@@ -312,21 +312,13 @@ function getGoogleDriveClient() {
 }
 
 function extractIssueIdAndDateFromFilename(filename) {
-  const name = String(filename || '');
+  const name = String(filename || '').trim();
 
-  const issuePatterns = [
-    /(?:^|[^0-9])#?(\d{3,})(?:[^0-9]|$)/,
-    /(?:tarefa|task|issue|redmine)[\s_-]*#?(\d{3,})/i
-  ];
-
-  let issueId = null;
-  for (const pattern of issuePatterns) {
-    const match = name.match(pattern);
-    if (match) {
-      issueId = match[1];
-      break;
-    }
-  }
+  // Os arquivos das gravações devem começar com o número da tarefa:
+  // Ex.: "#58851 Treinamento cliente.mp4"
+  // Isso evita pesquisar números soltos no nome do arquivo e reduz consultas indevidas ao Redmine.
+  const issueMatch = name.match(/^#(\d{3,})(?:\b|\s|[-_.])/);
+  const issueId = issueMatch ? issueMatch[1] : null;
 
   const dateMatch =
     name.match(/\b(\d{4})[-_.](\d{2})[-_.](\d{2})\b/) ||
@@ -550,7 +542,7 @@ async function processMeetRecordings() {
 
       const { issueId, fileDate } = extractIssueIdAndDateFromFilename(file.name);
       if (!issueId) {
-        console.log(`[DRIVE] Arquivo sem ID de tarefa no nome, ignorado: ${file.name}`);
+        console.log(`[DRIVE] Arquivo ignorado porque não começa com #ID da tarefa no Redmine: ${file.name}`);
         continue;
       }
 
