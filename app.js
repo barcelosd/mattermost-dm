@@ -50,7 +50,18 @@ const {
   LUNCH_POLLING_INTERVAL_SECONDS = 900,
   OFF_HOURS_POLLING_INTERVAL_SECONDS = 1800,
   WEEKEND_POLLING_INTERVAL_SECONDS = 3600,
-  REDMINE_CACHE_TTL_SECONDS = 45
+  REDMINE_CACHE_TTL_SECONDS = 45,
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN,
+  GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+  GOOGLE_DRIVE_CLIENTES_FOLDER_ID,
+  GOOGLE_DRIVE_MEET_PROCESSED_FOLDER_ID,
+  DRIVE_MOVER_INTERVAL_SECONDS = 300,
+  DRIVE_MOVER_LIMIT = 10,
+  PRODUCT_CONFIG_FIELD_NAME = 'Configuração do Produto',
+  PERSONALIZATION_NUMBER_FIELD_NAME = 'Número da Personalização',
+  TRAININGS_FOLDER_NAME = 'Treinamentos'
 } = process.env;
 
 const app = express();
@@ -274,11 +285,329 @@ async function pollingAppointmentAlerts(issues) {
 }
 
 // ---------------------------------------------------------
-// OUTRAS ROTINAS EM PARALELO (SUMMARIES E DRIVE MOVER)
+// GOOGLE DRIVE - ORGANIZAÇÃO DE GRAVAÇÕES DO MEET
+// ---------------------------------------------------------
+const redmineIssueByIdCache = new Map();
+
+function normalizeDriveName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+function escapeDriveQueryValue(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function getGoogleDriveClient() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+    throw new Error('Credenciais do Google Drive incompletas no .env.');
+  }
+
+  const oauth2Client = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
+  return google.drive({ version: 'v3', auth: oauth2Client });
+}
+
+function extractIssueIdAndDateFromFilename(filename) {
+  const name = String(filename || '');
+
+  const issuePatterns = [
+    /(?:^|[^0-9])#?(\d{3,})(?:[^0-9]|$)/,
+    /(?:tarefa|task|issue|redmine)[\s_-]*#?(\d{3,})/i
+  ];
+
+  let issueId = null;
+  for (const pattern of issuePatterns) {
+    const match = name.match(pattern);
+    if (match) {
+      issueId = match[1];
+      break;
+    }
+  }
+
+  const dateMatch =
+    name.match(/\b(\d{4})[-_.](\d{2})[-_.](\d{2})\b/) ||
+    name.match(/\b(\d{2})[-_.](\d{2})[-_.](\d{4})\b/);
+
+  let fileDate = null;
+  if (dateMatch) {
+    if (dateMatch[1].length === 4) {
+      fileDate = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+    } else {
+      fileDate = `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}`;
+    }
+  }
+
+  return { issueId, fileDate };
+}
+
+function getCustomFieldValue(issue, fieldNames) {
+  const names = Array.isArray(fieldNames) ? fieldNames : [fieldNames];
+  const normalizedNames = names.map(normalizeDriveName);
+  const fields = issue?.custom_fields || [];
+
+  const field = fields.find(f => normalizedNames.includes(normalizeDriveName(f.name)));
+  if (!field) return null;
+
+  if (Array.isArray(field.value)) {
+    return field.value.filter(Boolean).join(', ');
+  }
+
+  return field.value || null;
+}
+
+async function fetchRedmineIssueById(issueId) {
+  const cached = redmineIssueByIdCache.get(String(issueId));
+  const now = Date.now();
+
+  if (cached && now - cached.fetchedAt < 30 * 60 * 1000) {
+    return cached.issue;
+  }
+
+  const response = await axios.get(`${REDMINE_URL}/issues/${issueId}.json`, {
+    headers: getRedmineHeaders(),
+    params: { include: 'children,attachments,journals' }
+  });
+
+  const issue = response.data.issue;
+  redmineIssueByIdCache.set(String(issueId), { issue, fetchedAt: now });
+  return issue;
+}
+
+async function findFolderByName(drive, name, parentId = null) {
+  if (!name) return null;
+
+  const queryParts = [
+    "mimeType = 'application/vnd.google-apps.folder'",
+    "trashed = false",
+    `name = '${escapeDriveQueryValue(name)}'`
+  ];
+
+  if (parentId) {
+    queryParts.push(`'${escapeDriveQueryValue(parentId)}' in parents`);
+  }
+
+  const response = await drive.files.list({
+    q: queryParts.join(' and '),
+    fields: 'files(id,name,parents)',
+    pageSize: 10,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
+  });
+
+  return (response.data.files || [])[0] || null;
+}
+
+async function findFolderContainingText(drive, text, parentId = null) {
+  if (!text) return null;
+
+  const queryParts = [
+    "mimeType = 'application/vnd.google-apps.folder'",
+    "trashed = false",
+    `name contains '${escapeDriveQueryValue(text)}'`
+  ];
+
+  if (parentId) {
+    queryParts.push(`'${escapeDriveQueryValue(parentId)}' in parents`);
+  }
+
+  const response = await drive.files.list({
+    q: queryParts.join(' and '),
+    fields: 'files(id,name,parents)',
+    pageSize: 20,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
+  });
+
+  const folders = response.data.files || [];
+  const normalizedText = normalizeDriveName(text);
+  return folders.find(folder => normalizeDriveName(folder.name).includes(normalizedText)) || folders[0] || null;
+}
+
+async function findOrCreateTrainingsFolder(drive, personalizationFolderId) {
+  const existing = await findFolderByName(drive, TRAININGS_FOLDER_NAME, personalizationFolderId);
+  if (existing) return existing;
+
+  const response = await drive.files.create({
+    requestBody: {
+      name: TRAININGS_FOLDER_NAME,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [personalizationFolderId]
+    },
+    fields: 'id,name',
+    supportsAllDrives: true
+  });
+
+  return response.data;
+}
+
+async function moveDriveFileToFolder(drive, file, targetFolderId) {
+  const previousParents = (file.parents || []).join(',');
+
+  await drive.files.update({
+    fileId: file.id,
+    addParents: targetFolderId,
+    removeParents: previousParents || undefined,
+    fields: 'id,parents',
+    supportsAllDrives: true
+  });
+}
+
+
+function isVideoDriveFile(file) {
+  return String(file?.mimeType || '').startsWith('video/') ||
+    Boolean(file?.videoMediaMetadata?.durationMillis);
+}
+
+function formatVideoDuration(durationMillis) {
+  const totalSeconds = Math.max(0, Math.round(Number(durationMillis || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, '0')}min ${String(seconds).padStart(2, '0')}s`;
+  }
+
+  return `${minutes}min ${String(seconds).padStart(2, '0')}s`;
+}
+
+async function getDriveVideoDurationMillis(drive, file) {
+  if (file?.videoMediaMetadata?.durationMillis) {
+    return Number(file.videoMediaMetadata.durationMillis);
+  }
+
+  const response = await drive.files.get({
+    fileId: file.id,
+    fields: 'id,name,mimeType,videoMediaMetadata(durationMillis)',
+    supportsAllDrives: true
+  });
+
+  return Number(response.data?.videoMediaMetadata?.durationMillis || 0);
+}
+
+async function addRedmineIssueJournal(issueId, notes) {
+  if (!notes) return;
+
+  await axios.put(`${REDMINE_URL}/issues/${issueId}.json`, {
+    issue: { notes }
+  }, {
+    headers: getRedmineHeaders()
+  });
+}
+
+async function addVideoDurationJournalAfterMove(drive, file, issueId, destinationDescription) {
+  if (!isVideoDriveFile(file)) {
+    return;
+  }
+
+  const durationMillis = await getDriveVideoDurationMillis(drive, file);
+  if (!durationMillis) {
+    console.log(`[DRIVE] Arquivo "${file.name}" é vídeo, mas a duração não veio no metadata do Drive.`);
+    return;
+  }
+
+  const durationText = formatVideoDuration(durationMillis);
+  const notes =
+    `Gravação do Meet movida para ${destinationDescription}.\n` +
+    `Tempo total do vídeo: ${durationText}.`;
+
+  await addRedmineIssueJournal(issueId, notes);
+  console.log(`[REDMINE] Journal gravado na Task #${issueId} com duração do vídeo: ${durationText}.`);
+}
+
+async function processMeetRecordings() {
+  if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !GOOGLE_DRIVE_CLIENTES_FOLDER_ID) {
+    console.log('[DRIVE] Pastas do Drive não configuradas. Rotina ignorada.');
+    return;
+  }
+
+  const drive = getGoogleDriveClient();
+
+  const response = await drive.files.list({
+    q: `'${escapeDriveQueryValue(GOOGLE_DRIVE_RECORDINGS_FOLDER_ID)}' in parents and trashed = false`,
+    fields: 'files(id,name,mimeType,parents,createdTime,videoMediaMetadata(durationMillis))',
+    orderBy: 'createdTime desc',
+    pageSize: Math.max(1, Math.min(Number(DRIVE_MOVER_LIMIT) || 10, 50)),
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true
+  });
+
+  const files = response.data.files || [];
+  if (!files.length) {
+    console.log('[DRIVE] Nenhuma gravação nova do Meet encontrada.');
+    return;
+  }
+
+  for (const file of files) {
+    try {
+      if (file.mimeType === 'application/vnd.google-apps.folder') {
+        continue;
+      }
+
+      const { issueId, fileDate } = extractIssueIdAndDateFromFilename(file.name);
+      if (!issueId) {
+        console.log(`[DRIVE] Arquivo sem ID de tarefa no nome, ignorado: ${file.name}`);
+        continue;
+      }
+
+      const issue = await fetchRedmineIssueById(issueId);
+      const projectName = issue?.project?.name || '';
+
+      const productConfig = getCustomFieldValue(issue, [
+        PRODUCT_CONFIG_FIELD_NAME,
+        'Configuração Produto',
+        'Configuracao do Produto',
+        'Produto'
+      ]);
+
+      const personalizationNumber = getCustomFieldValue(issue, [
+        PERSONALIZATION_NUMBER_FIELD_NAME,
+        'Personalização',
+        'Personalizacao',
+        'Número Personalização',
+        'Numero Personalizacao'
+      ]) || productConfig;
+
+      if (!personalizationNumber) {
+        console.log(`[DRIVE] Task #${issueId} sem número de personalização/configuração do produto.`);
+        continue;
+      }
+
+      const personalizationFolder = await findFolderContainingText(
+        drive,
+        String(personalizationNumber),
+        GOOGLE_DRIVE_CLIENTES_FOLDER_ID
+      );
+
+      if (!personalizationFolder) {
+        console.log(`[DRIVE] Pasta da personalização ${personalizationNumber} não encontrada para Task #${issueId}. Projeto: ${projectName}`);
+        continue;
+      }
+
+      const trainingsFolder = await findOrCreateTrainingsFolder(drive, personalizationFolder.id);
+      await moveDriveFileToFolder(drive, file, trainingsFolder.id);
+      const destinationDescription = `${personalizationFolder.name}/${trainingsFolder.name}`;
+      await addVideoDurationJournalAfterMove(drive, file, issueId, destinationDescription);
+
+      console.log(
+        `[DRIVE] Arquivo "${file.name}" movido para ${personalizationFolder.name}/${trainingsFolder.name}. ` +
+        `Task #${issueId}${fileDate ? `, data ${fileDate}` : ''}, projeto: ${projectName || 'não informado'}.`
+      );
+    } catch (err) {
+      console.error(`[DRIVE] Falha ao processar "${file.name}":`, err.message);
+    }
+  }
+}
+
+// ---------------------------------------------------------
+// OUTRAS ROTINAS EM PARALELO (SUMMARIES)
 // ---------------------------------------------------------
 async function processDailySummary() { /* Lógica existente */ }
 async function processClientMorningSummary() { /* Lógica existente */ }
-async function processMeetRecordings() { /* Lógica existente do Google Drive */ }
 
 // ---------------------------------------------------------
 // INICIALIZADORES DOS LOOPS RECURSIVOS (TIMEOUT DINÂMICO)
@@ -317,7 +646,7 @@ setInterval(() => {
 
 setInterval(() => {
   processMeetRecordings().catch(err => console.error('[DRIVE ERR]:', err.message));
-}, 60 * 1000);
+}, Math.max(60, Number(DRIVE_MOVER_INTERVAL_SECONDS) || 300) * 1000);
 
 // Inicialização do servidor Express
 app.listen(PORT, () => {
