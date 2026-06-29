@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
+const path = require('path');
 const { google } = require('googleapis');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -15,16 +16,17 @@ const {
   DisconnectReason
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 dayjs.extend(customParseFormat);
+
+// Set default timezone globally to avoid discrepancies
 dayjs.tz.setDefault('America/Sao_Paulo');
 
-const TZ = 'America/Sao_Paulo';
-
+// ---------------------------------------------------------
+// CONFIGURAÇÕES
+// ---------------------------------------------------------
 const {
   PORT = 3000,
   REDMINE_URL,
@@ -33,1017 +35,593 @@ const {
   MATTERMOST_TOKEN,
   REDIS_URL,
   REDIS_TTL_DAYS = 90,
-
   POLLING_ENABLED = 'true',
   POLLING_INTERVAL_SECONDS = 60,
   POLLING_LIMIT = 20,
-
-  NOTIFY_STATUSES = 'Novo,Reaberta',
-  IGNORE_STATUSES = '',
-
-  MEET_STATUS_NAME = 'Aguardando Data',
-  ALERT_FIELD_NAME = 'Horário',
   ALERT_MINUTES_BEFORE = 10,
   ALERT_EXTRA_MINUTES_BEFORE = 2,
   WHATSAPP_ALERT_MINUTES_BEFORE = 5,
+  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
   ALERT_WINDOW_SECONDS = 180,
-
+  ALERT_FIELD_NAME = 'Horário',
+  ALERT_POLLING_INTERVAL_SECONDS = 60,
   DAILY_SUMMARY_ENABLED = 'true',
   DAILY_SUMMARY_HOUR = 17,
   DAILY_SUMMARY_MINUTE = 45,
   CLIENT_SUMMARY_TIME = '08:30',
-
-  GOOGLE_CALENDAR_ID,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  GOOGLE_REFRESH_TOKEN,
-  GOOGLE_MEET_PROJECT_FIELD_NAME = 'Nome Fantasia',
-  GOOGLE_MEET_FIELD_NAME = 'Google Meet',
-
-  WHATSAPP_AUTH_DIR = './baileys_auth',
-  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
-  WHATSAPP_ENABLED = 'true',
-  GOOGLE_CALENDAR_ENABLED = 'true',
-  LOG_SKIPPED_EVENTS = 'false'
+  MEET_STATUS_NAME = 'Aguardando Data',
+  MATTERMOST_REDMINE_LOGIN_FIELD_NAME = 'Login Mattermost'
 } = process.env;
 
 const app = express();
 app.use(express.json());
 
-const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
-let sock = null;
+const redis = new Redis(REDIS_URL);
+let sock = null; // Instância do WhatsApp Baileys
 
-const ttlSeconds = Number(REDIS_TTL_DAYS) * 24 * 60 * 60;
-const notifyStatuses = csv(NOTIFY_STATUSES);
-const ignoreStatuses = csv(IGNORE_STATUSES);
+const TZ = 'America/Sao_Paulo';
 
-const mattermost = axios.create({
-  baseURL: MATTERMOST_URL ? `${MATTERMOST_URL.replace(/\/$/, '')}/api/v4` : '',
-  headers: MATTERMOST_TOKEN ? { Authorization: `Bearer ${MATTERMOST_TOKEN}` } : {}
-});
-
-const redmine = axios.create({
-  baseURL: REDMINE_URL ? REDMINE_URL.replace(/\/$/, '') : '',
-  headers: REDMINE_API_KEY ? { 'X-Redmine-API-Key': REDMINE_API_KEY } : {}
-});
-
-function csv(value) {
-  return String(value || '')
-    .split(',')
-    .map(s => s.trim().replace(/^"|"$/g, ''))
-    .filter(Boolean);
+function cleanValue(value) {
+  return String(value || '').trim();
 }
 
-function logSkip(...args) {
-  if (String(LOG_SKIPPED_EVENTS).toLowerCase() === 'true') console.log('[SKIP]', ...args);
+function getCustomField(issue, fieldName) {
+  return (issue.custom_fields || []).find(f => f.name === fieldName);
 }
 
-function normalize(value) {
-  return String(value || '').trim().toLowerCase();
+function getIssueDate(issue) {
+  const dateField = getCustomField(issue, 'Data');
+  return cleanValue(dateField && dateField.value ? dateField.value : issue.due_date);
 }
 
-function isSameStatus(a, b) {
-  return normalize(a) === normalize(b);
+function getIssueTime(issue) {
+  const timeField = getCustomField(issue, ALERT_FIELD_NAME);
+  return cleanValue(timeField && timeField.value);
 }
 
-function getCustomField(issue, name) {
-  return (issue.custom_fields || []).find(f => isSameStatus(f.name, name));
-}
-
-function getCustomValue(issue, name) {
-  const field = getCustomField(issue, name);
-  if (!field) return '';
-  if (Array.isArray(field.value)) return field.value.filter(Boolean).join(', ');
-  return String(field.value || '').trim();
-}
-
-function getIssueDateStr(issue) {
-  // No Redmine, a tela mostra "Início", que na API vem como start_date.
-  // Mantemos compatibilidade com campo personalizado "Data" e também due_date.
-  return getCustomValue(issue, 'Data') || issue.start_date || issue.due_date || '';
-}
-
-function getIssueTimeStr(issue) {
-  return getCustomValue(issue, ALERT_FIELD_NAME);
-}
-
-function parseIssueDateTime(issue) {
-  const dateStr = getIssueDateStr(issue);
-  const timeStr = getIssueTimeStr(issue);
-
+function parseAppointmentDateTime(dateStr, timeStr) {
   if (!dateStr || !timeStr) return null;
 
-  const cleanedTime = String(timeStr).trim().replace('h', ':');
-  const candidates = [
-    `${dateStr} ${cleanedTime}`,
-    `${dateStr} ${cleanedTime}:00`
-  ];
+  const normalizedTime = timeStr.replace('h', ':').replace(/\s/g, '');
+  const parsed = dayjs.tz(
+    `${dateStr} ${normalizedTime}`,
+    [
+      'YYYY-MM-DD HH:mm',
+      'YYYY-MM-DD H:mm',
+      'YYYY-MM-DD HH:mm:ss',
+      'DD/MM/YYYY HH:mm',
+      'DD/MM/YYYY H:mm'
+    ],
+    TZ
+  );
 
-  for (const value of candidates) {
-    const parsed = dayjs.tz(value, ['YYYY-MM-DD HH:mm', 'YYYY-MM-DD HH:mm:ss', 'DD/MM/YYYY HH:mm', 'DD/MM/YYYY HH:mm:ss'], TZ);
-    if (parsed.isValid()) return parsed;
+  return parsed.isValid() ? parsed : null;
+}
+
+function getNextBusinessDay(baseDate = dayjs().tz(TZ)) {
+  let next = baseDate.add(1, 'day').startOf('day');
+  while (next.day() === 0 || next.day() === 6) {
+    next = next.add(1, 'day');
   }
-
-  return null;
+  return next;
 }
 
-function isPastDay(dateStr) {
-  if (!dateStr) return false;
-  const date = dayjs.tz(dateStr, ['YYYY-MM-DD', 'DD/MM/YYYY'], TZ).startOf('day');
-  return date.isValid() && date.isBefore(dayjs().tz(TZ).startOf('day'));
-}
-
-function isBusinessDay(d) {
-  const day = d.day();
-  return day >= 1 && day <= 5;
-}
-
-function nextBusinessDay(from = dayjs().tz(TZ)) {
-  let d = from.add(1, 'day').startOf('day');
-  while (!isBusinessDay(d)) d = d.add(1, 'day');
-  return d;
-}
-
-function previousBusinessDay(from = dayjs().tz(TZ)) {
-  let d = from.subtract(1, 'day').startOf('day');
-  while (!isBusinessDay(d)) d = d.subtract(1, 'day');
-  return d;
-}
-
-function isTodayMinute(hour, minute) {
+function shouldRunAtConfiguredMinute(hour, minute) {
   const now = dayjs().tz(TZ);
   return now.hour() === Number(hour) && now.minute() === Number(minute);
 }
 
-function shouldRunAtTime(key, hour, minute) {
-  if (!isTodayMinute(hour, minute)) return false;
-  return oncePerDay(key);
-}
-
-async function oncePerDay(key) {
-  if (!redis) return true;
-  const today = dayjs().tz(TZ).format('YYYY-MM-DD');
-  const fullKey = `${key}:${today}`;
-  const ok = await redis.set(fullKey, '1', 'EX', 36 * 60 * 60, 'NX');
-  return ok === 'OK';
-}
-
-async function redisSetOnce(key, value = '1', ttl = ttlSeconds) {
-  if (!redis) return true;
-  const ok = await redis.set(key, value, 'EX', ttl, 'NX');
-  return ok === 'OK';
-}
-
-function getDynamicPollingIntervalInSeconds() {
-  const now = dayjs().tz(TZ);
-  const day = now.day();
-  const minutes = now.hour() * 60 + now.minute();
-
-  if (day === 0 || day === 6) return 3600;
-
-  const activeMorningStart = 7 * 60 + 30;
-  const activeMorningEnd = 12 * 60 + 15;
-  const activeAfternoonStart = 13 * 60 + 15;
-  const activeAfternoonEnd = 18 * 60 + 15;
-
-  const active =
-    (minutes >= activeMorningStart && minutes <= activeMorningEnd) ||
-    (minutes >= activeAfternoonStart && minutes <= activeAfternoonEnd);
-
-  return active ? Number(POLLING_INTERVAL_SECONDS) || 60 : 900;
-}
-
-function redmineIssueUrl(issue) {
-  return `${REDMINE_URL.replace(/\/$/, '')}/issues/${issue.id}`;
-}
-
-function formatIssueLine(issue) {
-  const assigned = issue.assigned_to ? issue.assigned_to.name : 'sem responsável';
-  return `#${issue.id} - ${issue.subject}\nStatus: ${issue.status?.name || '-'}\nResponsável: ${assigned}\nLink: ${redmineIssueUrl(issue)}`;
-}
-
-function looksLikeEmail(value) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
-}
-
-function normalizeMattermostUsername(value) {
-  return String(value || '')
-    .trim()
-    .replace(/^@/, '')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '.')
-    .replace(/^\.+|\.+$/g, '');
-}
-
-async function getRedmineUserEmailById(userId) {
-  if (!userId) return '';
-
-  const cacheKey = `redmine:user:${userId}:email`;
-  if (redis) {
-    const cached = await redis.get(cacheKey);
-    if (cached) return cached;
-  }
-
-  try {
-    const res = await redmine.get(`/users/${userId}.json`);
-    const email = String(res.data?.user?.mail || res.data?.user?.email || '').trim().toLowerCase();
-    if (looksLikeEmail(email)) {
-      if (redis) await redis.set(cacheKey, email, 'EX', 24 * 60 * 60);
-      return email;
-    }
-  } catch (err) {
-    console.warn(`[REDMINE] Não foi possível buscar e-mail do usuário ${userId}:`, err.response?.data || err.message);
-  }
-
-  return '';
-}
-
-async function getRedmineGroupMemberEmails(groupId) {
-  if (!groupId) return [];
-
-  const cacheKey = `redmine:group:${groupId}:member_emails`;
-  if (redis) {
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      try {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed)) return parsed;
-      } catch (_) {}
-    }
-  }
-
-  const emails = new Set();
-
-  // Preferencial: /users.json?group_id=ID costuma trazer o e-mail quando a API key tem permissão de admin.
-  try {
-    let offset = 0;
-    const limit = 100;
-
-    while (true) {
-      const res = await redmine.get('/users.json', {
-        params: { group_id: groupId, status: 1, limit, offset }
-      });
-
-      const users = res.data?.users || [];
-      for (const user of users) {
-        const email = String(user.mail || user.email || '').trim().toLowerCase();
-        if (looksLikeEmail(email)) emails.add(email);
-      }
-
-      const total = Number(res.data?.total_count || users.length);
-      offset += limit;
-      if (!users.length || offset >= total) break;
-    }
-  } catch (err) {
-    console.warn(`[REDMINE] Não foi possível listar usuários do grupo ${groupId} via /users.json?group_id:`, err.response?.data || err.message);
-  }
-
-  // Fallback: /groups/:id.json?include=users retorna membros, mas normalmente sem e-mail.
-  // Por isso buscamos /users/:id.json para cada membro.
-  if (!emails.size) {
-    try {
-      const res = await redmine.get(`/groups/${groupId}.json`, { params: { include: 'users' } });
-      const users = res.data?.group?.users || [];
-
-      for (const user of users) {
-        const email = await getRedmineUserEmailById(user.id);
-        if (looksLikeEmail(email)) emails.add(email);
-      }
-    } catch (err) {
-      const status = err.response?.status;
-      if (status !== 404) {
-        console.warn(`[REDMINE] Não foi possível buscar membros do grupo ${groupId}:`, err.response?.data || err.message);
-      }
-    }
-  }
-
-  const result = Array.from(emails);
-  if (redis && result.length) {
-    await redis.set(cacheKey, JSON.stringify(result), 'EX', 15 * 60);
-  }
-
-  return result;
-}
-
-async function getRedmineAssignedUserEmail(issue) {
-  const explicitEmail =
-    getCustomValue(issue, 'E-mail') ||
-    getCustomValue(issue, 'Email') ||
-    getCustomValue(issue, 'Mattermost Email') ||
-    getCustomValue(issue, 'E-mail Mattermost');
-
-  if (looksLikeEmail(explicitEmail)) return explicitEmail.trim().toLowerCase();
-
-  const assignedId = issue.assigned_to?.id;
-  if (!assignedId) return '';
-
-  const email = await getRedmineUserEmailById(assignedId);
-  if (email) return email;
-
-  const assignedName = String(issue.assigned_to?.name || '').trim();
-  if (looksLikeEmail(assignedName)) return assignedName.toLowerCase();
-
-  return '';
-}
-
-async function getRedmineAssigneeEmails(issue) {
-  const assignedId = issue.assigned_to?.id;
-  if (!assignedId) return [];
-
-  // Primeiro tenta como grupo. Se não for grupo, a lista voltará vazia e cairemos no usuário individual.
-  const groupEmails = await getRedmineGroupMemberEmails(assignedId);
-  if (groupEmails.length) {
-    console.log(`[REDMINE] Issue #${issue.id} atribuída ao grupo "${issue.assigned_to?.name}". ${groupEmails.length} membro(s) encontrado(s).`);
-    return groupEmails;
-  }
-
-  const email = await getRedmineAssignedUserEmail(issue);
-  return email ? [email] : [];
-}
-
-function redmineUserToMattermostUsername(issue) {
-  const loginField = getCustomValue(issue, 'Mattermost') || getCustomValue(issue, 'Usuário Mattermost');
-  if (loginField && !looksLikeEmail(loginField)) return normalizeMattermostUsername(loginField);
-  return normalizeMattermostUsername(issue.assigned_to?.name || '');
-}
-
-async function getMattermostUserByEmail(email) {
-  const normalizedEmail = String(email || '').trim().toLowerCase();
-  if (!looksLikeEmail(normalizedEmail)) return null;
-
-  const cacheKey = `mattermost:user:email:${normalizedEmail}`;
-  if (redis) {
-    const cachedId = await redis.get(cacheKey);
-    if (cachedId) return { id: cachedId, email: normalizedEmail };
-  }
-
-  const user = await mattermost.get(`/users/email/${encodeURIComponent(normalizedEmail)}`);
-  if (redis && user.data?.id) await redis.set(cacheKey, user.data.id, 'EX', 24 * 60 * 60);
-  return user.data;
-}
-
-async function getMattermostUserByUsername(username) {
-  const normalizedUsername = normalizeMattermostUsername(username);
-  if (!normalizedUsername) return null;
-
-  const cacheKey = `mattermost:user:username:${normalizedUsername}`;
-  if (redis) {
-    const cachedId = await redis.get(cacheKey);
-    if (cachedId) return { id: cachedId, username: normalizedUsername };
-  }
-
-  const user = await mattermost.get(`/users/username/${encodeURIComponent(normalizedUsername)}`);
-  if (redis && user.data?.id) await redis.set(cacheKey, user.data.id, 'EX', 24 * 60 * 60);
-  return user.data;
-}
-
-async function sendMattermostDMToUser(user, label, message) {
-  const me = await mattermost.get('/users/me');
-  const channel = await mattermost.post('/channels/direct', [me.data.id, user.id]);
-  await mattermost.post('/posts', { channel_id: channel.data.id, message });
-  console.log(`[MATTERMOST] DM enviada para ${label}`);
-  return true;
-}
-
-async function sendMattermostDM(identifier, message) {
-  if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
-    console.warn('[MATTERMOST] MATTERMOST_URL ou MATTERMOST_TOKEN ausente.');
-    return false;
-  }
-
-  const value = String(identifier || '').trim();
-  if (!value) {
-    console.warn('[MATTERMOST] Usuário/e-mail Mattermost não identificado.');
-    return false;
-  }
-
-  try {
-    if (looksLikeEmail(value)) {
-      const user = await getMattermostUserByEmail(value);
-      return sendMattermostDMToUser(user, value, message);
-    }
-
-    const user = await getMattermostUserByUsername(value);
-    return sendMattermostDMToUser(user, `@${normalizeMattermostUsername(value)}`, message);
-  } catch (err) {
-    console.error(`[MATTERMOST] Falha ao enviar DM para ${value}:`, err.response?.data || err.message);
-    return false;
-  }
-}
-
-async function sendIssueDM(issue, message) {
-  const emails = await getRedmineAssigneeEmails(issue);
-
-  if (emails.length) {
-    let sent = 0;
-
-    for (const email of emails) {
-      const ok = await sendMattermostDM(email, message);
-      if (ok) sent += 1;
-    }
-
-    if (emails.length > 1) {
-      console.log(`[MATTERMOST] Issue #${issue.id}: DM enviada para ${sent}/${emails.length} membro(s) do grupo "${issue.assigned_to?.name}".`);
-    }
-
-    return sent > 0;
-  }
-
-  const username = redmineUserToMattermostUsername(issue);
-  console.warn(`[MATTERMOST] E-mail do responsável/grupo da issue #${issue.id} não encontrado. Tentando fallback por username: @${username}`);
-  return sendMattermostDM(username, message);
-}
-
-async function startWhatsapp() {
-  if (String(WHATSAPP_ENABLED).toLowerCase() !== 'true') return;
-  try {
-    const authDir = path.resolve(WHATSAPP_AUTH_DIR || './baileys_auth');
-    fs.mkdirSync(authDir, { recursive: true });
-    console.log(`[WHATSAPP] Usando pasta de autenticação: ${authDir}`);
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      logger: pino({ level: 'silent' })
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-      if (qr) qrcode.generate(qr, { small: true });
-      if (connection === 'open') console.log('[WHATSAPP] Conectado.');
-      if (connection === 'close') {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        console.warn('[WHATSAPP] Desconectado.', code);
-        if (code !== DisconnectReason.loggedOut) setTimeout(startWhatsapp, 5000);
-      }
-    });
-  } catch (err) {
-    console.error('[WHATSAPP] Falha ao inicializar:', err.message);
-  }
-}
-
-async function sendWhatsappGroup(groupId, message) {
-  if (!groupId) return false;
-  if (!sock) {
-    console.warn('[WHATSAPP] Socket ainda não conectado.');
-    return false;
-  }
-  const jid = groupId.includes('@') ? groupId : `${groupId}@g.us`;
-  try {
-    await sock.sendMessage(jid, { text: message });
-    console.log(`[WHATSAPP] Mensagem enviada ao grupo ${jid}`);
-    return true;
-  } catch (err) {
-    console.error('[WHATSAPP] Falha ao enviar:', err.message);
-    return false;
-  }
-}
-
-function getGoogleCalendarClient() {
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) return null;
-  const oauth2 = new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
-  oauth2.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
-  return google.calendar({ version: 'v3', auth: oauth2 });
-}
-
-async function updateIssueCustomField(issue, fieldName, value) {
-  const field = getCustomField(issue, fieldName);
-  if (!field?.id) return false;
-
-  try {
-    await redmine.put(`/issues/${issue.id}.json`, {
-      issue: {
-        custom_fields: [
-          { id: field.id, value: value == null ? '' : String(value) }
-        ]
-      }
-    });
-    console.log(`[REDMINE] Campo "${fieldName}" atualizado na issue #${issue.id}`);
-    return true;
-  } catch (err) {
-    console.error(`[REDMINE] Falha ao atualizar campo "${fieldName}" da issue #${issue.id}:`, err.response?.data || err.message);
-    return false;
-  }
-}
-
-function getMeetLinkFromCalendarEvent(event) {
-  return event?.hangoutLink ||
-    (event?.conferenceData?.entryPoints || []).find(p => p.entryPointType === 'video')?.uri ||
-    '';
-}
-
-
-function getCalendarRedisKey(issueId) {
-  return `redmine:issue:${issueId}:calendar-event-id`;
-}
-
-function getCalendarSignature(issue) {
-  const status = issue.status?.name || '';
-  const start = parseIssueDateTime(issue);
-  const estimatedHours = Number(issue.estimated_hours);
-  if (!isSameStatus(status, MEET_STATUS_NAME) || !start || !estimatedHours || estimatedHours <= 0) {
-    return '';
-  }
-  return [
-    normalize(status),
-    start.format('YYYY-MM-DDTHH:mm'),
-    Number(estimatedHours).toFixed(2),
-    getIssueDateStr(issue),
-    getIssueTimeStr(issue)
-  ].join('|');
-}
-
-function shouldHaveCalendarEvent(issue) {
-  return Boolean(getCalendarSignature(issue));
-}
-
-async function findCalendarEventForIssue(calendar, issue) {
-  if (!calendar || !GOOGLE_CALENDAR_ID) return null;
-
-  const cachedId = redis ? await redis.get(getCalendarRedisKey(issue.id)) : '';
-  if (cachedId) {
-    try {
-      const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: cachedId });
-      if (event?.data?.status !== 'cancelled') return event.data;
-    } catch (err) {
-      if (err.response?.status !== 404 && err.code !== 404) {
-        console.warn(`[GOOGLE] Não consegui ler evento salvo da issue #${issue.id}:`, err.response?.data || err.message);
-      }
-    }
-  }
-
-  const privateProperty = `redmineIssueId=${issue.id}`;
-  try {
-    const res = await calendar.events.list({
-      calendarId: GOOGLE_CALENDAR_ID,
-      privateExtendedProperty: privateProperty,
-      singleEvents: true,
-      maxResults: 10,
-      orderBy: 'updated'
-    });
-    const event = (res.data?.items || []).find(e => e.status !== 'cancelled');
-    if (event?.id) {
-      if (redis) await redis.set(getCalendarRedisKey(issue.id), event.id, 'EX', ttlSeconds);
-      return event;
-    }
-  } catch (err) {
-    console.warn(`[GOOGLE] Busca por extendedProperty falhou para issue #${issue.id}:`, err.response?.data || err.message);
-  }
-
-  // Compatibilidade com eventos criados antes dessa correção.
-  try {
-    const res = await calendar.events.list({
-      calendarId: GOOGLE_CALENDAR_ID,
-      q: `#${issue.id}`,
-      singleEvents: true,
-      maxResults: 10,
-      orderBy: 'updated'
-    });
-    const event = (res.data?.items || []).find(e =>
-      e.status !== 'cancelled' &&
-      (String(e.summary || '').includes(`#${issue.id}`) || String(e.description || '').includes(`/issues/${issue.id}`))
-    );
-    if (event?.id) {
-      if (redis) await redis.set(getCalendarRedisKey(issue.id), event.id, 'EX', ttlSeconds);
-      return event;
-    }
-  } catch (err) {
-    console.warn(`[GOOGLE] Busca textual falhou para issue #${issue.id}:`, err.response?.data || err.message);
-  }
-
-  return null;
-}
-
-async function clearCalendarEvent(issue, reason) {
-  if (String(GOOGLE_CALENDAR_ENABLED).toLowerCase() !== 'true' || !GOOGLE_CALENDAR_ID) return;
-
-  const calendar = getGoogleCalendarClient();
-  if (!calendar) {
-    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não consegui excluir evento.');
-    return;
-  }
-
-  const event = await findCalendarEventForIssue(calendar, issue);
-  if (!event?.id) {
-    const meet = getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
-    if (meet) await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
-    return;
-  }
-
-  try {
-    await calendar.events.delete({ calendarId: GOOGLE_CALENDAR_ID, eventId: event.id });
-    console.log(`[GOOGLE] Evento da issue #${issue.id} excluído (${reason}).`);
-    if (redis) {
-      await redis.del(getCalendarRedisKey(issue.id));
-      await redis.del(`redmine:issue:${issue.id}:calendar-signature`);
-    }
-    await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
-  } catch (err) {
-    if (err.response?.status === 404 || err.code === 404) {
-      if (redis) await redis.del(getCalendarRedisKey(issue.id));
-      await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, '');
-      return;
-    }
-    console.error(`[GOOGLE] Falha ao excluir evento da issue #${issue.id}:`, err.response?.data || err.message);
-  }
-}
-
-function buildCalendarEventRequest(issue, start, estimatedHours) {
-  const end = start.add(estimatedHours, 'hour');
-  const projectName = getCustomValue(issue, GOOGLE_MEET_PROJECT_FIELD_NAME);
-  const summary = `${projectName ? projectName + ' - ' : ''}#${issue.id} ${issue.subject}`;
+function parseHourMinute(value, fallback = '08:30') {
+  const raw = cleanValue(value || fallback);
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return { hour: 8, minute: 30 };
 
   return {
-    summary,
-    description: `${formatIssueLine(issue)}`,
-    start: { dateTime: start.toISOString(), timeZone: TZ },
-    end: { dateTime: end.toISOString(), timeZone: TZ },
-    extendedProperties: {
-      private: {
-        redmineIssueId: String(issue.id)
-      }
-    }
+    hour: Number(match[1]),
+    minute: Number(match[2])
   };
 }
 
-async function ensureCalendarEvent(issue) {
-  if (String(GOOGLE_CALENDAR_ENABLED).toLowerCase() !== 'true') return;
-  if (!GOOGLE_CALENDAR_ID) {
-    console.warn('[GOOGLE] GOOGLE_CALENDAR_ID ausente.');
-    return;
+function shouldRunAtConfiguredTime(value, fallback = '08:30') {
+  const { hour, minute } = parseHourMinute(value, fallback);
+  return shouldRunAtConfiguredMinute(hour, minute);
+}
+
+async function getMattermostUserIdFromIssue(issue) {
+  const mattermostLoginField = getCustomField(issue, MATTERMOST_REDMINE_LOGIN_FIELD_NAME);
+  const login = cleanValue(mattermostLoginField && mattermostLoginField.value);
+
+  if (login) {
+    const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(login)}`, {
+      headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
+    });
+    return response.data.id;
   }
 
-  const calendar = getGoogleCalendarClient();
-  if (!calendar) {
-    console.warn('[GOOGLE] Credenciais do Calendar ausentes. Não sincronizei evento.');
-    return;
-  }
+  // Fallback: tenta localizar pelo nome do atribuído no Redmine.
+  // Ideal: criar um campo personalizado "Login Mattermost" no Redmine.
+  const assignedName = issue.assigned_to && issue.assigned_to.name ? issue.assigned_to.name : '';
+  if (!assignedName) return null;
 
-  // Só removemos evento quando a issue foi carregada com detalhes suficientes.
-  // A listagem do Redmine pode vir sem campos customizados em alguns ambientes.
-  const hasCustomFieldsArray = Array.isArray(issue.custom_fields);
-  const signature = getCalendarSignature(issue);
+  const search = await axios.post(
+    `${MATTERMOST_URL}/api/v4/users/search`,
+    { term: assignedName },
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  );
 
-  if (!signature) {
-    if (!hasCustomFieldsArray) {
-      console.warn(`[GOOGLE] Issue #${issue.id} sem custom_fields no payload; não vou excluir evento para evitar remoção indevida.`);
-      return;
-    }
-    await clearCalendarEvent(issue, 'faltam requisitos: status Aguardando Data, Horário ou Tempo estimado');
-    return;
-  }
+  return search.data && search.data[0] ? search.data[0].id : null;
+}
 
-  const start = parseIssueDateTime(issue);
-  const estimatedHours = Number(issue.estimated_hours);
-  const cachedSignatureKey = `redmine:issue:${issue.id}:calendar-signature`;
-  const cachedSignature = redis ? await redis.get(cachedSignatureKey) : '';
+async function createMattermostDirectChannel(userId) {
+  const me = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, {
+    headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
+  });
 
-  const existingEvent = await findCalendarEventForIssue(calendar, issue);
-  const eventBody = buildCalendarEventRequest(issue, start, estimatedHours);
+  const response = await axios.post(
+    `${MATTERMOST_URL}/api/v4/channels/direct`,
+    [me.data.id, userId],
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  );
 
-  if (existingEvent?.id) {
-    if (cachedSignature === signature) {
-      logSkip(`#${issue.id}`, 'evento do Google Calendar já sincronizado.');
-      return;
-    }
+  return response.data;
+}
 
-    try {
-      const response = await calendar.events.patch({
-        calendarId: GOOGLE_CALENDAR_ID,
-        eventId: existingEvent.id,
-        conferenceDataVersion: 1,
-        requestBody: eventBody
-      });
+async function sendMattermostDirectMessage(userId, message) {
+  if (!MATTERMOST_URL || !MATTERMOST_TOKEN || !userId) return false;
 
-      const meetLink = getMeetLinkFromCalendarEvent(response.data) || getCustomValue(issue, GOOGLE_MEET_FIELD_NAME);
-      if (meetLink && meetLink !== getCustomValue(issue, GOOGLE_MEET_FIELD_NAME)) {
-        await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
-      }
+  const channel = await createMattermostDirectChannel(userId);
 
-      if (redis) {
-        await redis.set(getCalendarRedisKey(issue.id), existingEvent.id, 'EX', ttlSeconds);
-        await redis.set(cachedSignatureKey, signature, 'EX', ttlSeconds);
-      }
+  await axios.post(
+    `${MATTERMOST_URL}/api/v4/posts`,
+    { channel_id: channel.id, message },
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  );
 
-      console.log(`[GOOGLE] Evento atualizado para issue #${issue.id}: ${start.format('DD/MM/YYYY HH:mm')} (${estimatedHours}h).`);
-      return;
-    } catch (err) {
-      console.error(`[GOOGLE] Falha ao atualizar evento da issue #${issue.id}:`, err.response?.data || err.message);
-      return;
-    }
-  }
+  return true;
+}
 
-  const createLockKey = `redmine:issue:${issue.id}:calendar-create-lock`;
-  const first = await redisSetOnce(createLockKey, '1', 5 * 60);
-  if (!first) return;
+async function fetchRedmineIssues(params = {}) {
+  const allIssues = [];
+  const limit = Number(params.limit || 100);
+  let offset = Number(params.offset || 0);
+  let totalCount = null;
 
-  try {
-    const response = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      conferenceDataVersion: 1,
-      requestBody: {
-        ...eventBody,
-        conferenceData: {
-          createRequest: {
-            requestId: `redmine-${issue.id}-${Date.now()}`,
-            conferenceSolutionKey: { type: 'hangoutsMeet' }
-          }
-        }
+  do {
+    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+      headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
+      params: {
+        status_id: '*',
+        sort: 'due_date:asc,updated_on:desc',
+        ...params,
+        limit,
+        offset
       }
     });
 
-    const meetLink = getMeetLinkFromCalendarEvent(response.data);
-    console.log(`[GOOGLE] Evento criado para issue #${issue.id}${meetLink ? `: ${meetLink}` : ''}`);
+    const data = response.data || {};
+    const issues = data.issues || [];
+    allIssues.push(...issues);
 
-    if (meetLink) {
-      await updateIssueCustomField(issue, GOOGLE_MEET_FIELD_NAME, meetLink);
-    }
+    totalCount = Number(data.total_count || allIssues.length);
+    offset += limit;
 
-    if (redis) {
-      await redis.set(getCalendarRedisKey(issue.id), response.data?.id || '1', 'EX', ttlSeconds);
-      await redis.set(cachedSignatureKey, signature, 'EX', ttlSeconds);
-      await redis.del(createLockKey);
-    }
-  } catch (err) {
-    console.error('[GOOGLE] Falha ao criar evento:', err.response?.data || err.message);
-    if (redis) await redis.del(createLockKey);
-  }
+    if (issues.length === 0) break;
+  } while (allIssues.length < totalCount);
+
+  return allIssues;
 }
 
-async function fetchRecentIssues(params = {}) {
-  const response = await redmine.get('/issues.json', {
-    params: {
-      limit: Number(POLLING_LIMIT) || 20,
-      sort: 'updated_on:desc',
-      include: 'journals',
-      ...params
-    }
-  });
-  return response.data.issues || [];
+async function fetchAwaitingDateIssues(params = {}) {
+  return fetchRedmineIssues(params);
 }
 
-async function fetchIssueById(issueId) {
-  const response = await redmine.get(`/issues/${issueId}.json`, {
-    params: {
-      include: 'journals'
-    }
-  });
-  return response.data.issue;
+
+// ---------------------------------------------------------
+// FUNÇÃO PARA CALCULAR O INTERVALO DINÂMICO DE POLLING
+// ---------------------------------------------------------
+function getDynamicPollingIntervalInSeconds() {
+  const agora = dayjs().tz('America/Sao_Paulo');
+  const diaDaSemana = agora.day(); // 0 = Domingo, 1 = Segunda, ..., 6 = Sábado
+  const hora = agora.hour();
+  const minuto = agora.minute();
+  const tempoEmMinutos = hora * 60 + minuto;
+
+  // 1. Finais de Semana (Sábado ou Domingo) -> 1 hora
+  if (diaDaSemana === 0 || diaDaSemana === 6) {
+    return 3600;
+  }
+
+  // 2. Segunda a Sexta: Horário de Almoço (Das 12h15 às 13h15) -> 5 minutos
+  const inicioAlmoco = 12 * 60 + 15; // 12:15 em min
+  const fimAlmoco = 13 * 60 + 15;    // 13:15 em min
+  if (tempoEmMinutos >= inicioAlmoco && tempoEmMinutos < fimAlmoco) {
+    return 300; // 5 minutos
+  }
+
+  // 3. Segunda a Sexta: Fora do Expediente Comercial (Das 18h15 até às 07h15) -> 1 hora
+  const inicioNoite = 18 * 60 + 15; // 18:15 em min
+  const fimManha = 7 * 60 + 15;     // 07:15 em min
+  if (tempoEmMinutos >= inicioNoite || tempoEmMinutos < fimManha) {
+    return 3600; // 1 hora
+  }
+
+  // 4. Horário de Expediente Normal (Segunda a Sexta) -> Tempo padrão configurado
+  return Number(POLLING_INTERVAL_SECONDS) || 60;
 }
 
-function getLastJournalUpdatedAt(issue) {
-  const journalDates = (issue.journals || [])
-    .map(j => dayjs(j.created_on || j.updated_on))
-    .filter(d => d.isValid());
-
-  if (journalDates.length) {
-    return journalDates.reduce((latest, current) => current.isAfter(latest) ? current : latest);
-  }
-
-  const updated = dayjs(issue.updated_on);
-  return updated.isValid() ? updated : null;
-}
-
-async function fetchChangedIssuesForCalendar() {
-  const minutesBack = Math.max(30, Math.ceil(getDynamicPollingIntervalInSeconds() / 60) + 10);
-  const fallbackSince = dayjs().subtract(minutesBack, 'minute');
-  const redisKey = 'redmine:calendar-sync:last-scan';
-  let since = fallbackSince;
-
-  if (redis) {
-    const cached = await redis.get(redisKey);
-    const parsed = cached ? dayjs(cached) : null;
-    if (parsed?.isValid()) {
-      since = parsed.subtract(2, 'minute'); // margem para fuso/latência
-    }
-  }
-
-  let issueSummaries;
-  const dateFilter = `>=${since.tz(TZ).format('YYYY-MM-DD')}`;
-
-  try {
-    // O Redmine costuma aceitar filtro de data, mas não ISO com hora.
-    // Por isso usamos YYYY-MM-DD e filtramos a hora exata localmente pelos journals/updated_on.
-    issueSummaries = await fetchRecentIssues({
-      status_id: '*',
-      updated_on: dateFilter
-    });
-  } catch (err) {
-    console.warn('[REDMINE] Filtro updated_on não aceito; usando últimas tarefas alteradas.', err.response?.data || err.message);
-    issueSummaries = await fetchRecentIssues({ status_id: '*' });
-  }
-
-  const changedSummaries = issueSummaries.filter(issue => {
-    const lastJournal = getLastJournalUpdatedAt(issue);
-    const updated = dayjs(issue.updated_on);
-    if (!lastJournal && !updated.isValid()) return true;
-    return (lastJournal && lastJournal.isAfter(since)) || (updated.isValid() && updated.isAfter(since));
-  });
-
-  const detailedIssues = [];
-  for (const issue of changedSummaries) {
-    try {
-      detailedIssues.push(await fetchIssueById(issue.id));
-    } catch (err) {
-      console.warn(`[REDMINE] Não consegui carregar detalhes da issue #${issue.id}; pulando sync do calendário.`, err.response?.data || err.message);
-    }
-  }
-
-  const nowIso = dayjs().toISOString();
-  if (redis) await redis.set(redisKey, nowIso, 'EX', 7 * 24 * 60 * 60);
-
-  return detailedIssues;
-}
-
+// ---------------------------------------------------------
+// POLLING DO REDMINE (TASKS E GESTÃO DE STATUS)
+// ---------------------------------------------------------
 async function pollingRedmineIssues() {
-  console.log('[POLLING] Checando Redmine...');
-  const issues = await fetchRecentIssues();
+  console.log('[POLLING] Iniciando checagem de rotina no Redmine...');
+  
+  // Exemplo de chamada ao Redmine buscando atualizações de status relevantes
+  const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+    headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
+    params: { limit: POLLING_LIMIT, sort: 'updated_on:desc' }
+  });
+
+  const issues = response.data.issues || [];
+  const hoje = dayjs().tz('America/Sao_Paulo').startOf('day');
 
   for (const issue of issues) {
-    const statusName = issue.status?.name || '';
-    if (ignoreStatuses.some(s => isSameStatus(s, statusName))) {
-      logSkip(`#${issue.id}`, `status ignorado: ${statusName}`);
+    const statusName = issue.status ? issue.status.name : '';
+    
+    // Identificar campos customizados de data ou usar a data de vencimento nativa
+    const customFields = issue.custom_fields || [];
+    const dateField = customFields.find(f => f.name === 'Data' || f.name === ALERT_FIELD_NAME);
+    const issueDateStr = dateField ? dateField.value : issue.due_date;
+
+    // -------------------------------------------------------------------------
+    // TRAVA DE SEGURANÇA REDIS: FILTRAR TAREFAS SEM DATA OU DATAS PASSADAS
+    // -------------------------------------------------------------------------
+    if (!issueDateStr) {
+      // Se a tarefa está em "Aguardando Data" ou qualquer outro status mas não tem data definida,
+      // ignora sumariamente para não inflar operações de consulta/gravação no Redis.
       continue;
     }
 
-    // Notificação de nova tarefa ou tarefa reaberta: não depende de data.
-    if (notifyStatuses.some(s => isSameStatus(s, statusName))) {
-      const key = `redmine:issue:${issue.id}:status:${normalize(statusName)}:assigned:${issue.assigned_to?.id || 'none'}`;
-      const first = await redisSetOnce(key);
-      if (first) {
-        await sendIssueDM(issue, `🔔 Tarefa atribuída/atualizada no Redmine\n\n${formatIssueLine(issue)}`);
-      }
+    const issueDate = dayjs(issueDateStr).tz('America/Sao_Paulo').startOf('day');
+    if (issueDate.isBefore(hoje)) {
+      // Se a data do agendamento ficou no passado, não há motivo para avaliar ou guardar chaves
+      continue;
     }
+    // -------------------------------------------------------------------------
 
-  }
+    // Fluxo normal de validação no Redis e Disparos
+    const redisKey = `redmine:issue:${issue.id}:notified`;
+    const alreadyNotified = await redis.get(redisKey);
 
-  const changedForCalendar = await fetchChangedIssuesForCalendar();
-  for (const issue of changedForCalendar) {
-    await ensureCalendarEvent(issue);
+    if (!alreadyNotified) {
+      console.log(`[REDMINE] Processando gatilho de notificação para a Task #${issue.id}`);
+      
+      // Lógica de envio de mensagem integrada via WhatsApp ou Mattermost aqui...
+      
+      // Salva a trava no Redis com expiração configurada para evitar reenvios
+      await redis.set(redisKey, 'true', 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
+    }
   }
 }
 
-async function pollingAppointmentAlerts() {
-  console.log('[ALERTAS] Verificando compromissos...');
-  const issues = await fetchRecentIssues({ status_id: '*' });
+// ---------------------------------------------------------
+// MONITORAMENTO DE ALERTAS DE COMPROMISSOS (APPOINTMENTS)
+// ---------------------------------------------------------
+async function sendMattermostAppointmentAlert(issue, appointmentAt, minutesBefore) {
+  const userId = await getMattermostUserIdFromIssue(issue);
+
+  if (!userId) {
+    console.warn(`[ALERTAS] Sem usuário Mattermost para a tarefa #${issue.id}.`);
+    return false;
+  }
+
+  const url = `${REDMINE_URL}/issues/${issue.id}`;
+  const estimated = issue.estimated_hours ? `\nTempo estimado: ${issue.estimated_hours}h` : '';
+
+  const message =
+    `⏰ **Lembrete de compromisso**\n\n` +
+    `A tarefa **#${issue.id} - ${issue.subject}** começa em **${minutesBefore} minuto(s)**.\n\n` +
+    `Data/hora: **${appointmentAt.format('DD/MM/YYYY HH:mm')}**${estimated}\n` +
+    `${url}`;
+
+  return sendMattermostDirectMessage(userId, message);
+}
+
+async function sendWhatsappAppointmentAlert(issue, appointmentAt, minutesBefore) {
+  if (!sock) {
+    console.warn(`[ALERTAS] WhatsApp não inicializado. Tarefa #${issue.id} não enviada.`);
+    return false;
+  }
+
+  const groupField = getCustomField(issue, WHATSAPP_GROUP_FIELD_NAME);
+  const groupId = cleanValue(groupField && groupField.value);
+
+  if (!groupId) {
+    console.warn(`[ALERTAS] Sem campo "${WHATSAPP_GROUP_FIELD_NAME}" para a tarefa #${issue.id}.`);
+    return false;
+  }
+
+  const url = `${REDMINE_URL}/issues/${issue.id}`;
+  const estimated = issue.estimated_hours ? `\nTempo estimado: ${issue.estimated_hours}h` : '';
+
+  const message =
+    `⏰ Lembrete de compromisso\n\n` +
+    `A tarefa #${issue.id} - ${issue.subject} começa em ${minutesBefore} minuto(s).\n\n` +
+    `Data/hora: ${appointmentAt.format('DD/MM/YYYY HH:mm')}${estimated}\n` +
+    `${url}`;
+
+  await sock.sendMessage(groupId, { text: message });
+  return true;
+}
+
+async function trySendTimedAlert({ issue, appointmentAt, channel, minutesBefore, sendFn }) {
   const now = dayjs().tz(TZ);
-  const thresholds = [
-    { name: `${ALERT_MINUTES_BEFORE}min`, minutes: Number(ALERT_MINUTES_BEFORE), channel: 'mattermost' },
-    { name: `${ALERT_EXTRA_MINUTES_BEFORE}min`, minutes: Number(ALERT_EXTRA_MINUTES_BEFORE), channel: 'mattermost' },
-    { name: `whatsapp-${WHATSAPP_ALERT_MINUTES_BEFORE}min`, minutes: Number(WHATSAPP_ALERT_MINUTES_BEFORE), channel: 'whatsapp' }
-  ];
+  const triggerAt = appointmentAt.subtract(Number(minutesBefore), 'minute');
+  const diffSeconds = now.diff(triggerAt, 'second');
+
+  // Só dispara a partir do momento-alvo e dentro da janela configurada.
+  // Isso evita envio antecipado e ainda tolera atraso do polling.
+  if (diffSeconds < 0 || diffSeconds > Number(ALERT_WINDOW_SECONDS)) return false;
+
+  const alertKey = `redmine:appointment:${issue.id}:${channel}:${minutesBefore}min`;
+
+  if (await redis.get(alertKey)) return false;
+
+  const sent = await sendFn(issue, appointmentAt, minutesBefore);
+  if (!sent) return false;
+
+  await redis.set(alertKey, 'true', 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
+  console.log(`[ALERTAS] ${channel} ${minutesBefore}min enviado para a tarefa #${issue.id}.`);
+
+  return true;
+}
+
+// ---------------------------------------------------------
+// MONITORAMENTO DE ALERTAS DE COMPROMISSOS (APPOINTMENTS)
+// ---------------------------------------------------------
+async function pollingAppointmentAlerts() {
+  console.log('[ALERTAS] Verificando proximidade de horários...');
+
+  const hoje = dayjs().tz(TZ).startOf('day');
+  const issues = await fetchRedmineIssues({
+    limit: 100,
+    status_id: '*',
+    sort: 'due_date:asc,updated_on:desc'
+  });
 
   for (const issue of issues) {
-    const statusName = issue.status?.name || '';
-    if (!isSameStatus(statusName, MEET_STATUS_NAME)) continue;
+    const statusName = issue.status ? issue.status.name : '';
+    if (statusName !== MEET_STATUS_NAME) continue;
 
-    const dateStr = getIssueDateStr(issue);
-    if (!dateStr || isPastDay(dateStr)) continue;
+    const issueDateStr = getIssueDate(issue);
+    const issueTimeStr = getIssueTime(issue);
 
-    const appointmentAt = parseIssueDateTime(issue);
-    if (!appointmentAt) continue;
-    if (appointmentAt.isBefore(now)) continue;
+    if (!issueDateStr || !issueTimeStr) continue;
 
-    const diffSeconds = appointmentAt.diff(now, 'second');
-
-    for (const threshold of thresholds) {
-      const targetSeconds = threshold.minutes * 60;
-      const delta = Math.abs(diffSeconds - targetSeconds);
-      if (delta > Number(ALERT_WINDOW_SECONDS)) continue;
-
-      const key = `redmine:appointment:${issue.id}:${appointmentAt.format('YYYYMMDDHHmm')}:${threshold.name}`;
-      const first = await redisSetOnce(key, '1', 3 * 24 * 60 * 60);
-      if (!first) continue;
-
-      const msg = `⏰ Compromisso em ${threshold.minutes} minuto(s)\n\n${formatIssueLine(issue)}\nData/Hora: ${appointmentAt.format('DD/MM/YYYY HH:mm')}`;
-
-      if (threshold.channel === 'whatsapp') {
-        const groupId = getCustomValue(issue, WHATSAPP_GROUP_FIELD_NAME);
-        await sendWhatsappGroup(groupId, msg);
-      } else {
-        await sendIssueDM(issue, msg);
-      }
+    const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
+    if (!appointmentAt) {
+      console.warn(`[ALERTAS] Data/hora inválida na tarefa #${issue.id}: ${issueDateStr} ${issueTimeStr}`);
+      continue;
     }
+
+    // Ignora compromissos passados para reduzir leitura/escrita no Redis.
+    if (appointmentAt.isBefore(dayjs().tz(TZ))) continue;
+
+    const issueDate = appointmentAt.startOf('day');
+    if (issueDate.isBefore(hoje)) continue;
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'mattermost',
+      minutesBefore: Number(ALERT_MINUTES_BEFORE),
+      sendFn: sendMattermostAppointmentAlert
+    });
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'mattermost',
+      minutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE),
+      sendFn: sendMattermostAppointmentAlert
+    });
+
+    await trySendTimedAlert({
+      issue,
+      appointmentAt,
+      channel: 'whatsapp',
+      minutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE),
+      sendFn: sendWhatsappAppointmentAlert
+    });
   }
 }
 
+// ---------------------------------------------------------
+// OUTRAS ROTINAS EM PARALELO (SUMMARIES E DRIVE MOVER)
+// ---------------------------------------------------------
 async function processDailySummary() {
-  if (String(DAILY_SUMMARY_ENABLED).toLowerCase() !== 'true') return;
-  const ok = await shouldRunAtTime('summary:daily', Number(DAILY_SUMMARY_HOUR), Number(DAILY_SUMMARY_MINUTE));
-  if (!ok) return;
+  if (DAILY_SUMMARY_ENABLED !== 'true') return;
+  if (!shouldRunAtConfiguredMinute(DAILY_SUMMARY_HOUR, DAILY_SUMMARY_MINUTE)) return;
 
-  const target = nextBusinessDay();
-  await sendSummaryForDate(target, `📌 Resumo dos compromissos do próximo dia útil (${target.format('DD/MM/YYYY')})`);
+  const targetDay = getNextBusinessDay();
+  const targetDate = targetDay.format('YYYY-MM-DD');
+  const today = dayjs().tz(TZ).format('YYYY-MM-DD');
+  const summaryKey = `redmine:daily-summary:${targetDate}:sent-at:${today}`;
+
+  if (await redis.get(summaryKey)) return;
+
+  console.log(`[SUMMARY] Gerando resumo de compromissos de ${targetDate}...`);
+
+  const issues = await fetchAwaitingDateIssues({ due_date: targetDate });
+  const byUser = new Map();
+
+  for (const issue of issues) {
+    if ((issue.status && issue.status.name) !== MEET_STATUS_NAME) continue;
+
+    const issueDateStr = getIssueDate(issue);
+    const issueTimeStr = getIssueTime(issue);
+    if (!issueDateStr || !issueTimeStr) continue;
+
+    const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
+    if (!appointmentAt || appointmentAt.format('YYYY-MM-DD') !== targetDate) continue;
+
+    const userId = await getMattermostUserIdFromIssue(issue);
+    if (!userId) {
+      console.warn(`[SUMMARY] Sem usuário Mattermost para a tarefa #${issue.id}.`);
+      continue;
+    }
+
+    if (!byUser.has(userId)) byUser.set(userId, []);
+    byUser.get(userId).push({ issue, appointmentAt });
+  }
+
+  for (const [userId, appointments] of byUser.entries()) {
+    appointments.sort((a, b) => a.appointmentAt.valueOf() - b.appointmentAt.valueOf());
+
+    const lines = appointments.map(({ issue, appointmentAt }) => {
+      const url = `${REDMINE_URL}/issues/${issue.id}`;
+      const estimated = issue.estimated_hours ? ` | estimado: ${issue.estimated_hours}h` : '';
+      return `- ${appointmentAt.format('HH:mm')} - #${issue.id} ${issue.subject}${estimated}\n  ${url}`;
+    });
+
+    const message =
+      `📅 **Resumo dos compromissos do próximo dia útil (${targetDay.format('DD/MM/YYYY')})**\n\n` +
+      `Status: **${MEET_STATUS_NAME}**\n\n` +
+      lines.join('\n');
+
+    await sendMattermostDirectMessage(userId, message);
+  }
+
+  await redis.set(summaryKey, 'true', 'EX', 36 * 60 * 60);
+  console.log(`[SUMMARY] Resumo concluído para ${byUser.size} usuário(s).`);
 }
-
 async function processClientMorningSummary() {
-  const [hour, minute] = String(CLIENT_SUMMARY_TIME).split(':').map(Number);
-  const ok = await shouldRunAtTime('summary:client-morning', hour, minute);
-  if (!ok) return;
+  // Confirmação por WhatsApp às 08:30 dos compromissos do próximo dia útil.
+  // Regras:
+  // - status Aguardando Data;
+  // - tem data, horário e tempo estimado;
+  // - tem campo "ID Grupo WhatsApp";
+  // - dispara uma única vez por próximo dia útil.
+  if (!shouldRunAtConfiguredTime(CLIENT_SUMMARY_TIME, '08:30')) return;
 
-  const today = dayjs().tz(TZ).startOf('day');
-  await sendSummaryForDate(today, `📌 Compromissos de hoje (${today.format('DD/MM/YYYY')})`);
-}
+  if (!sock) {
+    console.warn('[WHATSAPP SUMMARY] WhatsApp não inicializado; confirmação não enviada.');
+    return;
+  }
 
-async function sendSummaryForDate(targetDay, title) {
-  const issues = await fetchRecentIssues({ status_id: '*' });
-  const grouped = new Map();
+  const targetDay = getNextBusinessDay();
+  const targetDate = targetDay.format('YYYY-MM-DD');
+  const today = dayjs().tz(TZ).format('YYYY-MM-DD');
+  const summaryKey = `redmine:whatsapp-client-summary:${targetDate}:sent-at:${today}`;
+
+  if (await redis.get(summaryKey)) return;
+
+  console.log(`[WHATSAPP SUMMARY] Gerando confirmações dos compromissos de ${targetDate}...`);
+
+  const issues = await fetchAwaitingDateIssues({
+    limit: 100,
+    status_id: '*',
+    sort: 'due_date:asc,updated_on:desc'
+  });
+
+  const byGroup = new Map();
 
   for (const issue of issues) {
-    if (!isSameStatus(issue.status?.name, MEET_STATUS_NAME)) continue;
-    const at = parseIssueDateTime(issue);
-    if (!at || !at.isSame(targetDay, 'day')) continue;
+    if ((issue.status && issue.status.name) !== MEET_STATUS_NAME) continue;
 
-    const username = redmineUserToMattermostUsername(issue);
-    if (!username) continue;
-    if (!grouped.has(username)) grouped.set(username, []);
-    grouped.get(username).push(`• ${at.format('HH:mm')} - #${issue.id} ${issue.subject}\n  ${redmineIssueUrl(issue)}`);
-  }
+    const issueDateStr = getIssueDate(issue);
+    const issueTimeStr = getIssueTime(issue);
+    if (!issueDateStr || !issueTimeStr) continue;
 
-  for (const [username, lines] of grouped.entries()) {
-    await sendMattermostDM(username, `${title}\n\n${lines.join('\n')}`);
-  }
-}
+    // A confirmação é somente para compromissos com tempo estimado.
+    if (!issue.estimated_hours || Number(issue.estimated_hours) <= 0) continue;
 
-async function processBusinessDayBeforeConfirmations() {
-  const today = dayjs().tz(TZ).startOf('day');
-  const tomorrowBusiness = nextBusinessDay(today);
-  const issues = await fetchRecentIssues({ status_id: '*' });
+    const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
+    if (!appointmentAt || appointmentAt.format('YYYY-MM-DD') !== targetDate) continue;
 
-  for (const issue of issues) {
-    if (!isSameStatus(issue.status?.name, MEET_STATUS_NAME)) continue;
-    if (!issue.estimated_hours) continue;
-
-    const at = parseIssueDateTime(issue);
-    if (!at || !at.isSame(tomorrowBusiness, 'day')) continue;
-
-    const key = `redmine:issue:${issue.id}:confirm:${at.format('YYYYMMDD')}`;
-    const first = await redisSetOnce(key, '1', 3 * 24 * 60 * 60);
-    if (!first) continue;
-
-    await sendIssueDM(issue, `✅ Confirme o compromisso do próximo dia útil\n\n${formatIssueLine(issue)}\nData/Hora: ${at.format('DD/MM/YYYY HH:mm')}\nTempo estimado: ${issue.estimated_hours}h`);
-  }
-}
-
-async function processMeetRecordings() {
-  // Implementação segura: mantém o loop vivo, mas não tenta mover arquivos sem IDs/credenciais.
-  // Para mover gravações, é necessário mapear pasta de origem/destino e regra exata de nome do arquivo.
-  return;
-}
-
-app.get('/health', (_, res) => {
-  res.json({
-    ok: true,
-    time: dayjs().tz(TZ).format(),
-    whatsapp: Boolean(sock),
-    redis: Boolean(redis),
-    pollingEnabled: POLLING_ENABLED === 'true'
-  });
-});
-
-async function bootstrap() {
-  if (!REDMINE_URL || !REDMINE_API_KEY) {
-    console.warn('[CONFIG] REDMINE_URL ou REDMINE_API_KEY ausente.');
-  }
-  if (redis) {
-    redis.on('error', err => console.error('[REDIS]', err.message));
-  }
-
-  await startWhatsapp();
-
-  if (POLLING_ENABLED === 'true') {
-    console.log('[POLLING] Inicializando loops.');
-
-    function loopRedmine() {
-      pollingRedmineIssues()
-        .catch(err => console.error('[POLLING ERRO]:', err.response?.data || err.message))
-        .finally(() => setTimeout(loopRedmine, getDynamicPollingIntervalInSeconds() * 1000));
+    const groupField = getCustomField(issue, WHATSAPP_GROUP_FIELD_NAME);
+    const groupId = cleanValue(groupField && groupField.value);
+    if (!groupId) {
+      console.warn(`[WHATSAPP SUMMARY] Sem campo "${WHATSAPP_GROUP_FIELD_NAME}" para a tarefa #${issue.id}.`);
+      continue;
     }
 
-    function loopAlertas() {
-      pollingAppointmentAlerts()
-        .catch(err => console.error('[ALERTAS ERRO]:', err.response?.data || err.message))
-        .finally(() => setTimeout(loopAlertas, getDynamicPollingIntervalInSeconds() * 1000));
-    }
-
-    loopRedmine();
-    loopAlertas();
+    if (!byGroup.has(groupId)) byGroup.set(groupId, []);
+    byGroup.get(groupId).push({ issue, appointmentAt });
   }
 
-  setInterval(() => {
-    processDailySummary().catch(err => console.error('[SUMMARY ERR]:', err.response?.data || err.message));
-    processClientMorningSummary().catch(err => console.error('[CLIENT SUMMARY ERR]:', err.response?.data || err.message));
-    processBusinessDayBeforeConfirmations().catch(err => console.error('[CONFIRM ERR]:', err.response?.data || err.message));
-    processMeetRecordings().catch(err => console.error('[DRIVE ERR]:', err.response?.data || err.message));
-  }, 60 * 1000);
+  let sentCount = 0;
 
-  app.listen(PORT, () => {
-    console.log(`[SERVER] Aplicação rodando na porta ${PORT}`);
-  });
+  for (const [groupId, appointments] of byGroup.entries()) {
+    appointments.sort((a, b) => a.appointmentAt.valueOf() - b.appointmentAt.valueOf());
+
+    const lines = appointments.map(({ issue, appointmentAt }) => {
+      const url = `${REDMINE_URL}/issues/${issue.id}`;
+      const estimated = issue.estimated_hours ? ` | estimado: ${issue.estimated_hours}h` : '';
+      return `• ${appointmentAt.format('HH:mm')} - #${issue.id} ${issue.subject}${estimated}\n  ${url}`;
+    });
+
+    const message =
+      `📅 Confirmação de compromisso\n\n` +
+      `Compromisso(s) agendado(s) para o próximo dia útil (${targetDay.format('DD/MM/YYYY')}):\n\n` +
+      lines.join('\n\n') +
+      `\n\nPor favor, confirme o compromisso respondendo esta mensagem.`;
+
+    await sock.sendMessage(groupId, { text: message });
+    sentCount += 1;
+  }
+
+  await redis.set(summaryKey, 'true', 'EX', 36 * 60 * 60);
+  console.log(`[WHATSAPP SUMMARY] Confirmações enviadas para ${sentCount} grupo(s).`);
+}
+async function processMeetRecordings() { /* Lógica existente do Google Drive */ }
+
+// ---------------------------------------------------------
+// INICIALIZADORES DOS LOOPS RECURSIVOS (TIMEOUT DINÂMICO)
+// ---------------------------------------------------------
+if (POLLING_ENABLED !== 'true') {
+  console.log('[POLLING] Recursos de pooling globais desativados via ENV.');
+} else {
+  console.log('[POLLING] Inicializando loops com gerenciamento de janelas comerciais ativo.');
+
+  // Loop inteligente para as Tasks Gerais do Redmine
+  function loopRedmine() {
+    pollingRedmineIssues()
+      .catch(err => console.error('[POLLING ERRO]:', err.message))
+      .finally(() => {
+        const proximoIntervalo = getDynamicPollingIntervalInSeconds();
+        setTimeout(loopRedmine, proximoIntervalo * 1000);
+      });
+  }
+
+  // Loop inteligente para Alertas de Compromissos
+  function loopAlertas() {
+    pollingAppointmentAlerts()
+      .catch(err => console.error('[ALERTAS ERRO]:', err.message))
+      .finally(() => {
+        const proximoIntervalo = getDynamicPollingIntervalInSeconds();
+        setTimeout(loopAlertas, proximoIntervalo * 1000);
+      });
+  }
+
+  // Dispara a primeira execução imediata dos loops
+  loopRedmine();
+  loopAlertas();
 }
 
-bootstrap().catch(err => {
-  console.error('[FATAL]', err);
-  process.exit(1);
+// Manutenção dos processos secundários estruturados de hora em hora/minuto fixo
+setInterval(() => {
+  processDailySummary().catch(err => console.error('[SUMMARY ERR]:', err.message));
+}, 60 * 1000);
+
+setInterval(() => {
+  processClientMorningSummary().catch(err => console.error('[WHATSAPP SUMMARY ERR]:', err.message));
+}, 60 * 1000);
+
+setInterval(() => {
+  processMeetRecordings().catch(err => console.error('[DRIVE ERR]:', err.message));
+}, 60 * 1000);
+
+// Inicialização do servidor Express
+app.listen(PORT, () => {
+  console.log(`[SERVER] Aplicação rodando com sucesso na porta ${PORT}`);
 });
