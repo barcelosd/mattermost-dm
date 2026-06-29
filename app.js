@@ -54,6 +54,55 @@ const {
 } = process.env;
 
 const app = express();
+
+axios.defaults.timeout = Number(process.env.HTTP_TIMEOUT_MS || 30000);
+
+// Retry simples para falhas transitórias comuns no Render/Redmine/Mattermost.
+// ECONNRESET normalmente significa que o servidor remoto fechou a conexão antes da resposta.
+function isTransientNetworkError(error) {
+  const code = error && error.code;
+  const status = error && error.response && error.response.status;
+
+  return (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNABORTED' ||
+    code === 'EAI_AGAIN' ||
+    code === 'ENOTFOUND' ||
+    code === 'ECONNREFUSED' ||
+    status === 408 ||
+    status === 429 ||
+    (status >= 500 && status <= 599)
+  );
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withHttpRetry(operation, label, maxAttempts = Number(process.env.HTTP_RETRY_ATTEMPTS || 3)) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+
+      if (!isTransientNetworkError(error) || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      const waitMs = Math.min(1000 * attempt, 5000);
+      console.warn(`[HTTP RETRY] ${label} falhou (${error.code || (error.response && error.response.status) || error.message}). Tentativa ${attempt + 1}/${maxAttempts} em ${waitMs}ms.`);
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError;
+}
+
+
 app.use(express.json());
 
 const redis = new Redis(REDIS_URL);
@@ -132,9 +181,12 @@ async function getMattermostUserIdFromIssue(issue) {
   const login = cleanValue(mattermostLoginField && mattermostLoginField.value);
 
   if (login) {
-    const response = await axios.get(`${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(login)}`, {
+    const response = await withHttpRetry(
+    () => axios.get(`${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(login)}`, {
       headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
-    });
+    }),
+    `Mattermost usuário ${login}`
+  );
     return response.data.id;
   }
 
@@ -143,24 +195,33 @@ async function getMattermostUserIdFromIssue(issue) {
   const assignedName = issue.assigned_to && issue.assigned_to.name ? issue.assigned_to.name : '';
   if (!assignedName) return null;
 
-  const search = await axios.post(
-    `${MATTERMOST_URL}/api/v4/users/search`,
-    { term: assignedName },
-    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  const search = await withHttpRetry(
+    () => axios.post(
+      `${MATTERMOST_URL}/api/v4/users/search`,
+      { term: assignedName },
+      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+    ),
+    `Mattermost busca usuário ${assignedName}`
   );
 
   return search.data && search.data[0] ? search.data[0].id : null;
 }
 
 async function createMattermostDirectChannel(userId) {
-  const me = await axios.get(`${MATTERMOST_URL}/api/v4/users/me`, {
-    headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
-  });
+  const me = await withHttpRetry(
+    () => axios.get(`${MATTERMOST_URL}/api/v4/users/me`, {
+      headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` }
+    }),
+    'Mattermost users/me'
+  );
 
-  const response = await axios.post(
-    `${MATTERMOST_URL}/api/v4/channels/direct`,
-    [me.data.id, userId],
-    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  const response = await withHttpRetry(
+    () => axios.post(
+      `${MATTERMOST_URL}/api/v4/channels/direct`,
+      [me.data.id, userId],
+      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+    ),
+    `Mattermost canal direto ${userId}`
   );
 
   return response.data;
@@ -171,10 +232,13 @@ async function sendMattermostDirectMessage(userId, message) {
 
   const channel = await createMattermostDirectChannel(userId);
 
-  await axios.post(
-    `${MATTERMOST_URL}/api/v4/posts`,
-    { channel_id: channel.id, message },
-    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  await withHttpRetry(
+    () => axios.post(
+      `${MATTERMOST_URL}/api/v4/posts`,
+      { channel_id: channel.id, message },
+      { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+    ),
+    `Mattermost post canal ${channel.id}`
   );
 
   return true;
@@ -187,16 +251,19 @@ async function fetchRedmineIssues(params = {}) {
   let totalCount = null;
 
   do {
-    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-      headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
-      params: {
-        status_id: '*',
-        sort: 'due_date:asc,updated_on:desc',
-        ...params,
-        limit,
-        offset
-      }
-    });
+    const response = await withHttpRetry(
+      () => axios.get(`${REDMINE_URL}/issues.json`, {
+        headers: { 'X-Redmine-API-Key': REDMINE_API_KEY },
+        params: {
+          status_id: '*',
+          sort: 'due_date:asc,updated_on:desc',
+          ...params,
+          limit,
+          offset
+        }
+      }),
+      `Redmine issues offset ${offset}`
+    );
 
     const data = response.data || {};
     const issues = data.issues || [];
@@ -366,7 +433,14 @@ async function trySendTimedAlert({ issue, appointmentAt, channel, minutesBefore,
 
   if (await redis.get(alertKey)) return false;
 
-  const sent = await sendFn(issue, appointmentAt, minutesBefore);
+  let sent = false;
+  try {
+    sent = await sendFn(issue, appointmentAt, minutesBefore);
+  } catch (error) {
+    console.error(`[ALERTAS] Erro ao enviar ${channel} ${minutesBefore}min da tarefa #${issue.id}: ${error.code || error.message}`);
+    return false;
+  }
+
   if (!sent) return false;
 
   await redis.set(alertKey, 'true', 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
@@ -382,56 +456,67 @@ async function pollingAppointmentAlerts() {
   console.log('[ALERTAS] Verificando proximidade de horários...');
 
   const hoje = dayjs().tz(TZ).startOf('day');
-  const issues = await fetchRedmineIssues({
-    limit: 100,
-    status_id: '*',
-    sort: 'due_date:asc,updated_on:desc'
-  });
+
+  let issues = [];
+  try {
+    issues = await fetchRedmineIssues({
+      limit: 100,
+      status_id: '*',
+      sort: 'due_date:asc,updated_on:desc'
+    });
+  } catch (error) {
+    console.error(`[ALERTAS] Falha ao consultar Redmine: ${error.code || error.message}`);
+    return;
+  }
 
   for (const issue of issues) {
-    const statusName = issue.status ? issue.status.name : '';
-    if (statusName !== MEET_STATUS_NAME) continue;
+    try {
+      const statusName = issue.status ? issue.status.name : '';
+      if (statusName !== MEET_STATUS_NAME) continue;
 
-    const issueDateStr = getIssueDate(issue);
-    const issueTimeStr = getIssueTime(issue);
+      const issueDateStr = getIssueDate(issue);
+      const issueTimeStr = getIssueTime(issue);
 
-    if (!issueDateStr || !issueTimeStr) continue;
+      if (!issueDateStr || !issueTimeStr) continue;
 
-    const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
-    if (!appointmentAt) {
-      console.warn(`[ALERTAS] Data/hora inválida na tarefa #${issue.id}: ${issueDateStr} ${issueTimeStr}`);
-      continue;
+      const appointmentAt = parseAppointmentDateTime(issueDateStr, issueTimeStr);
+      if (!appointmentAt) {
+        console.warn(`[ALERTAS] Data/hora inválida na tarefa #${issue.id}: ${issueDateStr} ${issueTimeStr}`);
+        continue;
+      }
+
+      // Ignora compromissos passados para reduzir leitura/escrita no Redis.
+      if (appointmentAt.isBefore(dayjs().tz(TZ))) continue;
+
+      const issueDate = appointmentAt.startOf('day');
+      if (issueDate.isBefore(hoje)) continue;
+
+      await trySendTimedAlert({
+        issue,
+        appointmentAt,
+        channel: 'mattermost',
+        minutesBefore: Number(ALERT_MINUTES_BEFORE),
+        sendFn: sendMattermostAppointmentAlert
+      });
+
+      await trySendTimedAlert({
+        issue,
+        appointmentAt,
+        channel: 'mattermost',
+        minutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE),
+        sendFn: sendMattermostAppointmentAlert
+      });
+
+      await trySendTimedAlert({
+        issue,
+        appointmentAt,
+        channel: 'whatsapp',
+        minutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE),
+        sendFn: sendWhatsappAppointmentAlert
+      });
+    } catch (error) {
+      console.error(`[ALERTAS] Falha ao processar tarefa #${issue && issue.id ? issue.id : 'desconhecida'}: ${error.code || error.message}`);
     }
-
-    // Ignora compromissos passados para reduzir leitura/escrita no Redis.
-    if (appointmentAt.isBefore(dayjs().tz(TZ))) continue;
-
-    const issueDate = appointmentAt.startOf('day');
-    if (issueDate.isBefore(hoje)) continue;
-
-    await trySendTimedAlert({
-      issue,
-      appointmentAt,
-      channel: 'mattermost',
-      minutesBefore: Number(ALERT_MINUTES_BEFORE),
-      sendFn: sendMattermostAppointmentAlert
-    });
-
-    await trySendTimedAlert({
-      issue,
-      appointmentAt,
-      channel: 'mattermost',
-      minutesBefore: Number(ALERT_EXTRA_MINUTES_BEFORE),
-      sendFn: sendMattermostAppointmentAlert
-    });
-
-    await trySendTimedAlert({
-      issue,
-      appointmentAt,
-      channel: 'whatsapp',
-      minutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE),
-      sendFn: sendWhatsappAppointmentAlert
-    });
   }
 }
 
