@@ -50,7 +50,8 @@ const {
   DAILY_SUMMARY_MINUTE = 45,
   CLIENT_SUMMARY_TIME = '08:30',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
-  WHATSAPP_SESSION_PATH = '/var/data/whatsapp',
+  WHATSAPP_AUTH_DIR,
+  WHATSAPP_SESSION_PATH,
   MEET_STATUS_NAME = 'Aguardando Data',
   REDMINE_LOOKBACK_MINUTES = 10,
   REDMINE_MAX_POLLING_LIMIT = 20,
@@ -90,10 +91,13 @@ let lastSuccessfulRedmineFetchAt = null;
 // WHATSAPP - CONEXÃO E ENVIO
 // ---------------------------------------------------------
 function getWhatsAppAuthDir() {
-  // No Render, use um Persistent Disk montado em /var/data para manter a sessão entre deploys/reinícios.
-  // A variável WHATSAPP_SESSION_PATH permite alterar o caminho sem mexer no código.
-  const configuredPath = String(WHATSAPP_SESSION_PATH || '').trim();
-  return configuredPath || path.join(__dirname, 'auth_info_baileys');
+  // Mantém compatibilidade com a variável já existente no Render.
+  // Prioridade: WHATSAPP_AUTH_DIR > WHATSAPP_SESSION_PATH > pasta local padrão.
+  const configuredAuthDir = String(WHATSAPP_AUTH_DIR || '').trim();
+  const configuredSessionPath = String(WHATSAPP_SESSION_PATH || '').trim();
+  const configuredPath = configuredAuthDir || configuredSessionPath;
+
+  return configuredPath || path.join(__dirname, '.wwebjs_auth');
 }
 
 function ensureWritableDirectory(dirPath) {
@@ -176,7 +180,7 @@ async function startWhatsAppConnection() {
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        console.log('[WHATSAPP] Credenciais atualizadas no disco persistente.');
+        console.log('[WHATSAPP] Credenciais atualizadas no diretório de autenticação.');
       } catch (err) {
         console.error('[WHATSAPP] Falha ao salvar credenciais:', err.message);
       }
