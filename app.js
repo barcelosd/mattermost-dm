@@ -659,6 +659,26 @@ async function updateRedmineCustomField(issue, fieldName, value) {
   setCustomFieldValue(issue, fieldName, value);
 }
 
+async function addRedmineJournalNote(issueId, notes) {
+  try {
+    await axios.put(
+      `${REDMINE_URL}/issues/${issueId}.json`,
+      {
+        issue: { notes }
+      },
+      { headers: redmineHeaders }
+    );
+    console.log(`Nota adicionada com sucesso na tarefa #${issueId}`);
+  } catch (err) {
+    console.error(`Erro ao adicionar nota na tarefa #${issueId}:`, err.response?.data || err.message);
+    await notifyAttention(
+      `redmine_add_note_error:${issueId}`,
+      'Erro ao adicionar histórico/nota na tarefa do Redmine',
+      { issueId, error: err.response?.data || err.message }
+    );
+  }
+}
+
 async function getRedmineProject(projectId) {
   if (!projectId) return null;
 
@@ -1567,9 +1587,10 @@ async function processMeetRecordings() {
   try {
     const drive = getGoogleDriveClient();
 
+    // Alterado o parâmetro 'fields' para buscar também os metadados do vídeo (videoMediaMetadata)
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name)'
+      fields: 'files(id, name, videoMediaMetadata)'
     });
 
     const files = res.data.files || res.data.items || [];
@@ -1587,6 +1608,7 @@ async function processMeetRecordings() {
         const structure = await getOrCreateClientFolderStructure(issue);
 
         if (structure?.treinamentosFolderId) {
+          // Move o arquivo no Google Drive
           await drive.files.update({
             fileId: file.id,
             addParents: structure.treinamentosFolderId,
@@ -1595,15 +1617,44 @@ async function processMeetRecordings() {
           });
 
           console.log(`Gravação movida para tarefa #${issueId}`);
+
+          // --- NOVA LÓGICA: CÁLCULO DA DURAÇÃO DO VÍDEO ---
+          let durationText = 'Não identificada';
+          const durationMillis = file.videoMediaMetadata?.durationMillis;
+
+          if (durationMillis) {
+            const totalSeconds = Math.floor(Number(durationMillis) / 1000);
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            const seconds = totalSeconds % 60;
+
+            if (hours > 0) {
+              durationText = `${hours}h ${minutes}m ${seconds}s`;
+            } else {
+              durationText = `${minutes}m ${seconds}s`;
+            }
+          }
+
+          // Monta o comentário/histórico que será inserido no Redmine
+          const journalNote = [
+            `🎥 *Gravação de Reunião Disponibilizada*`,
+            `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
+            `• **Arquivo:** \`${file.name}\``,
+            `• **Duração do vídeo:** ${durationText}`
+          ].join('\n');
+
+          // Envia o comentário para a tarefa do Redmine
+          await addRedmineJournalNote(issueId, journalNote);
+          // ------------------------------------------------
         }
       } catch (err) {
         console.error(
-          `Erro ao mover gravação da tarefa #${issueId}:`,
+          `Erro ao mover gravação ou atualizar tarefa #${issueId}:`,
           err.response?.data || err.message
         );
         await notifyAttention(
           `drive_recording_move_error:${issueId}`,
-          'Erro ao mover gravação no Google Drive',
+          'Erro ao mover gravação no Google Drive / Atualizar Redmine',
           { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
         );
       }
