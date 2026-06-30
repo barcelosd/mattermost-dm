@@ -1581,7 +1581,7 @@ async function getOrCreateClientFolderStructure(issue) {
   }
 }
 
-async function async function processMeetRecordings() {
+async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
 
   try {
