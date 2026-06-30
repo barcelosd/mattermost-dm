@@ -96,10 +96,39 @@ function getWhatsAppAuthDir() {
   return configuredPath || path.join(__dirname, 'auth_info_baileys');
 }
 
-function ensureDirectoryExists(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
+function ensureWritableDirectory(dirPath) {
+  const targetPath = path.resolve(dirPath);
+
+  try {
+    fs.mkdirSync(targetPath, { recursive: true });
+
+    const testFile = path.join(targetPath, `.write-test-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(testFile, 'ok');
+    fs.unlinkSync(testFile);
+
+    return targetPath;
+  } catch (err) {
+    err.message = `${err.message}. Verifique se o Persistent Disk do Render está montado nesse caminho e se o serviço tem permissão de escrita.`;
+    throw err;
   }
+}
+
+function getWhatsAppReconnectDelayMs(reason = '') {
+  const normalizedReason = String(reason || '').toLowerCase();
+
+  // Erros de permissão/caminho não são resolvidos tentando a cada 5 segundos.
+  // Isso evita poluição no log e consumo desnecessário enquanto o mount do Render é corrigido.
+  if (
+    normalizedReason.includes('eacces') ||
+    normalizedReason.includes('eperm') ||
+    normalizedReason.includes('permission') ||
+    normalizedReason.includes('permissão') ||
+    normalizedReason.includes('persistent disk')
+  ) {
+    return 5 * 60 * 1000;
+  }
+
+  return 30 * 1000;
 }
 
 function scheduleWhatsAppReconnect(reason = 'desconexão') {
@@ -107,14 +136,17 @@ function scheduleWhatsAppReconnect(reason = 'desconexão') {
     return;
   }
 
-  console.log(`[WHATSAPP] Reagendando reconexão em 5s. Motivo: ${reason}.`);
+  const delayMs = getWhatsAppReconnectDelayMs(reason);
+  const delaySeconds = Math.round(delayMs / 1000);
+
+  console.log(`[WHATSAPP] Reagendando reconexão em ${delaySeconds}s. Motivo: ${reason}.`);
 
   whatsappReconnectTimer = setTimeout(() => {
     whatsappReconnectTimer = null;
     startWhatsAppConnection().catch(err =>
       console.error('[WHATSAPP] Falha ao reconectar:', err.message)
     );
-  }, 5000);
+  }, delayMs);
 }
 
 async function startWhatsAppConnection() {
@@ -126,8 +158,7 @@ async function startWhatsAppConnection() {
   whatsappStarting = true;
 
   try {
-    const authDir = getWhatsAppAuthDir();
-    ensureDirectoryExists(authDir);
+    const authDir = ensureWritableDirectory(getWhatsAppAuthDir());
 
     const hasExistingSession = fs.existsSync(path.join(authDir, 'creds.json'));
     console.log(`[WHATSAPP] Diretório de sessão: ${authDir}`);
@@ -183,7 +214,7 @@ async function startWhatsAppConnection() {
     });
   } catch (err) {
     console.error('[WHATSAPP] Falha ao iniciar conexão:', err.message);
-    scheduleWhatsAppReconnect('falha na inicialização');
+    scheduleWhatsAppReconnect(err.message || 'falha na inicialização');
   } finally {
     whatsappStarting = false;
   }
