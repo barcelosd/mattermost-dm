@@ -44,6 +44,11 @@ const {
   ALERT_WINDOW_SECONDS = 180,
   ALERT_FIELD_NAME = 'Horário',
   ALERT_POLLING_INTERVAL_SECONDS = 60,
+  DAILY_SUMMARY_ENABLED = 'true',
+  DAILY_SUMMARY_HOUR = 17,
+  DAILY_SUMMARY_MINUTE = 45,
+  CLIENT_SUMMARY_TIME = '08:30',
+  WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
   MEET_STATUS_NAME = 'Aguardando Data',
   REDMINE_LOOKBACK_MINUTES = 10,
   REDMINE_MAX_POLLING_LIMIT = 20,
@@ -75,6 +80,84 @@ let sock = null; // Instância do WhatsApp Baileys
 let redmineIssuesCache = [];
 let redmineIssuesCacheFetchedAt = null;
 let lastSuccessfulRedmineFetchAt = null;
+
+// ---------------------------------------------------------
+// WHATSAPP - CONEXÃO E ENVIO
+// ---------------------------------------------------------
+async function startWhatsAppConnection() {
+  try {
+    const authDir = path.join(__dirname, 'auth_info_baileys');
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' })
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log('[WHATSAPP] Escaneie o QR Code abaixo para autenticar:');
+        qrcode.generate(qr, { small: true });
+      }
+
+      if (connection === 'open') {
+        console.log('[WHATSAPP] Conectado com sucesso.');
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        console.log(`[WHATSAPP] Conexão fechada. Reconectar: ${shouldReconnect}.`);
+
+        if (shouldReconnect) {
+          setTimeout(() => {
+            startWhatsAppConnection().catch(err =>
+              console.error('[WHATSAPP] Falha ao reconectar:', err.message)
+            );
+          }, 5000);
+        }
+      }
+    });
+  } catch (err) {
+    console.error('[WHATSAPP] Falha ao iniciar conexão:', err.message);
+  }
+}
+
+function normalizeWhatsAppGroupJid(value) {
+  const raw = String(value || '').trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  if (raw.includes('@g.us')) {
+    return raw;
+  }
+
+  const onlyDigits = raw.replace(/\D/g, '');
+  if (onlyDigits) {
+    return `${onlyDigits}@g.us`;
+  }
+
+  return raw;
+}
+
+async function sendWhatsAppMessage(jid, text) {
+  if (!sock?.user) {
+    console.log('[WHATSAPP] Socket não conectado. Mensagem não enviada.');
+    return false;
+  }
+
+  await sock.sendMessage(jid, { text });
+  return true;
+}
+
 
 // ---------------------------------------------------------
 // FUNÇÃO PARA CALCULAR O INTERVALO DINÂMICO DE POLLING
@@ -246,10 +329,76 @@ async function pollingRedmineIssues(issues) {
 // ---------------------------------------------------------
 // MONITORAMENTO DE ALERTAS DE COMPROMISSOS (APPOINTMENTS)
 // ---------------------------------------------------------
+function parseIssueAppointmentDateTime(issue) {
+  return getIssueAppointmentDateTime(issue);
+}
+
+function shouldSendAppointmentAlert(now, appointmentAt, minutesBefore) {
+  const alertAt = appointmentAt.subtract(Number(minutesBefore), 'minute');
+  const diffSeconds = now.diff(alertAt, 'second');
+  const windowSeconds = Math.max(30, Number(ALERT_WINDOW_SECONDS) || 180);
+
+  return diffSeconds >= 0 && diffSeconds <= windowSeconds && appointmentAt.isAfter(now);
+}
+
+function buildAppointmentAlertMessage(issue, appointmentAt, minutesBefore) {
+  const projeto = issue.project?.name ? ` - ${issue.project.name}` : '';
+  const estimativa = formatIssueEstimatedHours(issue);
+  const estimatedText = estimativa ? `\nEstimativa: ${estimativa}` : '';
+  const issueUrl = `${String(REDMINE_URL).replace(/\/$/, '')}/issues/${issue.id}`;
+
+  return [
+    `⏰ **Alerta de compromisso - faltam ${minutesBefore} minutos**`,
+    '',
+    `Task: **#${issue.id}${projeto}**`,
+    `Assunto: ${issue.subject || 'Sem assunto'}`,
+    `Data/Hora: ${appointmentAt.format('DD/MM/YYYY HH:mm')}`,
+    `Status: ${MEET_STATUS_NAME}${estimatedText}`,
+    '',
+    issueUrl
+  ].join('\n');
+}
+
+async function sendMattermostAppointmentAlert(issue, appointmentAt, minutesBefore) {
+  const assignedUserId = issue.assigned_to?.id;
+  if (!assignedUserId) {
+    console.log(`[ALERTAS] Task #${issue.id} sem responsável. Alerta de ${minutesBefore} min ignorado.`);
+    return false;
+  }
+
+  const redmineUser = await fetchRedmineUserById(assignedUserId);
+  const mattermostUser = await findMattermostUserForRedmineUser(redmineUser);
+
+  if (!mattermostUser?.id) {
+    console.log(`[ALERTAS] Usuário Mattermost não encontrado para Redmine user #${assignedUserId}.`);
+    return false;
+  }
+
+  const message = buildAppointmentAlertMessage(issue, appointmentAt, minutesBefore);
+  await sendMattermostDirectMessage(mattermostUser.id, message);
+
+  console.log(
+    `[ALERTAS] Alerta de ${minutesBefore} min da Task #${issue.id} enviado para ` +
+    `${mattermostUser.username || mattermostUser.id}.`
+  );
+
+  return true;
+}
+
 async function pollingAppointmentAlerts(issues) {
   console.log('[ALERTAS] Processando proximidade de horários...');
 
-  const hoje = dayjs().tz('America/Sao_Paulo').startOf('day');
+  if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
+    console.log('[ALERTAS] Mattermost não configurado. Alertas de compromisso ignorados.');
+    return;
+  }
+
+  const agora = dayjs().tz('America/Sao_Paulo');
+  const hoje = agora.startOf('day');
+  const alertMinutes = [
+    Number(ALERT_MINUTES_BEFORE) || 10,
+    Number(ALERT_EXTRA_MINUTES_BEFORE) || 2
+  ].filter((value, index, array) => value > 0 && array.indexOf(value) === index);
 
   for (const issue of issues) {
     const statusName = issue.status ? issue.status.name : '';
@@ -257,29 +406,33 @@ async function pollingAppointmentAlerts(issues) {
       continue;
     }
 
-    const customFields = issue.custom_fields || [];
-    const dateField = customFields.find(f => f.name === 'Data');
-    const timeField = customFields.find(f => f.name === ALERT_FIELD_NAME);
+    const appointmentAt = parseIssueAppointmentDateTime(issue);
 
-    const issueDateStr = dateField ? dateField.value : issue.due_date;
-
-    // Ignora sem data/horário e tudo que já passou.
-    if (!issueDateStr || !timeField || !timeField.value) {
+    // Ignora sem data/horário, datas antigas e eventos já encerrados.
+    if (!appointmentAt || appointmentAt.startOf('day').isBefore(hoje) || !appointmentAt.isAfter(agora)) {
       continue;
     }
 
-    const issueDate = dayjs(issueDateStr).tz('America/Sao_Paulo').startOf('day');
-    if (issueDate.isBefore(hoje)) {
-      continue;
-    }
+    for (const minutesBefore of alertMinutes) {
+      if (!shouldSendAppointmentAlert(agora, appointmentAt, minutesBefore)) {
+        continue;
+      }
 
-    const alertKey = `redmine:appointment:${issue.id}:alerted`;
-    const alreadyAlerted = await redis.get(alertKey);
+      const alertKey = `redmine:appointment:${issue.id}:mattermost-alert:${minutesBefore}min:${appointmentAt.format('YYYYMMDDHHmm')}`;
+      const alreadyAlerted = await redis.get(alertKey);
 
-    if (!alreadyAlerted) {
-      // Lógica matemática de aproximação de horário (ex: faltando 10 min para o compromisso)
-      // Se estiver dentro da janela de disparo, executa sock.sendMessage() ou Mattermost e:
-      // await redis.set(alertKey, 'true', 'EX', 86400);
+      if (alreadyAlerted) {
+        continue;
+      }
+
+      try {
+        const sent = await sendMattermostAppointmentAlert(issue, appointmentAt, minutesBefore);
+        if (sent) {
+          await redis.set(alertKey, 'true', 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
+        }
+      } catch (err) {
+        console.error(`[ALERTAS] Falha ao enviar alerta de ${minutesBefore} min da Task #${issue.id}:`, err.message);
+      }
     }
   }
 }
@@ -289,6 +442,9 @@ async function pollingAppointmentAlerts(issues) {
 // ---------------------------------------------------------
 const redmineIssueByIdCache = new Map();
 const redmineProjectByIdCache = new Map();
+const redmineUserByIdCache = new Map();
+const mattermostUserCache = new Map();
+const redmineStatusIdByNameCache = new Map();
 
 function normalizeDriveName(value) {
   return String(value || '')
@@ -350,6 +506,67 @@ function getCustomFieldValue(issue, fieldNames) {
   }
 
   return field.value || null;
+}
+
+function getIssueDateString(issue) {
+  const dateValue = getCustomFieldValue(issue, ['Data']);
+  return dateValue || issue?.due_date || null;
+}
+
+function getIssueTimeString(issue) {
+  const timeValue = getCustomFieldValue(issue, [ALERT_FIELD_NAME, 'Horário', 'Horario', 'Hora']);
+  return timeValue ? String(timeValue).trim() : null;
+}
+
+function normalizeIssueTimeValue(timeValue) {
+  if (!timeValue) return null;
+
+  const normalized = String(timeValue)
+    .trim()
+    .toLowerCase()
+    .replace(/\s/g, '')
+    .replace(/[.;]/g, ':')
+    .replace('h', ':');
+
+  const match = normalized.match(/^(\d{1,2})(?::?(\d{2}))?(?::?(\d{2}))?$/);
+  if (!match) return normalized;
+
+  const hour = String(match[1]).padStart(2, '0');
+  const minute = String(match[2] || '00').padStart(2, '0');
+  const second = String(match[3] || '00').padStart(2, '0');
+
+  return `${hour}:${minute}:${second}`;
+}
+
+function getIssueAppointmentDateTime(issue) {
+  const issueDateStr = getIssueDateString(issue);
+  const timeValue = getIssueTimeString(issue);
+
+  if (!issueDateStr || !timeValue) {
+    return null;
+  }
+
+  const datePart = String(issueDateStr).trim().slice(0, 10);
+  const normalizedTime = normalizeIssueTimeValue(timeValue);
+  const candidate = `${datePart} ${normalizedTime}`;
+  const formats = [
+    'YYYY-MM-DD HH:mm:ss',
+    'YYYY-MM-DD H:mm:ss',
+    'YYYY-MM-DD HH:mm',
+    'YYYY-MM-DD H:mm',
+    'DD/MM/YYYY HH:mm:ss',
+    'DD/MM/YYYY H:mm:ss',
+    'DD/MM/YYYY HH:mm',
+    'DD/MM/YYYY H:mm'
+  ];
+
+  const parsed = dayjs.tz(candidate, formats, 'America/Sao_Paulo');
+  return parsed.isValid() ? parsed : null;
+}
+
+function issueHasAppointmentOnDate(issue, targetDate) {
+  const appointmentAt = getIssueAppointmentDateTime(issue);
+  return Boolean(appointmentAt && appointmentAt.startOf('day').isSame(targetDate.startOf('day')));
 }
 
 async function fetchRedmineIssueById(issueId) {
@@ -646,8 +863,460 @@ async function processMeetRecordings() {
 // ---------------------------------------------------------
 // OUTRAS ROTINAS EM PARALELO (SUMMARIES)
 // ---------------------------------------------------------
-async function processDailySummary() { /* Lógica existente */ }
-async function processClientMorningSummary() { /* Lógica existente */ }
+function getNextBusinessDay(baseDate = dayjs().tz('America/Sao_Paulo')) {
+  let next = baseDate.add(1, 'day').startOf('day');
+
+  while (next.day() === 0 || next.day() === 6) {
+    next = next.add(1, 'day');
+  }
+
+  return next;
+}
+
+function shouldRunDailySummaryNow() {
+  if (String(DAILY_SUMMARY_ENABLED).toLowerCase() !== 'true') {
+    return false;
+  }
+
+  const agora = dayjs().tz('America/Sao_Paulo');
+
+  // O resumo operacional deve rodar em dias úteis. Na sexta, o alvo será segunda.
+  if (agora.day() === 0 || agora.day() === 6) {
+    return false;
+  }
+
+  return agora.hour() === Number(DAILY_SUMMARY_HOUR) &&
+    agora.minute() === Number(DAILY_SUMMARY_MINUTE);
+}
+
+function formatDateBr(date) {
+  return date.tz('America/Sao_Paulo').format('DD/MM/YYYY');
+}
+
+function formatIssueTime(issue) {
+  const appointmentAt = getIssueAppointmentDateTime(issue);
+  if (appointmentAt) {
+    return appointmentAt.format('HH:mm');
+  }
+
+  const timeValue = getIssueTimeString(issue);
+  return timeValue ? String(timeValue).trim() : 'sem horário';
+}
+
+function formatIssueEstimatedHours(issue) {
+  if (issue.estimated_hours === null || issue.estimated_hours === undefined || issue.estimated_hours === '') {
+    return null;
+  }
+
+  const value = Number(issue.estimated_hours);
+  if (!Number.isFinite(value)) {
+    return String(issue.estimated_hours);
+  }
+
+  return `${String(value).replace('.', ',')}h`;
+}
+
+function isIssueOnDate(issue, targetDate) {
+  return issueHasAppointmentOnDate(issue, targetDate);
+}
+
+async function fetchRedmineStatusIdByName(statusName) {
+  const normalized = normalizeDriveName(statusName);
+  if (redmineStatusIdByNameCache.has(normalized)) {
+    return redmineStatusIdByNameCache.get(normalized);
+  }
+
+  const response = await axios.get(`${REDMINE_URL}/issue_statuses.json`, {
+    headers: getRedmineHeaders()
+  });
+
+  const statuses = response.data.issue_statuses || [];
+  for (const status of statuses) {
+    redmineStatusIdByNameCache.set(normalizeDriveName(status.name), status.id);
+  }
+
+  return redmineStatusIdByNameCache.get(normalized) || null;
+}
+
+async function fetchIssuesForDailySummary(targetDate) {
+  const statusId = await fetchRedmineStatusIdByName(MEET_STATUS_NAME);
+  const issues = [];
+  const limit = 100;
+  let offset = 0;
+  let totalCount = 0;
+
+  do {
+    const params = {
+      limit,
+      offset,
+      sort: 'due_date:asc,id:asc',
+      status_id: statusId || '*'
+    };
+
+    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
+      headers: getRedmineHeaders(),
+      params
+    });
+
+    const pageIssues = response.data.issues || [];
+    totalCount = Number(response.data.total_count || pageIssues.length || 0);
+
+    for (const issue of pageIssues) {
+      const statusName = issue.status ? issue.status.name : '';
+      if (statusName === MEET_STATUS_NAME && isIssueOnDate(issue, targetDate)) {
+        issues.push(issue);
+      }
+    }
+
+    offset += limit;
+  } while (offset < totalCount);
+
+  return issues;
+}
+
+async function fetchRedmineUserById(userId) {
+  if (!userId) return null;
+
+  const cacheKey = String(userId);
+  const cached = redmineUserByIdCache.get(cacheKey);
+  const now = Date.now();
+
+  if (cached && now - cached.fetchedAt < 60 * 60 * 1000) {
+    return cached.user;
+  }
+
+  const response = await axios.get(`${REDMINE_URL}/users/${userId}.json`, {
+    headers: getRedmineHeaders()
+  });
+
+  const user = response.data.user || null;
+  redmineUserByIdCache.set(cacheKey, { user, fetchedAt: now });
+  return user;
+}
+
+async function findMattermostUserForRedmineUser(redmineUser) {
+  if (!redmineUser) return null;
+
+  const candidates = [
+    redmineUser.login,
+    redmineUser.mail,
+    [redmineUser.firstname, redmineUser.lastname].filter(Boolean).join(' '),
+    redmineUser.lastname,
+    redmineUser.firstname
+  ].filter(Boolean);
+
+  const cacheKey = candidates.join('|').toLowerCase();
+  if (mattermostUserCache.has(cacheKey)) {
+    return mattermostUserCache.get(cacheKey);
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const byUsername = await axios.get(
+        `${MATTERMOST_URL}/api/v4/users/username/${encodeURIComponent(candidate)}`,
+        { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+      );
+
+      if (byUsername.data?.id) {
+        mattermostUserCache.set(cacheKey, byUsername.data);
+        return byUsername.data;
+      }
+    } catch (err) {
+      if (err.response?.status !== 404) {
+        console.log(`[MATTERMOST] Falha ao buscar usuário por username "${candidate}": ${err.message}`);
+      }
+    }
+
+    try {
+      const search = await axios.post(
+        `${MATTERMOST_URL}/api/v4/users/search`,
+        { term: candidate, limit: 10 },
+        { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+      );
+
+      const users = search.data || [];
+      const normalizedCandidate = normalizeDriveName(candidate);
+      const found = users.find(user =>
+        normalizeDriveName(user.username) === normalizedCandidate ||
+        normalizeDriveName(user.email) === normalizedCandidate ||
+        normalizeDriveName(`${user.first_name || ''} ${user.last_name || ''}`.trim()) === normalizedCandidate
+      ) || users[0];
+
+      if (found?.id) {
+        mattermostUserCache.set(cacheKey, found);
+        return found;
+      }
+    } catch (err) {
+      console.log(`[MATTERMOST] Falha ao pesquisar usuário "${candidate}": ${err.message}`);
+    }
+  }
+
+  mattermostUserCache.set(cacheKey, null);
+  return null;
+}
+
+async function sendMattermostDirectMessage(userId, message) {
+  const channelResponse = await axios.post(
+    `${MATTERMOST_URL}/api/v4/channels/direct`,
+    [userId],
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  );
+
+  await axios.post(
+    `${MATTERMOST_URL}/api/v4/posts`,
+    {
+      channel_id: channelResponse.data.id,
+      message
+    },
+    { headers: { Authorization: `Bearer ${MATTERMOST_TOKEN}` } }
+  );
+}
+
+function buildDailySummaryMessage(assignedIssues, targetDate) {
+  const sorted = [...assignedIssues].sort((a, b) => {
+    const appointmentA = getIssueAppointmentDateTime(a);
+    const appointmentB = getIssueAppointmentDateTime(b);
+    const timeA = appointmentA ? appointmentA.valueOf() : Number.MAX_SAFE_INTEGER;
+    const timeB = appointmentB ? appointmentB.valueOf() : Number.MAX_SAFE_INTEGER;
+    return timeA - timeB || Number(a.id) - Number(b.id);
+  });
+
+  const lines = [
+    `### Resumo dos compromissos do próximo dia útil - ${formatDateBr(targetDate)}`,
+    '',
+    `Você possui ${sorted.length} compromisso(s) com status **${MEET_STATUS_NAME}** para o próximo dia útil.`,
+    ''
+  ];
+
+  for (const issue of sorted) {
+    const horario = formatIssueTime(issue);
+    const estimativa = formatIssueEstimatedHours(issue);
+    const projeto = issue.project?.name ? ` - ${issue.project.name}` : '';
+    const estimatedText = estimativa ? ` | Estimativa: ${estimativa}` : '';
+    const issueUrl = `${String(REDMINE_URL).replace(/\/$/, '')}/issues/${issue.id}`;
+
+    lines.push(`- **${horario}** | #${issue.id}${projeto} | ${issue.subject || 'Sem assunto'}${estimatedText}`);
+    lines.push(`  ${issueUrl}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function processDailySummary() {
+  if (!shouldRunDailySummaryNow()) {
+    return;
+  }
+
+  const agora = dayjs().tz('America/Sao_Paulo');
+  const targetDate = getNextBusinessDay(agora);
+  const runKey = `mattermost:daily-summary:${agora.format('YYYY-MM-DD')}:${Number(DAILY_SUMMARY_HOUR)}:${Number(DAILY_SUMMARY_MINUTE)}`;
+
+  const alreadyRun = await redis.get(runKey);
+  if (alreadyRun) {
+    return;
+  }
+
+  if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
+    console.log('[SUMMARY] Mattermost não configurado. Resumo diário ignorado.');
+    await redis.set(runKey, 'mattermost-not-configured', 'EX', 2 * 60 * 60);
+    return;
+  }
+
+  const issues = await fetchIssuesForDailySummary(targetDate);
+  if (!issues.length) {
+    console.log(`[SUMMARY] Nenhum compromisso em ${MEET_STATUS_NAME} para ${formatDateBr(targetDate)}.`);
+    await redis.set(runKey, 'no-issues', 'EX', 2 * 60 * 60);
+    return;
+  }
+
+  const issuesByAssignedUserId = new Map();
+
+  for (const issue of issues) {
+    const assignedUserId = issue.assigned_to?.id;
+    if (!assignedUserId) {
+      console.log(`[SUMMARY] Task #${issue.id} sem responsável. Não foi possível enviar DM.`);
+      continue;
+    }
+
+    if (!issuesByAssignedUserId.has(assignedUserId)) {
+      issuesByAssignedUserId.set(assignedUserId, []);
+    }
+    issuesByAssignedUserId.get(assignedUserId).push(issue);
+  }
+
+  let sentCount = 0;
+
+  for (const [redmineUserId, assignedIssues] of issuesByAssignedUserId.entries()) {
+    try {
+      const redmineUser = await fetchRedmineUserById(redmineUserId);
+      const mattermostUser = await findMattermostUserForRedmineUser(redmineUser);
+
+      if (!mattermostUser?.id) {
+        console.log(`[SUMMARY] Usuário Mattermost não encontrado para Redmine user #${redmineUserId}.`);
+        continue;
+      }
+
+      const message = buildDailySummaryMessage(assignedIssues, targetDate);
+      await sendMattermostDirectMessage(mattermostUser.id, message);
+      sentCount += 1;
+
+      console.log(
+        `[SUMMARY] Resumo do próximo dia útil enviado para ${mattermostUser.username || mattermostUser.id} ` +
+        `com ${assignedIssues.length} compromisso(s).`
+      );
+    } catch (err) {
+      console.error(`[SUMMARY] Falha ao enviar resumo para Redmine user #${redmineUserId}:`, err.message);
+    }
+  }
+
+  await redis.set(runKey, `sent:${sentCount}`, 'EX', 2 * 60 * 60);
+}
+
+
+function parseClientSummaryTime() {
+  const raw = String(CLIENT_SUMMARY_TIME || '08:30').trim();
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+
+  if (!match) {
+    return { hour: 8, minute: 30 };
+  }
+
+  return {
+    hour: Number(match[1]),
+    minute: Number(match[2])
+  };
+}
+
+function shouldRunClientMorningSummaryNow() {
+  const agora = dayjs().tz('America/Sao_Paulo');
+
+  // A confirmação do cliente deve rodar em dia útil, sempre olhando o próximo dia útil.
+  if (agora.day() === 0 || agora.day() === 6) {
+    return false;
+  }
+
+  const { hour, minute } = parseClientSummaryTime();
+  return agora.hour() === hour && agora.minute() === minute;
+}
+
+function issueHasEstimatedHours(issue) {
+  return issue.estimated_hours !== null &&
+    issue.estimated_hours !== undefined &&
+    issue.estimated_hours !== '' &&
+    Number(issue.estimated_hours) > 0;
+}
+
+function getIssueWhatsAppGroupJid(issue) {
+  const groupValue = getCustomFieldValue(issue, [
+    WHATSAPP_GROUP_FIELD_NAME,
+    'ID Grupo WhatsApp',
+    'Grupo WhatsApp',
+    'Whatsapp',
+    'WhatsApp'
+  ]);
+
+  return normalizeWhatsAppGroupJid(groupValue);
+}
+
+function buildClientMorningSummaryMessage(issues, targetDate) {
+  const sorted = [...issues].sort((a, b) => {
+    const appointmentA = getIssueAppointmentDateTime(a);
+    const appointmentB = getIssueAppointmentDateTime(b);
+    const timeA = appointmentA ? appointmentA.valueOf() : Number.MAX_SAFE_INTEGER;
+    const timeB = appointmentB ? appointmentB.valueOf() : Number.MAX_SAFE_INTEGER;
+    return timeA - timeB || Number(a.id) - Number(b.id);
+  });
+
+  const lines = [
+    `Bom dia! Passando para confirmar o(s) compromisso(s) agendado(s) para ${formatDateBr(targetDate)}:`,
+    ''
+  ];
+
+  for (const issue of sorted) {
+    const horario = formatIssueTime(issue);
+    const estimativa = formatIssueEstimatedHours(issue);
+    const projeto = issue.project?.name ? ` - ${issue.project.name}` : '';
+    const issueUrl = `${String(REDMINE_URL).replace(/\/$/, '')}/issues/${issue.id}`;
+
+    lines.push(`• ${horario} - #${issue.id}${projeto} - ${issue.subject || 'Compromisso'}`);
+    if (estimativa) {
+      lines.push(`  Duração prevista: ${estimativa}`);
+    }
+    lines.push(`  ${issueUrl}`);
+  }
+
+  lines.push('');
+  lines.push('Por favor, confirme o recebimento e a disponibilidade para o horário agendado.');
+
+  return lines.join('\n');
+}
+
+async function processClientMorningSummary() {
+  if (!shouldRunClientMorningSummaryNow()) {
+    return;
+  }
+
+  const agora = dayjs().tz('America/Sao_Paulo');
+  const { hour, minute } = parseClientSummaryTime();
+  const targetDate = getNextBusinessDay(agora);
+  const runKey = `whatsapp:client-summary:${agora.format('YYYY-MM-DD')}:${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+  const alreadyRun = await redis.get(runKey);
+  if (alreadyRun) {
+    return;
+  }
+
+  if (!sock?.user) {
+    console.log('[WHATSAPP SUMMARY] WhatsApp não conectado. Confirmação das 8h30 ignorada neste ciclo.');
+    return;
+  }
+
+  const issues = await fetchIssuesForDailySummary(targetDate);
+  const issuesByGroup = new Map();
+
+  for (const issue of issues) {
+    const appointmentAt = getIssueAppointmentDateTime(issue);
+    const groupJid = getIssueWhatsAppGroupJid(issue);
+
+    // Confirmação só para compromissos com data, horário, tempo estimado e grupo WhatsApp.
+    if (!appointmentAt || !issueHasEstimatedHours(issue) || !groupJid) {
+      continue;
+    }
+
+    if (!issuesByGroup.has(groupJid)) {
+      issuesByGroup.set(groupJid, []);
+    }
+    issuesByGroup.get(groupJid).push(issue);
+  }
+
+  let sentCount = 0;
+
+  for (const [groupJid, groupIssues] of issuesByGroup.entries()) {
+    const groupKey = `whatsapp:client-summary:group:${groupJid}:${targetDate.format('YYYY-MM-DD')}`;
+    const alreadySentToGroup = await redis.get(groupKey);
+    if (alreadySentToGroup) {
+      continue;
+    }
+
+    try {
+      const message = buildClientMorningSummaryMessage(groupIssues, targetDate);
+      const sent = await sendWhatsAppMessage(groupJid, message);
+
+      if (sent) {
+        sentCount += 1;
+        await redis.set(groupKey, `sent:${groupIssues.length}`, 'EX', Number(REDIS_TTL_DAYS) * 24 * 60 * 60);
+        console.log(`[WHATSAPP SUMMARY] Confirmação enviada para ${groupJid} com ${groupIssues.length} compromisso(s).`);
+      }
+    } catch (err) {
+      console.error(`[WHATSAPP SUMMARY] Falha ao enviar confirmação para ${groupJid}:`, err.message);
+    }
+  }
+
+  await redis.set(runKey, `sent:${sentCount}`, 'EX', 2 * 60 * 60);
+}
+
+
+startWhatsAppConnection().catch(err => console.error('[WHATSAPP] Erro na inicialização:', err.message));
 
 // ---------------------------------------------------------
 // INICIALIZADORES DOS LOOPS RECURSIVOS (TIMEOUT DINÂMICO)
