@@ -4,6 +4,7 @@ const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
 const path = require('path');
+const fs = require('fs');
 const { google } = require('googleapis');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -49,6 +50,7 @@ const {
   DAILY_SUMMARY_MINUTE = 45,
   CLIENT_SUMMARY_TIME = '08:30',
   WHATSAPP_GROUP_FIELD_NAME = 'ID Grupo WhatsApp',
+  WHATSAPP_SESSION_PATH = '/var/data/whatsapp',
   MEET_STATUS_NAME = 'Aguardando Data',
   REDMINE_LOOKBACK_MINUTES = 10,
   REDMINE_MAX_POLLING_LIMIT = 20,
@@ -74,6 +76,9 @@ app.use(express.json());
 
 const redis = new Redis(REDIS_URL);
 let sock = null; // Instância do WhatsApp Baileys
+let whatsappStarting = false;
+let whatsappReconnectTimer = null;
+let whatsappSendQueue = Promise.resolve();
 
 // Cache em memória para evitar leituras duplicadas do Redmine no mesmo ciclo.
 // Importante: isso reduz consumo do Redmine sem aumentar leitura/gravação no Redis.
@@ -84,48 +89,103 @@ let lastSuccessfulRedmineFetchAt = null;
 // ---------------------------------------------------------
 // WHATSAPP - CONEXÃO E ENVIO
 // ---------------------------------------------------------
+function getWhatsAppAuthDir() {
+  // No Render, use um Persistent Disk montado em /var/data para manter a sessão entre deploys/reinícios.
+  // A variável WHATSAPP_SESSION_PATH permite alterar o caminho sem mexer no código.
+  const configuredPath = String(WHATSAPP_SESSION_PATH || '').trim();
+  return configuredPath || path.join(__dirname, 'auth_info_baileys');
+}
+
+function ensureDirectoryExists(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+function scheduleWhatsAppReconnect(reason = 'desconexão') {
+  if (whatsappReconnectTimer) {
+    return;
+  }
+
+  console.log(`[WHATSAPP] Reagendando reconexão em 5s. Motivo: ${reason}.`);
+
+  whatsappReconnectTimer = setTimeout(() => {
+    whatsappReconnectTimer = null;
+    startWhatsAppConnection().catch(err =>
+      console.error('[WHATSAPP] Falha ao reconectar:', err.message)
+    );
+  }, 5000);
+}
+
 async function startWhatsAppConnection() {
+  if (whatsappStarting) {
+    console.log('[WHATSAPP] Inicialização já em andamento. Ignorando chamada duplicada.');
+    return;
+  }
+
+  whatsappStarting = true;
+
   try {
-    const authDir = path.join(__dirname, 'auth_info_baileys');
+    const authDir = getWhatsAppAuthDir();
+    ensureDirectoryExists(authDir);
+
+    const hasExistingSession = fs.existsSync(path.join(authDir, 'creds.json'));
+    console.log(`[WHATSAPP] Diretório de sessão: ${authDir}`);
+    console.log(`[WHATSAPP] Sessão existente: ${hasExistingSession ? 'sim' : 'não'}`);
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     sock = makeWASocket({
       auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' })
+      logger: pino({ level: 'silent' }),
+      browser: ['NewNorte Automacoes', 'Chrome', '1.0.0']
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      try {
+        await saveCreds();
+        console.log('[WHATSAPP] Credenciais atualizadas no disco persistente.');
+      } catch (err) {
+        console.error('[WHATSAPP] Falha ao salvar credenciais:', err.message);
+      }
+    });
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log('[WHATSAPP] Escaneie o QR Code abaixo para autenticar:');
+        console.log('[WHATSAPP] QR Code gerado. Escaneie para autenticar esta sessão:');
         qrcode.generate(qr, { small: true });
       }
 
+      if (connection === 'connecting') {
+        console.log('[WHATSAPP] Conectando...');
+      }
+
       if (connection === 'open') {
-        console.log('[WHATSAPP] Conectado com sucesso.');
+        console.log('[WHATSAPP] Conectado com sucesso e pronto para envio.');
       }
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message || 'sem detalhe';
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        console.log(`[WHATSAPP] Conexão fechada. Reconectar: ${shouldReconnect}.`);
+        console.log(`[WHATSAPP] Conexão fechada. Status: ${statusCode || 'desconhecido'}. Erro: ${errorMessage}. Reconectar: ${shouldReconnect}.`);
 
         if (shouldReconnect) {
-          setTimeout(() => {
-            startWhatsAppConnection().catch(err =>
-              console.error('[WHATSAPP] Falha ao reconectar:', err.message)
-            );
-          }, 5000);
+          scheduleWhatsAppReconnect(`status ${statusCode || 'desconhecido'}`);
+        } else {
+          console.log('[WHATSAPP] Sessão encerrada pelo WhatsApp. Será necessário escanear o QR Code novamente.');
         }
       }
     });
   } catch (err) {
     console.error('[WHATSAPP] Falha ao iniciar conexão:', err.message);
+    scheduleWhatsAppReconnect('falha na inicialização');
+  } finally {
+    whatsappStarting = false;
   }
 }
 
@@ -149,13 +209,25 @@ function normalizeWhatsAppGroupJid(value) {
 }
 
 async function sendWhatsAppMessage(jid, text) {
-  if (!sock?.user) {
-    console.log('[WHATSAPP] Socket não conectado. Mensagem não enviada.');
-    return false;
-  }
+  const sendTask = async () => {
+    if (!sock?.user) {
+      console.log('[WHATSAPP] Socket não conectado. Mensagem não enviada.');
+      return false;
+    }
 
-  await sock.sendMessage(jid, { text });
-  return true;
+    try {
+      await sock.sendMessage(jid, { text });
+      return true;
+    } catch (err) {
+      console.error(`[WHATSAPP] Falha ao enviar mensagem para ${jid}:`, err.message);
+      scheduleWhatsAppReconnect('falha no envio');
+      return false;
+    }
+  };
+
+  // Serializa os envios para reduzir risco de bloqueio/queda por muitos disparos simultâneos.
+  whatsappSendQueue = whatsappSendQueue.then(sendTask, sendTask);
+  return whatsappSendQueue;
 }
 
 
