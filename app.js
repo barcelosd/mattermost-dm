@@ -1587,27 +1587,33 @@ async function processMeetRecordings() {
   try {
     const drive = getGoogleDriveClient();
 
-    // ALTERAÇÃO 1: Adicionado 'mimeType' aos campos retornados da API
-    const res = await drive.files.list({
-      q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name, mimeType, videoMediaMetadata)'
-    });
+    // ALTERAÇÃO: Mudamos de 'videoMediaMetadata' para 'videoMediaMetadata(durationMillis)'
+const res = await drive.files.list({
+  q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
+  fields: 'files(id, name, mimeType, videoMediaMetadata(durationMillis))'
+});
 
     const files = res.data.files || res.data.items || [];
 
-    for (const file of files) {
-      // ALTERAÇÃO 2: Validação para garantir que o bot processe APENAS vídeos
-      if (!file.mimeType || !file.mimeType.startsWith('video/')) {
-        continue; // Ignora documentos, imagens, planilhas, etc.
-      }
+  for (const file of files) {
+  // Validação para garantir que o bot processe APENAS vídeos
+  if (!file.mimeType || !file.mimeType.startsWith('video/')) {
+    continue; 
+  }
 
-      const match = file.name.match(/#(\d+)/);
+  // NOVA TRAVA: Se o Google Drive ainda não processou os metadados do vídeo,
+  // pula este arquivo para processá-lo na próxima rodada (daqui a 5 minutos)
+  if (!file.videoMediaMetadata || !file.videoMediaMetadata.durationMillis) {
+    console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
+    continue;
+  }
 
-      if (!match) continue;
+  const match = file.name.match(/#(\d+)/);
+  if (!match) continue;
 
-      const issueId = match[1];
-
-      try {
+  const issueId = match[1];
+  
+        try {
         const issue = await fetchIssueDetails(issueId);
 
         const structure = await getOrCreateClientFolderStructure(issue);
