@@ -1581,45 +1581,42 @@ async function getOrCreateClientFolderStructure(issue) {
   }
 }
 
-async function processMeetRecordings() {
+async function async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
 
   try {
     const drive = getGoogleDriveClient();
 
-    // ALTERAÇÃO: Mudamos de 'videoMediaMetadata' para 'videoMediaMetadata(durationMillis)'
-const res = await drive.files.list({
-  q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-  fields: 'files(id, name, mimeType, videoMediaMetadata(durationMillis))'
-});
+    // Busca todos os arquivos da pasta original
+    const res = await drive.files.list({
+      q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
+      fields: 'files(id, name, mimeType, videoMediaMetadata(durationMillis))'
+    });
 
     const files = res.data.files || res.data.items || [];
 
-  for (const file of files) {
-  // Validação para garantir que o bot processe APENAS vídeos
-  if (!file.mimeType || !file.mimeType.startsWith('video/')) {
-    continue; 
-  }
+    for (const file of files) {
+      // 1. Verifica primeiro se o arquivo possui a marcação da tarefa (#ID) no nome
+      const match = file.name.match(/#(\d+)/);
+      if (!match) continue;
 
-  // NOVA TRAVA: Se o Google Drive ainda não processou os metadados do vídeo,
-  // pula este arquivo para processá-lo na próxima rodada (daqui a 5 minutos)
-  if (!file.videoMediaMetadata || !file.videoMediaMetadata.durationMillis) {
-    console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
-    continue;
-  }
+      const issueId = match[1];
+      
+      // 2. Identifica se o arquivo atual é um vídeo
+      const isVideo = file.mimeType && file.mimeType.startsWith('video/');
 
-  const match = file.name.match(/#(\d+)/);
-  if (!match) continue;
+      // 3. SE FOR VÍDEO: Valida se o Google Drive já disponibilizou a duração/metadados
+      if (isVideo && (!file.videoMediaMetadata || !file.videoMediaMetadata.durationMillis)) {
+        console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
+        continue;
+      }
 
-  const issueId = match[1];
-  
-        try {
+      try {
         const issue = await fetchIssueDetails(issueId);
-
         const structure = await getOrCreateClientFolderStructure(issue);
 
         if (structure?.treinamentosFolderId) {
-          // Move o arquivo no Google Drive
+          // Move o arquivo (seja nota ou vídeo) para a pasta de Treinamentos do cliente
           await drive.files.update({
             fileId: file.id,
             addParents: structure.treinamentosFolderId,
@@ -1627,44 +1624,47 @@ const res = await drive.files.list({
             fields: 'id, parents'
           });
 
-          console.log(`Gravação movida para tarefa #${issueId}`);
+          console.log(`Arquivo [${file.name}] movido com sucesso para a tarefa #${issueId}`);
 
-          // --- CÁLCULO DA DURAÇÃO DO VÍDEO ---
-          let durationText = 'Não identificada';
-          const durationMillis = file.videoMediaMetadata?.durationMillis;
+          // 4. REGRA CONDICIONAL: Só faz o registro de comentário no Redmine se for um vídeo
+          if (isVideo) {
+            // --- CÁLCULO DA DURAÇÃO DO VÍDEO ---
+            let durationText = 'Não identificada';
+            const durationMillis = file.videoMediaMetadata?.durationMillis;
 
-          if (durationMillis) {
-            const totalSeconds = Math.floor(Number(durationMillis) / 1000);
-            const hours = Math.floor(totalSeconds / 3600);
-            const minutes = Math.floor((totalSeconds % 3600) / 60);
-            const seconds = totalSeconds % 60;
+            if (durationMillis) {
+              const totalSeconds = Math.floor(Number(durationMillis) / 1000);
+              const hours = Math.floor(totalSeconds / 3600);
+              const minutes = Math.floor((totalSeconds % 3600) / 60);
+              const seconds = totalSeconds % 60;
 
-            if (hours > 0) {
-              durationText = `${hours}h ${minutes}m ${seconds}s`;
-            } else {
-              durationText = `${minutes}m ${seconds}s`;
+              if (hours > 0) {
+                durationText = `${hours}h ${minutes}m ${seconds}s`;
+              } else {
+                durationText = `${minutes}m ${seconds}s`;
+              }
             }
+
+            // Monta o comentário/histórico que será inserido no Redmine
+            const journalNote = [
+              `🎥 *Gravação de Reunião Disponibilizada*`,
+              `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
+              `• **Arquivo:** \`${file.name}\``,
+              `• **Duração do vídeo:** ${durationText}`
+            ].join('\n');
+
+            // Envia o comentário para a tarefa do Redmine
+            await addRedmineJournalNote(issueId, journalNote);
           }
-
-          // Monta o comentário/histórico que será inserido no Redmine
-          const journalNote = [
-            `🎥 *Gravação de Reunião Disponibilizada*`,
-            `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
-            `• **Arquivo:** \`${file.name}\``,
-            `• **Duração do vídeo:** ${durationText}`
-          ].join('\n');
-
-          // Envia o comentário para a tarefa do Redmine
-          await addRedmineJournalNote(issueId, journalNote);
         }
       } catch (err) {
         console.error(
-          `Erro ao mover gravação ou atualizar tarefa #${issueId}:`,
+          `Erro ao mover arquivo ou atualizar tarefa #${issueId}:`,
           err.response?.data || err.message
         );
         await notifyAttention(
           `drive_recording_move_error:${issueId}`,
-          'Erro ao mover gravação no Google Drive / Atualizar Redmine',
+          'Erro ao mover arquivo no Google Drive / Atualizar Redmine',
           { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
         );
       }
