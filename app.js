@@ -1587,15 +1587,20 @@ async function processMeetRecordings() {
   try {
     const drive = getGoogleDriveClient();
 
-    // Alterado o parâmetro 'fields' para buscar também os metadados do vídeo (videoMediaMetadata)
+    // ALTERAÇÃO 1: Adicionado 'mimeType' aos campos retornados da API
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name, videoMediaMetadata)'
+      fields: 'files(id, name, mimeType, videoMediaMetadata)'
     });
 
     const files = res.data.files || res.data.items || [];
 
     for (const file of files) {
+      // ALTERAÇÃO 2: Validação para garantir que o bot processe APENAS vídeos
+      if (!file.mimeType || !file.mimeType.startsWith('video/')) {
+        continue; // Ignora documentos, imagens, planilhas, etc.
+      }
+
       const match = file.name.match(/#(\d+)/);
 
       if (!match) continue;
@@ -1618,7 +1623,7 @@ async function processMeetRecordings() {
 
           console.log(`Gravação movida para tarefa #${issueId}`);
 
-          // --- NOVA LÓGICA: CÁLCULO DA DURAÇÃO DO VÍDEO ---
+          // --- CÁLCULO DA DURAÇÃO DO VÍDEO ---
           let durationText = 'Não identificada';
           const durationMillis = file.videoMediaMetadata?.durationMillis;
 
@@ -1645,7 +1650,6 @@ async function processMeetRecordings() {
 
           // Envia o comentário para a tarefa do Redmine
           await addRedmineJournalNote(issueId, journalNote);
-          // ------------------------------------------------
         }
       } catch (err) {
         console.error(
