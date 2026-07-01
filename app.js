@@ -1733,20 +1733,22 @@ async function pollingRedmineIssues() {
     const issues = await fetchRecentIssues(); 
 
     for (const issueSummary of issues) {
-      const updatedAt = new Date(issueSummary.updated_on).getTime();
+  const updatedAt = new Date(issueSummary.updated_on).getTime();
 
-      // Se a tarefa for mais antiga do que a nossa última checagem salva, ignora
-      if (updatedAt < lastPollingTimestamp) {
-        continue;
-      }
+  // Se a tarefa for mais antiga do que a nossa última checagem salva, ignora
+  if (updatedAt < lastPollingTimestamp) {
+    continue;
+  }
 
-      // ... (Mantenha aqui todo o RESTO do seu código que processa a tarefa/notificação) ...
-      // Ex: await processIssueNotification(issueSummary);
-    }
+  // 1. Busca os detalhes completos da tarefa (Custom Fields, Histórico, etc)
+  const fullIssue = await fetchIssueDetails(issueSummary.id);
 
-    // 3. SE TUDO DEU CERTO: Atualiza o Redis com o timestamp do início desta rodada.
-    // Assim, na próxima execução, ele começará exatamente deste milissegundo em diante.
-    await redis.set('redmine:last_polling_timestamp', currentRunTimestamp);
+  // 2. Chama a função para criar o Meet / Agenda
+  await processGoogleMeet(fullIssue);
+  
+  // 3. Chama a função de notificações gerais (se você usar)
+  // await processIssueNotification(fullIssue, 'Atualização', 'polling');
+}
 
   } catch (error) {
     console.error('Erro durante o polling de tarefas do Redmine:', error);
