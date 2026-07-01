@@ -1691,7 +1691,7 @@ async function processMeetRecordings() {
 // ---------------------------------------------------------
 // POLLING REDMINE
 // ---------------------------------------------------------
-let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
+//let lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
 
 async function fetchRecentIssues() {
   const response = await axios.get(`${REDMINE_URL}/issues.json`, {
@@ -1710,56 +1710,47 @@ async function pollingRedmineIssues() {
   if (POLLING_ENABLED !== 'true') return;
 
   try {
-    const issues = await fetchRecentIssues();
+    // 1. Tenta buscar o último timestamp gravado no Redis
+    let lastPollingTimestamp = await redis.get('redmine:last_polling_timestamp');
+
+    if (!lastPollingTimestamp) {
+      // Se for a primeira vez que o bot roda (ou o Redis foi resetado),
+      // ele olha os últimos 10 minutos por segurança.
+      lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
+      console.log('Nenhum timestamp encontrado no Redis. Usando fallback de 10 minutos atrás.');
+    } else {
+      // O Redis devolve uma String, precisamos converter para Número
+      lastPollingTimestamp = Number(lastPollingTimestamp);
+    }
+
+    // Armazenamos o momento exato do início DESTA rodada
+    const currentRunTimestamp = Date.now();
+
+    console.log(`[Polling] Buscando tarefas alteradas desde: ${new Date(lastPollingTimestamp).toISOString()}`);
+
+    // 2. Faz a chamada da API do Redmine (ajuste conforme o seu código atual)
+    const issues = await fetchRecentIssues(); 
 
     for (const issueSummary of issues) {
       const updatedAt = new Date(issueSummary.updated_on).getTime();
 
-      if (updatedAt < lastPollingTimestamp) continue;
-
-      try {
-        const issue = await fetchIssueDetails(issueSummary.id);
-
-        const issueWithUrl = {
-          ...issue,
-          url: `${REDMINE_URL}/issues/${issue.id}`
-        };
-
-        await processGoogleMeet(issueWithUrl);
-
-        const lastJournal = getLastJournal(issueWithUrl);
-
-        await processIssueNotification(
-          issueWithUrl,
-          'Atualização',
-          'Polling',
-          lastJournal
-        );
-      } catch (err) {
-        if (err.response?.status === 404) {
-          await deleteGoogleMeet(issueSummary.id);
-        } else {
-          console.error(
-            `Erro no polling da tarefa #${issueSummary.id}:`,
-            err.response?.data || err.message
-          );
-          await notifyAttention(
-            `polling_issue_error:${issueSummary.id}`,
-            'Erro no polling de tarefa do Redmine',
-            { issueId: issueSummary.id, error: err.response?.data || err.message }
-          );
-        }
+      // Se a tarefa for mais antiga do que a nossa última checagem salva, ignora
+      if (updatedAt < lastPollingTimestamp) {
+        continue;
       }
+
+      // ... (Mantenha aqui todo o RESTO do seu código que processa a tarefa/notificação) ...
+      // Ex: await processIssueNotification(issueSummary);
     }
 
-    lastPollingTimestamp = Date.now();
+    // 3. SE TUDO DEU CERTO: Atualiza o Redis com o timestamp do início desta rodada.
+    // Assim, na próxima execução, ele começará exatamente deste milissegundo em diante.
+    await redis.set('redmine:last_polling_timestamp', currentRunTimestamp);
+
   } catch (error) {
-    console.error('Erro geral no polling:', error.response?.data || error.message);
-    await notifyAttention(
-      'polling_general_error',
-      'Erro geral no polling do Redmine',
-      error.response?.data || error.message
-    );
+    console.error('Erro durante o polling de tarefas do Redmine:', error);
+    // Nota: Não atualizamos o timestamp em caso de erro crítico na chamada da API,
+    // garantindo que o bot tente buscar essas mesmas tarefas na próxima rodada.
   }
 }
 
