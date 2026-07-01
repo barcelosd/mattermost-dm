@@ -2359,89 +2359,157 @@ async function getGroupIdByName(name) {
 }
 
 async function processAutoResolution() {
-  console.log('[Auto-Resolução] Iniciando verificação de tarefas estagnadas em Aprovação...');
+  console.log('[Auto-Resolução] Iniciando verificação de tarefas estagnadas...');
   try {
+    // Busca dos IDs de status necessários
     const statusAprovacaoId = await getStatusIdByName('Aprovação');
     const statusResolvidoId = await getStatusIdByName('Resolvido');
+    const statusAguardandoId = await getStatusIdByName('Aguardando');
+    const statusRejeitadoId = await getStatusIdByName('Rejeitado');
     
-    if (!statusAprovacaoId || !statusResolvidoId) {
-      console.error('[Auto-Resolução] Cancelado: Status "Aprovação" ou "Resolvido" não foram encontrados.');
-      return;
-    }
+    // ---------------------------------------------------------
+    // 1. ROTINA: APROVAÇÃO -> RESOLVIDO (GP-Execução / GS-Execução)
+    // ---------------------------------------------------------
+    if (statusAprovacaoId && statusResolvidoId) {
+      const groupGPId = await getGroupIdByName('Gestão de Projetos');
+      const groupFinanceiroId = await getGroupIdByName('Financeiro');
 
-    const groupGPId = await getGroupIdByName('Gestão de Projetos');
-    const groupFinanceiroId = await getGroupIdByName('Financeiro');
-
-    const response = await axios.get(`${REDMINE_URL}/issues.json`, {
-      headers: redmineHeaders,
-      params: {
-        status_id: statusAprovacaoId,
-        limit: 100
-      }
-    });
-
-    const issues = response.data.issues || [];
-
-    for (const issueSummary of issues) {
-      try {
-        const trackerName = issueSummary.tracker?.name;
-        if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução') continue;
-
-        let targetGroupId = null;
-        let targetGroupName = '';
-
-        if (trackerName === 'GP-Execução') {
-          targetGroupId = groupGPId;
-          targetGroupName = 'Gestão de Projetos';
-        } else if (trackerName === 'GS-Execução') {
-          targetGroupId = groupFinanceiroId;
-          targetGroupName = 'Financeiro';
+      const responseAprovacao = await axios.get(`${REDMINE_URL}/issues.json`, {
+        headers: redmineHeaders,
+        params: {
+          status_id: statusAprovacaoId,
+          limit: 100
         }
+      });
 
-        if (!targetGroupId) {
-          console.error(`[Auto-Resolução] Grupo destino "${targetGroupName}" não encontrado para a tarefa #${issueSummary.id}`);
-          continue;
-        }
+      const issuesAprovacao = responseAprovacao.data.issues || [];
 
-        const issue = await fetchIssueDetails(issueSummary.id);
-        let enteredAprovacaoAt = dayjs(issue.created_on);
+      for (const issueSummary of issuesAprovacao) {
+        try {
+          const trackerName = issueSummary.tracker?.name;
+          if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução') continue;
 
-        if (issue.journals?.length) {
-          for (let i = issue.journals.length - 1; i >= 0; i--) {
-            const journal = issue.journals[i];
-            const statusChange = journal.details?.find(
-              d => d.property === 'attr' && d.name === 'status_id' && String(d.new_value) === String(statusAprovacaoId)
-            );
-            if (statusChange) {
-              enteredAprovacaoAt = dayjs(journal.created_on);
-              break;
+          let targetGroupId = null;
+          let targetGroupName = '';
+
+          if (trackerName === 'GP-Execução') {
+            targetGroupId = groupGPId;
+            targetGroupName = 'Gestão de Projetos';
+          } else if (trackerName === 'GS-Execução') {
+            targetGroupId = groupFinanceiroId;
+            targetGroupName = 'Financeiro';
+          }
+
+          if (!targetGroupId) {
+            console.error(`[Auto-Resolução] Grupo destino "${targetGroupName}" não encontrado para a tarefa #${issueSummary.id}`);
+            continue;
+          }
+
+          const issue = await fetchIssueDetails(issueSummary.id);
+          let enteredAprovacaoAt = dayjs(issue.created_on);
+
+          if (issue.journals?.length) {
+            for (let i = issue.journals.length - 1; i >= 0; i--) {
+              const journal = issue.journals[i];
+              const statusChange = journal.details?.find(
+                d => d.property === 'attr' && d.name === 'status_id' && String(d.new_value) === String(statusAprovacaoId)
+              );
+              if (statusChange) {
+                enteredAprovacaoAt = dayjs(journal.created_on);
+                break;
+              }
             }
           }
-        }
 
-        const horasEmAprovacao = dayjs().tz(TZ).diff(enteredAprovacaoAt.tz(TZ), 'hour');
-        
-        if (horasEmAprovacao >= 168) {
-          console.log(`[Auto-Resolução] Executando transição da tarefa #${issue.id} por estar há ${Math.floor(horasEmAprovacao / 24)} dias em Aprovação.`);
+          const horasEmAprovacao = dayjs().tz(TZ).diff(enteredAprovacaoAt.tz(TZ), 'hour');
           
-          await axios.put(
-            `${REDMINE_URL}/issues/${issue.id}.json`,
-            {
-              issue: {
-                status_id: statusResolvidoId,
-                assigned_to_id: targetGroupId,
-                notes: `*Rotina Automática:* Situação alterada para *Resolvido* e atribuição direcionada ao grupo *${targetGroupName}* por permanecer 7 dias ou mais em Aprovação.`
-              }
-            },
-            { headers: redmineHeaders }
-          );
-          
-          console.log(`[Auto-Resolução] Tarefa #${issue.id} atualizada com sucesso.`);
+          if (horasEmAprovacao >= 168) {
+            console.log(`[Auto-Resolução] Executando transição da tarefa #${issue.id} por estar há ${Math.floor(horasEmAprovacao / 24)} dias em Aprovação.`);
+            
+            await axios.put(
+              `${REDMINE_URL}/issues/${issue.id}.json`,
+              {
+                issue: {
+                  status_id: statusResolvidoId,
+                  assigned_to_id: targetGroupId,
+                  notes: `*Rotina Automática:* Situação alterada para *Resolvido* e atribuição direcionada ao grupo *${targetGroupName}* por permanecer 7 dias ou mais em Aprovação.`
+                }
+              },
+              { headers: redmineHeaders }
+            );
+            
+            console.log(`[Auto-Resolução] Tarefa #${issue.id} atualizada com sucesso para Resolvido.`);
+          }
+        } catch (err) {
+          console.error(`[Auto-Resolução] Erro ao processar a tarefa #${issueSummary.id} no fluxo de Aprovação:`, describeError(err));
         }
-      } catch (err) {
-        console.error(`[Auto-Resolução] Erro ao processar a tarefa #${issueSummary.id}:`, describeError(err));
       }
+    } else {
+      console.warn('[Auto-Resolução] Verificação de "Aprovação" ignorada: Status "Aprovação" ou "Resolvido" não encontrados.');
     }
+
+    // ---------------------------------------------------------
+    // 2. ROTINA: AGUARDANDO -> REJEITADO (GC-Análise Comercial)
+    // ---------------------------------------------------------
+    if (statusAguardandoId && statusRejeitadoId) {
+      const responseAguardando = await axios.get(`${REDMINE_URL}/issues.json`, {
+        headers: redmineHeaders,
+        params: {
+          status_id: statusAguardandoId,
+          limit: 100
+        }
+      });
+
+      const issuesAguardando = responseAguardando.data.issues || [];
+
+      for (const issueSummary of issuesAguardando) {
+        try {
+          const trackerName = issueSummary.tracker?.name;
+          if (trackerName !== 'GC-Análise Comercial') continue;
+
+          const issue = await fetchIssueDetails(issueSummary.id);
+          let enteredAguardandoAt = dayjs(issue.created_on);
+
+          // Varre o histórico para descobrir o momento exato em que a tarefa entrou em "Aguardando"
+          if (issue.journals?.length) {
+            for (let i = issue.journals.length - 1; i >= 0; i--) {
+              const journal = issue.journals[i];
+              const statusChange = journal.details?.find(
+                d => d.property === 'attr' && d.name === 'status_id' && String(d.new_value) === String(statusAguardandoId)
+              );
+              if (statusChange) {
+                enteredAguardandoAt = dayjs(journal.created_on);
+                break;
+              }
+            }
+          }
+
+          const horasEmAguardando = dayjs().tz(TZ).diff(enteredAguardandoAt.tz(TZ), 'hour');
+          
+          if (horasEmAguardando >= 168) {
+            console.log(`[Auto-Resolução] Executando rejeição da tarefa #${issue.id} por estar há ${Math.floor(horasEmAguardando / 24)} dias em Aguardando.`);
+            
+            await axios.put(
+              `${REDMINE_URL}/issues/${issue.id}.json`,
+              {
+                issue: {
+                  status_id: statusRejeitadoId,
+                  notes: `*Rotina Automática:* Situação alterada para *Rejeitado* por permanecer 7 dias ou mais no status *Aguardando*.`
+                }
+              },
+              { headers: redmineHeaders }
+            );
+            
+            console.log(`[Auto-Resolução] Tarefa #${issue.id} atualizada com sucesso para Rejeitado.`);
+          }
+        } catch (err) {
+          console.error(`[Auto-Resolução] Erro ao processar a tarefa #${issueSummary.id} no fluxo de Aguardando:`, describeError(err));
+        }
+      }
+    } else {
+      console.warn('[Auto-Resolução] Verificação de "Aguardando" ignorada: Status "Aguardando" ou "Rejeitado" não encontrados.');
+    }
+
   } catch (error) {
     console.error('[Auto-Resolução] Erro geral na rotina:', describeError(error));
     if (typeof notifyAttention === 'function') {
