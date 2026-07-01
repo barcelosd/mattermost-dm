@@ -1726,7 +1726,8 @@ async function pollingRedmineIssues() {
     // Armazenamos o momento exato do início DESTA rodada
     const currentRunTimestamp = Date.now();
 
-    console.log(`[Polling] Buscando tarefas alteradas desde: ${new Date(lastPollingTimestamp).toISOString()}`);
+    //console.log(`[Polling] Buscando tarefas alteradas desde: ${new Date(lastPollingTimestamp).toISOString()}`);
+    console.log(`[Polling] Buscando tarefas alteradas desde: ${dayjs(lastPollingTimestamp).format('YYYY-MM-DD HH:mm:ss')}`);
 
     // 2. Faz a chamada da API do Redmine (ajuste conforme o seu código atual)
     const issues = await fetchRecentIssues(); 
