@@ -1710,50 +1710,46 @@ async function pollingRedmineIssues() {
   if (POLLING_ENABLED !== 'true') return;
 
   try {
-    // 1. Tenta buscar o último timestamp gravado no Redis
-    let lastPollingTimestamp = await redis.get('redmine:last_polling_timestamp');
+    // CORREÇÃO 1: Usar redisGet (suporta tanto Redis quanto Memória)
+    let lastPollingTimestamp = await redisGet('redmine:last_polling_timestamp');
 
     if (!lastPollingTimestamp) {
-      // Se for a primeira vez que o bot roda (ou o Redis foi resetado),
-      // ele olha os últimos 10 minutos por segurança.
       lastPollingTimestamp = Date.now() - 10 * 60 * 1000;
-      console.log('Nenhum timestamp encontrado no Redis. Usando fallback de 10 minutos atrás.');
+      console.log('Nenhum timestamp encontrado. Usando fallback de 10 minutos atrás.');
     } else {
-      // O Redis devolve uma String, precisamos converter para Número
       lastPollingTimestamp = Number(lastPollingTimestamp);
     }
 
-    // Armazenamos o momento exato do início DESTA rodada
     const currentRunTimestamp = Date.now();
 
-    //console.log(`[Polling] Buscando tarefas alteradas desde: ${new Date(lastPollingTimestamp).toISOString()}`);
     console.log(`[Polling] Buscando tarefas alteradas desde: ${dayjs(lastPollingTimestamp).tz('America/Sao_Paulo').format('YYYY-MM-DD HH:mm:ss')}`);
 
-    // 2. Faz a chamada da API do Redmine (ajuste conforme o seu código atual)
     const issues = await fetchRecentIssues(); 
 
     for (const issueSummary of issues) {
-  const updatedAt = new Date(issueSummary.updated_on).getTime();
+      // CORREÇÃO 2: Bloco try...catch INDIVIDUAL para cada tarefa
+      try {
+        const updatedAt = new Date(issueSummary.updated_on).getTime();
 
-  // Se a tarefa for mais antiga do que a nossa última checagem salva, ignora
-  if (updatedAt < lastPollingTimestamp) {
-    continue;
-  }
+        if (updatedAt < lastPollingTimestamp) {
+          continue;
+        }
 
-  // 1. Busca os detalhes completos da tarefa (Custom Fields, Histórico, etc)
-  const fullIssue = await fetchIssueDetails(issueSummary.id);
+        const fullIssue = await fetchIssueDetails(issueSummary.id);
+        
+        await processGoogleMeet(fullIssue);
+        
+      } catch (issueError) {
+        console.error(`Erro isolado ao processar a tarefa #${issueSummary.id} no polling:`, issueError.response?.data || issueError.message);
+        // O erro foi capturado aqui! O loop vai continuar normalmente para a próxima tarefa.
+      }
+    }
 
-  // 2. Chama a função para criar o Meet / Agenda
-  await processGoogleMeet(fullIssue);
-  
-  // 3. Chama a função de notificações gerais (se você usar)
-  // await processIssueNotification(fullIssue, 'Atualização', 'polling');
-}
+    // CORREÇÃO 3: Usar redisSet para gravar o novo horário garantindo que não vai falhar
+    await redisSet('redmine:last_polling_timestamp', String(currentRunTimestamp));
 
   } catch (error) {
-    console.error('Erro durante o polling de tarefas do Redmine:', error);
-    // Nota: Não atualizamos o timestamp em caso de erro crítico na chamada da API,
-    // garantindo que o bot tente buscar essas mesmas tarefas na próxima rodada.
+    console.error('Erro geral durante o polling de tarefas do Redmine:', error.response?.data || error.message);
   }
 }
 
