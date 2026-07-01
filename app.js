@@ -576,7 +576,13 @@ function parseAppointmentDateTime(issue, preferredDate = null) {
     .toLowerCase()
     .replace(/\s+/g, '');
 
-  const parsedTime = dayjs(timeValue, ['HH:mm', 'HHhmm', 'HHh'], false);
+  // CORREÇÃO: Escapar a letra 'h' usando colchetes [h] para que o dayjs a trate como texto literal.
+  // Adicionadas também variações com 'H' para suportar horários sem o zero à esquerda (ex: 8h00).
+  const parsedTime = dayjs(
+    timeValue, 
+    ['HH:mm', 'H:mm', 'HH[h]mm', 'H[h]mm', 'HH[h]', 'H[h]'], 
+    false
+  );
 
   if (!parsedTime.isValid()) return null;
 
