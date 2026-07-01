@@ -2387,7 +2387,7 @@ async function processAutoResolution() {
       for (const issueSummary of issuesAprovacao) {
         try {
           const trackerName = issueSummary.tracker?.name;
-          if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução') continue;
+          if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução' && trackerName !== 'GS-Manutenção') continue;
 
           let targetGroupId = null;
           let targetGroupName = '';
@@ -2398,6 +2398,9 @@ async function processAutoResolution() {
           } else if (trackerName === 'GS-Execução') {
             targetGroupId = groupFinanceiroId;
             targetGroupName = 'Financeiro';
+          } else if (trackerName === 'GS-Manutenção') {
+            targetGroupId = groupFinanceiroId;
+            targetGroupName = 'Gestão de Serviços';
           }
 
           if (!targetGroupId) {
