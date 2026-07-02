@@ -1737,7 +1737,15 @@ async function pollingRedmineIssues() {
 
         const fullIssue = await fetchIssueDetails(issueSummary.id);
         
+        // 1. Processamento da Agenda e Google Meet
         await processGoogleMeet(fullIssue);
+        
+        // 2. ATIVAÇÃO: Notificações Comuns de Alteração de Status (Mattermost)
+        // Se a tarefa tiver histórico (journals), consideramos uma Atualização, senão uma Criação.
+        const action = fullIssue.journals?.length ? 'Atualização' : 'Criação';
+        
+        // Enviamos 'polling' como origem (source) e deixamos o journal como nulo de propósito.
+        await processIssueNotification(fullIssue, action, 'polling');
         
       } catch (issueError) {
         console.error(`Erro isolado ao processar a tarefa #${issueSummary.id} no polling:`, issueError.response?.data || issueError.message);
