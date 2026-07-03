@@ -1740,12 +1740,46 @@ async function pollingRedmineIssues() {
         // 1. Processamento da Agenda e Google Meet
         await processGoogleMeet(fullIssue);
         
-        // 2. ATIVAÇÃO: Notificações Comuns de Alteração de Status (Mattermost)
-        // Se a tarefa tiver histórico (journals), consideramos uma Atualização, senão uma Criação.
-        const action = fullIssue.journals?.length ? 'Atualização' : 'Criação';
-        
-        // Enviamos 'polling' como origem (source) e deixamos o journal como nulo de propósito.
-        await processIssueNotification(fullIssue, action, 'polling');
+        // 2. ATIVAÇÃO: Notificações Comuns de Alteração de Status e Responsável
+        if (!fullIssue.journals || fullIssue.journals.length === 0) {
+          // Se não há histórico, é uma Criação pura.
+          await processIssueNotification(fullIssue, 'Criação', 'polling', null);
+          continue;
+        }
+
+        // Filtra apenas os históricos (journals) que ocorreram desde o último polling
+        const recentJournals = fullIssue.journals.filter(j => {
+          return new Date(j.created_on).getTime() >= lastPollingTimestamp;
+        });
+
+        if (recentJournals.length === 0) {
+          // A tarefa foi alterada (ex: título, descrição), mas antes do nosso último polling 
+          // ou não gerou um journal relevante de status/responsável agora.
+          continue;
+        }
+
+        // Analisa as mudanças recentes
+        for (const journal of recentJournals) {
+          if (!journal.details) continue;
+
+          // Verifica se dentro desse histórico houve mudança de status ou de grupo/responsável
+          const statusMudou = journal.details.some(d => d.property === 'attr' && d.name === 'status_id');
+          const responsavelMudou = journal.details.some(d => d.property === 'attr' && d.name === 'assigned_to_id');
+
+          if (statusMudou || responsavelMudou) {
+            let action = 'Atualização';
+            
+            if (responsavelMudou && !statusMudou) {
+              action = 'Novo Grupo/Responsável Atribuído';
+            } else if (statusMudou) {
+              action = 'Alteração de Status';
+            }
+
+            // PASSANDO O JOURNAL: Isso fará a getEventKey gerar uma chave única baseada no ID desse histórico,
+            // garantindo que a validação de wasAlreadyNotified deixe a notificação passar para o novo destino.
+            await processIssueNotification(fullIssue, action, 'polling', journal);
+          }
+        }
         
       } catch (issueError) {
         console.error(`Erro isolado ao processar a tarefa #${issueSummary.id} no polling:`, issueError.response?.data || issueError.message);
