@@ -2400,7 +2400,7 @@ async function processAutoResolution() {
     const statusRejeitadoId = await getStatusIdByName('Rejeitado');
     
     // ---------------------------------------------------------
-    // 1. ROTINA: APROVAÇÃO -> RESOLVIDO (GP-Execução / GS-Execução)
+    // 1. ROTINA: APROVAÇÃO -> RESOLVIDO (GP-Execução / GS-Execução / GS-Manutenção)
     // ---------------------------------------------------------
     if (statusAprovacaoId && statusResolvidoId) {
       const groupGPId = await getGroupIdByName('Gestão de Projetos');
@@ -2484,7 +2484,8 @@ async function processAutoResolution() {
     }
 
     // ---------------------------------------------------------
-    // 2. ROTINA: AGUARDANDO -> REJEITADO (GC-Análise Comercial)
+    // 2. ROTINA: AGUARDANDO -> REJEITADO 
+    // (GC-Análise Comercial / GS-Tarefa de Análise / GS-Manutenção / GS-Suporte)
     // ---------------------------------------------------------
     if (statusAguardandoId && statusRejeitadoId) {
       const responseAguardando = await axios.get(`${REDMINE_URL}/issues.json`, {
@@ -2500,7 +2501,17 @@ async function processAutoResolution() {
       for (const issueSummary of issuesAguardando) {
         try {
           const trackerName = issueSummary.tracker?.name;
-          if (trackerName !== 'GC-Análise Comercial') continue;
+          
+          // Lista de trackers que devem ser movidos para Rejeitado após 7 dias em Aguardando
+          const trackersRejeicao = [
+            'GC-Análise Comercial',
+            'GS-Tarefa de Análise',
+            'GS-Manutenção',
+            'GS-Suporte'
+          ];
+
+          // Pula se o tracker não estiver na lista permitida
+          if (!trackersRejeicao.includes(trackerName)) continue;
 
           const issue = await fetchIssueDetails(issueSummary.id);
           let enteredAguardandoAt = dayjs(issue.created_on);
