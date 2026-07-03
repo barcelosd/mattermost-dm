@@ -2399,47 +2399,49 @@ async function processAutoResolution() {
     const statusAguardandoId = await getStatusIdByName('Aguardando');
     const statusRejeitadoId = await getStatusIdByName('Rejeitado');
     
-    // ---------------------------------------------------------
-    // 1. ROTINA: APROVAÇÃO -> RESOLVIDO (GP-Execução / GS-Execução / GS-Manutenção)
-    // ---------------------------------------------------------
-    if (statusAprovacaoId && statusResolvidoId) {
-      const groupGPId = await getGroupIdByName('Gestão de Projetos');
-      const groupFinanceiroId = await getGroupIdByName('Financeiro');
+// ---------------------------------------------------------
+// 1. ROTINA: APROVAÇÃO -> RESOLVIDO (GP-Execução / GS-Execução / GS-Manutenção)
+// ---------------------------------------------------------
+if (statusAprovacaoId && statusResolvidoId) {
+  const groupGPId = await getGroupIdByName('Gestão de Projetos');
+  const groupFinanceiroId = await getGroupIdByName('Financeiro');
+  const groupGestaoServicosId = await getGroupIdByName('Gestão de Serviços'); // 1. BUSCA O GRUPO CORRETO AQUI
 
-      const responseAprovacao = await axios.get(`${REDMINE_URL}/issues.json`, {
-        headers: redmineHeaders,
-        params: {
-          status_id: statusAprovacaoId,
-          limit: 100
-        }
-      });
+  const responseAprovacao = await axios.get(`${REDMINE_URL}/issues.json`, {
+    headers: redmineHeaders,
+    params: {
+      status_id: statusAprovacaoId,
+      limit: 100
+    }
+  });
 
-      const issuesAprovacao = responseAprovacao.data.issues || [];
+  const issuesAprovacao = responseAprovacao.data.issues || [];
 
-      for (const issueSummary of issuesAprovacao) {
-        try {
-          const trackerName = issueSummary.tracker?.name;
-          if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução' && trackerName !== 'GS-Manutenção') continue;
+  for (const issueSummary of issuesAprovacao) {
+    try {
+      const trackerName = issueSummary.tracker?.name;
+      if (trackerName !== 'GP-Execução' && trackerName !== 'GS-Execução' && trackerName !== 'GS-Manutenção') continue;
 
-          let targetGroupId = null;
-          let targetGroupName = '';
+      let targetGroupId = null;
+      let targetGroupName = '';
 
-          if (trackerName === 'GP-Execução') {
-            targetGroupId = groupGPId;
-            targetGroupName = 'Gestão de Projetos';
-          } else if (trackerName === 'GS-Execução') {
-            targetGroupId = groupFinanceiroId;
-            targetGroupName = 'Financeiro';
-          } else if (trackerName === 'GS-Manutenção') {
-            targetGroupId = groupFinanceiroId;
-            targetGroupName = 'Gestão de Serviços';
-          }
+      if (trackerName === 'GP-Execução') {
+        targetGroupId = groupGPId;
+        targetGroupName = 'Gestão de Projetos';
+      } else if (trackerName === 'GS-Execução') {
+        targetGroupId = groupFinanceiroId;
+        targetGroupName = 'Financeiro';
+      } else if (trackerName === 'GS-Manutenção') {
+        targetGroupId = groupGestaoServicosId; // 2. CORRIGE A ATRIBUIÇÃO AQUI
+        targetGroupName = 'Gestão de Serviços';
+      }
 
-          if (!targetGroupId) {
-            console.error(`[Auto-Resolução] Grupo destino "${targetGroupName}" não encontrado para a tarefa #${issueSummary.id}`);
-            continue;
-          }
+      if (!targetGroupId) {
+        console.error(`[Auto-Resolução] Grupo destino "${targetGroupName}" não encontrado para a tarefa #${issueSummary.id}`);
+        continue;
+      }
 
+      
           const issue = await fetchIssueDetails(issueSummary.id);
           let enteredAprovacaoAt = dayjs(issue.created_on);
 
