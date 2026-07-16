@@ -746,6 +746,31 @@ async function getResponsibleTargets(issue) {
     ];
   }
 
+  // Tentar primeiro como GRUPO para evitar conflito de IDs baixos de usuários
+  const group = await getRedmineGroup(assignee.id);
+
+  if (group && group.users && group.users.length > 0) {
+    const users = await Promise.all(
+      group.users.map(async gUser => {
+        try {
+          const fullUser = await getRedmineUser(gUser.id);
+  
+          if (isRedmineUserActive(fullUser)) {
+            return {
+              email: fullUser.mail.toLowerCase(),
+              name: `${fullUser.firstname} ${fullUser.lastname}`.trim()
+            };
+          }
+        } catch {}
+  
+        return null;
+      })
+    );
+  
+    return users.filter(Boolean);
+  }
+
+  // Se não for um grupo válido com usuários, tenta tratar como usuário único
   try {
     const user = await getRedmineUser(assignee.id);
 
@@ -759,28 +784,7 @@ async function getResponsibleTargets(issue) {
     }
   } catch {}
 
-  const group = await getRedmineGroup(assignee.id);
-
-  if (!group?.users?.length) return [];
-
-  const users = await Promise.all(
-    group.users.map(async gUser => {
-      try {
-        const fullUser = await getRedmineUser(gUser.id);
-
-        if (isRedmineUserActive(fullUser)) {
-          return {
-            email: fullUser.mail.toLowerCase(),
-            name: `${fullUser.firstname} ${fullUser.lastname}`.trim()
-          };
-        }
-      } catch {}
-
-      return null;
-    })
-  );
-
-  return users.filter(Boolean);
+  return [];
 }
 
 async function getWhatsAppGroupId(issue) {
