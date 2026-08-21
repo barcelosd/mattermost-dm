@@ -87,7 +87,7 @@ const WA_AUTH_DIR = WHATSAPP_AUTH_DIR || path.join(__dirname, '.wwebjs_auth');
 const PRICE_MONITOR_DATA_DIR =
   PERSISTENT_DATA_DIR || path.join(WA_AUTH_DIR, 'data');
 const PRICE_MONITORS_FILE = path.join(PRICE_MONITOR_DATA_DIR, 'price-monitors.json');
-const PRICE_SELECTION_VERSION = 'min-structured-v1';
+const PRICE_SELECTION_VERSION = 'product-price-context-v2';
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -2511,22 +2511,47 @@ function findPriceInCurrencyText(html) {
   const candidates = [];
   const text = html
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/\s+/g, ' ');
 
   const regex = /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)/gi;
   let match;
 
+  const positiveTerms = [
+    'preço', 'preco', 'por', 'à vista', 'a vista', 'pix', 'oferta',
+    'price', 'sale', 'valor', 'agora'
+  ];
+  const negativeTerms = [
+    'parcela', 'parcelas', 'x de', 'cashback', 'economize', 'cupom',
+    'frete', 'desconto de', 'juros', 'mensal', 'assinatura', 'entrada'
+  ];
+
   while ((match = regex.exec(text)) !== null) {
     const price = parsePriceValue(match[1]);
+    if (!price) continue;
 
-    if (price) {
-      candidates.push({
-        price,
-        method: 'currency-text'
-      });
+    const start = Math.max(0, match.index - 120);
+    const end = Math.min(text.length, regex.lastIndex + 120);
+    const context = text.slice(start, end).toLowerCase();
+
+    let score = 0;
+    for (const term of positiveTerms) {
+      if (context.includes(term)) score += 2;
+    }
+    for (const term of negativeTerms) {
+      if (context.includes(term)) score -= 4;
     }
 
-    if (candidates.length >= 20) break;
+    candidates.push({
+      price,
+      method: 'currency-text',
+      score,
+      context: context.slice(0, 240)
+    });
+
+    if (candidates.length >= 50) break;
   }
 
   return candidates;
@@ -2543,9 +2568,10 @@ function extractProductTitle(html) {
   return title?.[1]?.replace(/\s+/g, ' ').trim() || null;
 }
 
-function extractPriceFromHtml(html) {
-  // Prioriza fontes estruturadas ligadas ao produto (JSON-LD, meta tags
-  // e JSON embutido). Só usa texto solto da página como fallback.
+function extractPriceFromHtml(html, options = {}) {
+  const targetPrice = Number(options.targetPrice);
+  const hasTargetPrice = Number.isFinite(targetPrice) && targetPrice > 0;
+
   const structuredCandidates = [
     ...findPriceInJsonLd(html),
     ...findPriceInMetaTags(html),
@@ -2564,33 +2590,61 @@ function extractPriceFromHtml(html) {
       candidate.price < 10000000
   );
 
-  const candidates = structuredCandidates.length
-    ? structuredCandidates
-    : fallbackCandidates;
+  let candidates;
+  let method;
+
+  if (structuredCandidates.length) {
+    candidates = structuredCandidates;
+    method = 'selected:min-structured-candidate';
+  } else {
+    let plausible = fallbackCandidates.filter(candidate => candidate.score >= 0);
+
+    if (hasTargetPrice) {
+      const targetFloor = Math.max(10, targetPrice * 0.2);
+      const targetCeiling = targetPrice * 5;
+      const byTarget = plausible.filter(
+        candidate => candidate.price >= targetFloor && candidate.price <= targetCeiling
+      );
+      if (byTarget.length) plausible = byTarget;
+    }
+
+    if (plausible.length > 1) {
+      const maxPrice = Math.max(...plausible.map(candidate => candidate.price));
+      if (maxPrice >= 500) {
+        const clustered = plausible.filter(candidate => candidate.price >= maxPrice * 0.15);
+        if (clustered.length) plausible = clustered;
+      }
+    }
+
+    candidates = plausible.length ? plausible : fallbackCandidates;
+    method = 'selected:contextual-currency-candidate';
+  }
 
   if (!candidates.length) {
     throw new Error('Não foi possível identificar um preço válido no HTML da página.');
   }
 
-  // Regra do monitor: usar o MENOR preço válido do próprio produto.
-  const selected = candidates.reduce((lowest, candidate) =>
-    candidate.price < lowest.price ? candidate : lowest
-  );
+  const selected = candidates
+    .slice()
+    .sort((a, b) => {
+      const scoreA = Number(a.score || 0);
+      const scoreB = Number(b.score || 0);
+      if (scoreA !== scoreB) return scoreB - scoreA;
+      return a.price - b.price;
+    })[0];
 
   return {
     price: Number(selected.price.toFixed(2)),
-    method: structuredCandidates.length
-      ? 'selected:min-structured-candidate'
-      : 'selected:min-currency-text-candidate',
+    method,
     selectedSourceMethod: selected.method,
     candidates: candidates
       .slice()
       .sort((a, b) => a.price - b.price)
-      .slice(0, 20)
+      .slice(0, 30)
   };
 }
 
-async function fetchProductPrice(url) {
+async function fetchProductPrice(url, options = {}) {
   const response = await axios.get(url, {
     timeout: 25000,
     maxRedirects: 5,
@@ -2613,7 +2667,7 @@ async function fetchProductPrice(url) {
     throw new Error('A loja retornou uma página vazia.');
   }
 
-  const extracted = extractPriceFromHtml(html);
+  const extracted = extractPriceFromHtml(html, options);
 
   return {
     ...extracted,
@@ -2630,7 +2684,7 @@ async function checkPriceMonitor(monitor) {
       ? null
       : Number(monitor.lastPrice);
 
-  const fetched = await fetchProductPrice(monitor.url);
+  const fetched = await fetchProductPrice(monitor.url, { targetPrice: monitor.targetPrice });
   const currentPrice = Number(fetched.price.toFixed(2));
   const changed =
     previousPrice !== null &&
@@ -2718,6 +2772,8 @@ async function notifyPriceMonitorMattermost(monitor, result, reason) {
   const lines = [
     `### ${direction || '💰'} Monitor de Preço`,
     `**${monitor.name}**`,
+    monitor.brand ? `Marca: **${monitor.brand}**` : null,
+    monitor.store ? `Loja: **${monitor.store}**` : null,
     reason === 'target_reached'
       ? '🎯 O produto atingiu o preço-alvo.'
       : 'O menor preço disponível do produto mudou.',
@@ -2793,6 +2849,8 @@ app.post('/api/price-monitors', async (req, res) => {
   try {
     const body = req.body || {};
     const name = String(body.name || '').trim();
+    const brand = String(body.brand || '').trim() || null;
+    const store = String(body.store || '').trim() || null;
 
     if (!name) {
       return res.status(400).json({ error: 'name é obrigatório.' });
@@ -2820,6 +2878,8 @@ app.post('/api/price-monitors', async (req, res) => {
     const monitor = {
       id: randomUUID(),
       name,
+      brand,
+      store,
       url,
       targetPrice: targetPrice ?? null,
       notifyOnAnyChange: body.notifyOnAnyChange !== false,
@@ -2956,6 +3016,14 @@ app.patch('/api/price-monitors/:id', async (req, res) => {
       const name = String(body.name || '').trim();
       if (!name) return res.status(400).json({ error: 'name não pode ser vazio.' });
       updated.name = name;
+    }
+
+    if (body.brand !== undefined) {
+      updated.brand = String(body.brand || '').trim() || null;
+    }
+
+    if (body.store !== undefined) {
+      updated.store = String(body.store || '').trim() || null;
     }
 
     if (body.url !== undefined) {
