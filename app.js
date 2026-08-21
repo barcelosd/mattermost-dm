@@ -78,6 +78,7 @@ const {
   ERROR_NOTIFICATION_MIN_INTERVAL_SECONDS = 300,
 
   PRICE_MONITOR_API_TOKEN,
+  PRICE_MONITOR_DEFAULT_EMAIL,
   PERSISTENT_DATA_DIR
 } = process.env;
 
@@ -86,6 +87,7 @@ const WA_AUTH_DIR = WHATSAPP_AUTH_DIR || path.join(__dirname, '.wwebjs_auth');
 const PRICE_MONITOR_DATA_DIR =
   PERSISTENT_DATA_DIR || path.join(WA_AUTH_DIR, 'data');
 const PRICE_MONITORS_FILE = path.join(PRICE_MONITOR_DATA_DIR, 'price-monitors.json');
+const PRICE_SELECTION_VERSION = 'min-structured-v1';
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -2542,31 +2544,50 @@ function extractProductTitle(html) {
 }
 
 function extractPriceFromHtml(html) {
-  const groups = [
-    findPriceInJsonLd(html),
-    findPriceInMetaTags(html),
-    findPriceInEmbeddedJson(html),
-    findPriceInCurrencyText(html)
-  ];
+  // Prioriza fontes estruturadas ligadas ao produto (JSON-LD, meta tags
+  // e JSON embutido). Só usa texto solto da página como fallback.
+  const structuredCandidates = [
+    ...findPriceInJsonLd(html),
+    ...findPriceInMetaTags(html),
+    ...findPriceInEmbeddedJson(html)
+  ].filter(
+    candidate =>
+      Number.isFinite(candidate.price) &&
+      candidate.price > 0 &&
+      candidate.price < 10000000
+  );
 
-  for (const candidates of groups) {
-    const valid = candidates.filter(
-      candidate =>
-        Number.isFinite(candidate.price) &&
-        candidate.price > 0 &&
-        candidate.price < 10000000
-    );
+  const fallbackCandidates = findPriceInCurrencyText(html).filter(
+    candidate =>
+      Number.isFinite(candidate.price) &&
+      candidate.price > 0 &&
+      candidate.price < 10000000
+  );
 
-    if (valid.length) {
-      return {
-        price: valid[0].price,
-        method: valid[0].method,
-        candidates: valid.slice(0, 10)
-      };
-    }
+  const candidates = structuredCandidates.length
+    ? structuredCandidates
+    : fallbackCandidates;
+
+  if (!candidates.length) {
+    throw new Error('Não foi possível identificar um preço válido no HTML da página.');
   }
 
-  throw new Error('Não foi possível identificar um preço válido no HTML da página.');
+  // Regra do monitor: usar o MENOR preço válido do próprio produto.
+  const selected = candidates.reduce((lowest, candidate) =>
+    candidate.price < lowest.price ? candidate : lowest
+  );
+
+  return {
+    price: Number(selected.price.toFixed(2)),
+    method: structuredCandidates.length
+      ? 'selected:min-structured-candidate'
+      : 'selected:min-currency-text-candidate',
+    selectedSourceMethod: selected.method,
+    candidates: candidates
+      .slice()
+      .sort((a, b) => a.price - b.price)
+      .slice(0, 20)
+  };
 }
 
 async function fetchProductPrice(url) {
@@ -2640,10 +2661,88 @@ async function checkPriceMonitor(monitor) {
     targetPrice: monitor.targetPrice ?? null,
     targetReached,
     extractionMethod: fetched.method,
+    selectedSourceMethod: fetched.selectedSourceMethod ?? null,
     extractionCandidates: fetched.candidates,
     pageTitle: fetched.title,
     finalUrl: fetched.finalUrl,
     httpStatus: fetched.httpStatus
+  };
+}
+
+function normalizeNotificationEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  if (!email) return null;
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('notifyEmail inválido.');
+  }
+
+  return email;
+}
+
+function getPriceMonitorNotifyEmail(monitor) {
+  return normalizeNotificationEmail(
+    monitor.notifyEmail || PRICE_MONITOR_DEFAULT_EMAIL || ''
+  );
+}
+
+function formatCurrencyBRL(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return '-';
+  }
+
+  return Number(value).toLocaleString('pt-BR', {
+    style: 'currency',
+    currency: 'BRL'
+  });
+}
+
+async function notifyPriceMonitorMattermost(monitor, result, reason) {
+  const email = getPriceMonitorNotifyEmail(monitor);
+
+  if (!email) {
+    return {
+      sent: false,
+      reason: 'missing_notify_email'
+    };
+  }
+
+  const direction = result.difference === null
+    ? ''
+    : result.difference < 0
+      ? '📉'
+      : result.difference > 0
+        ? '📈'
+        : '➖';
+
+  const lines = [
+    `### ${direction || '💰'} Monitor de Preço`,
+    `**${monitor.name}**`,
+    reason === 'target_reached'
+      ? '🎯 O produto atingiu o preço-alvo.'
+      : 'O menor preço disponível do produto mudou.',
+    result.previousPrice !== null
+      ? `Preço anterior: **${formatCurrencyBRL(result.previousPrice)}**`
+      : null,
+    `Preço atual: **${formatCurrencyBRL(result.currentPrice)}**`,
+    result.difference !== null
+      ? `Variação: **${formatCurrencyBRL(result.difference)} (${result.differencePercent ?? 0}%)**`
+      : null,
+    monitor.targetPrice !== null && monitor.targetPrice !== undefined
+      ? `Preço-alvo: **${formatCurrencyBRL(monitor.targetPrice)}**`
+      : null,
+    `Link: ${monitor.url}`
+  ].filter(Boolean);
+
+  await notifyTargets(
+    [{ email, name: email }],
+    lines.join('\n')
+  );
+
+  return {
+    sent: true,
+    email,
+    reason
   };
 }
 
@@ -2693,6 +2792,9 @@ app.post('/api/price-monitors', async (req, res) => {
 
     const url = validateMonitorUrl(body.url);
     const targetPrice = parseOptionalPrice(body.targetPrice, 'targetPrice');
+    const notifyEmail = normalizeNotificationEmail(
+      body.notifyEmail || PRICE_MONITOR_DEFAULT_EMAIL || ''
+    );
     const now = dayjs().tz(TZ).toISOString();
     const monitors = await readPriceMonitors();
 
@@ -2713,11 +2815,14 @@ app.post('/api/price-monitors', async (req, res) => {
       url,
       targetPrice: targetPrice ?? null,
       notifyOnAnyChange: body.notifyOnAnyChange !== false,
+      notifyEmail,
       active: body.active !== false,
       lastPrice: null,
       lastCheckedAt: null,
       lastChangeAt: null,
       lastError: null,
+      lastTargetReached: false,
+      priceSelectionVersion: null,
       createdAt: now,
       updatedAt: now
     };
@@ -2748,14 +2853,44 @@ app.post('/api/price-monitors/:id/check', async (req, res) => {
   try {
     const result = await checkPriceMonitor(monitor);
 
+    // Se o monitor foi criado com uma regra de seleção de preço anterior,
+    // a primeira execução com a regra "menor preço" apenas redefine a base.
+    // Isso evita notificar uma falsa queda causada pela troca de algoritmo.
+    const rebaselined = monitor.priceSelectionVersion !== PRICE_SELECTION_VERSION;
+    const effectiveChanged = !rebaselined && result.changed;
+    const targetCrossed =
+      !rebaselined &&
+      result.targetReached &&
+      monitor.lastTargetReached !== true;
+
+    let notification = { sent: false, reason: 'not_required' };
+
+    if (targetCrossed) {
+      notification = await notifyPriceMonitorMattermost(
+        monitor,
+        result,
+        'target_reached'
+      );
+    } else if (effectiveChanged && monitor.notifyOnAnyChange !== false) {
+      notification = await notifyPriceMonitorMattermost(
+        monitor,
+        result,
+        'price_changed'
+      );
+    }
+
     const updated = {
       ...monitor,
       lastPrice: result.currentPrice,
       lastCheckedAt: result.checkedAt,
-      lastChangeAt: result.changed ? result.checkedAt : monitor.lastChangeAt,
+      lastChangeAt: effectiveChanged ? result.checkedAt : monitor.lastChangeAt,
       lastError: null,
       lastExtractionMethod: result.extractionMethod,
+      lastSelectedSourceMethod: result.selectedSourceMethod ?? null,
       lastPageTitle: result.pageTitle,
+      lastTargetReached: result.targetReached,
+      priceSelectionVersion: PRICE_SELECTION_VERSION,
+      notifyEmail: getPriceMonitorNotifyEmail(monitor),
       updatedAt: now
     };
 
@@ -2764,7 +2899,12 @@ app.post('/api/price-monitors/:id/check', async (req, res) => {
 
     return res.status(200).json({
       monitor: updated,
-      check: result
+      check: {
+        ...result,
+        rebaselined,
+        effectiveChanged
+      },
+      notification
     });
   } catch (error) {
     const message = describeError(error);
@@ -2822,6 +2962,10 @@ app.patch('/api/price-monitors/:id', async (req, res) => {
       updated.notifyOnAnyChange = Boolean(body.notifyOnAnyChange);
     }
 
+    if (body.notifyEmail !== undefined) {
+      updated.notifyEmail = normalizeNotificationEmail(body.notifyEmail);
+    }
+
     if (body.active !== undefined) {
       updated.active = Boolean(body.active);
     }
@@ -2874,6 +3018,7 @@ app.get('/health', (req, res) => {
     errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
     errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID),
     priceMonitorApiConfigured: Boolean(PRICE_MONITOR_API_TOKEN),
+    priceMonitorDefaultEmailConfigured: Boolean(PRICE_MONITOR_DEFAULT_EMAIL),
     priceMonitorDataDir: PRICE_MONITOR_DATA_DIR
   });
 });
