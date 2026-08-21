@@ -2346,6 +2346,307 @@ function validateMonitorUrl(value) {
   return parsed.toString();
 }
 
+
+function parsePriceValue(value) {
+  if (value === undefined || value === null) return null;
+
+  let text = String(value)
+    .replace(/\u00a0/g, ' ')
+    .replace(/R\$/gi, '')
+    .trim();
+
+  if (!text) return null;
+
+  text = text.replace(/[^0-9.,-]/g, '');
+  if (!text) return null;
+
+  const lastComma = text.lastIndexOf(',');
+  const lastDot = text.lastIndexOf('.');
+
+  if (lastComma > lastDot) {
+    text = text.replace(/\./g, '').replace(',', '.');
+  } else if (lastDot > lastComma && lastComma >= 0) {
+    text = text.replace(/,/g, '');
+  } else if (lastComma >= 0) {
+    text = text.replace(',', '.');
+  }
+
+  const numberValue = Number(text);
+
+  if (!Number.isFinite(numberValue) || numberValue <= 0) return null;
+
+  return Number(numberValue.toFixed(2));
+}
+
+function findPriceInJsonLd(html) {
+  const scripts = [...html.matchAll(
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+  )];
+
+  const candidates = [];
+
+  function walk(value) {
+    if (!value) return;
+
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+
+    if (typeof value !== 'object') return;
+
+    const type = Array.isArray(value['@type'])
+      ? value['@type'].join(' ')
+      : String(value['@type'] || '');
+
+    const isOffer = /offer/i.test(type);
+
+    if (isOffer) {
+      for (const field of ['price', 'lowPrice', 'highPrice']) {
+        const price = parsePriceValue(value[field]);
+        if (price) {
+          candidates.push({
+            price,
+            method: `json-ld:${field}`
+          });
+        }
+      }
+    }
+
+    if (value.offers) walk(value.offers);
+
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'offers') continue;
+      if (child && typeof child === 'object') walk(child);
+    }
+  }
+
+  for (const match of scripts) {
+    try {
+      walk(JSON.parse(match[1].trim()));
+    } catch (_) {}
+  }
+
+  return candidates;
+}
+
+function findPriceInMetaTags(html) {
+  const candidates = [];
+  const tagRegex = /<meta\b[^>]*>/gi;
+  const tags = html.match(tagRegex) || [];
+
+  for (const tag of tags) {
+    const keyMatch = tag.match(
+      /(?:property|name|itemprop)=["']([^"']+)["']/i
+    );
+    const contentMatch = tag.match(/content=["']([^"']+)["']/i);
+
+    if (!keyMatch || !contentMatch) continue;
+
+    const key = keyMatch[1].toLowerCase();
+
+    if (
+      ![
+        'product:price:amount',
+        'og:price:amount',
+        'price',
+        'product:price'
+      ].includes(key)
+    ) {
+      continue;
+    }
+
+    const price = parsePriceValue(contentMatch[1]);
+
+    if (price) {
+      candidates.push({
+        price,
+        method: `meta:${key}`
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function findPriceInEmbeddedJson(html) {
+  const candidates = [];
+  const patterns = [
+    {
+      regex: /["'](?:salePrice|bestPrice|spotPrice|currentPrice|price)["']\s*:\s*["']?([0-9]+(?:[.,][0-9]+)?)/gi,
+      method: 'embedded-json:price',
+      cents: false
+    },
+    {
+      regex: /["'](?:sellingPrice|bestPrice)["']\s*:\s*([0-9]{3,})/gi,
+      method: 'embedded-json:cents',
+      cents: true
+    }
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+
+    while ((match = pattern.regex.exec(html)) !== null) {
+      let price = parsePriceValue(match[1]);
+
+      if (price && pattern.cents && Number(match[1]) >= 1000) {
+        price = Number((Number(match[1]) / 100).toFixed(2));
+      }
+
+      if (price) {
+        candidates.push({ price, method: pattern.method });
+      }
+
+      if (candidates.length >= 20) break;
+    }
+  }
+
+  return candidates;
+}
+
+function findPriceInCurrencyText(html) {
+  const candidates = [];
+  const text = html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ');
+
+  const regex = /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)/gi;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const price = parsePriceValue(match[1]);
+
+    if (price) {
+      candidates.push({
+        price,
+        method: 'currency-text'
+      });
+    }
+
+    if (candidates.length >= 20) break;
+  }
+
+  return candidates;
+}
+
+function extractProductTitle(html) {
+  const ogTitle = html.match(
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
+  );
+
+  if (ogTitle?.[1]) return ogTitle[1].trim();
+
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return title?.[1]?.replace(/\s+/g, ' ').trim() || null;
+}
+
+function extractPriceFromHtml(html) {
+  const groups = [
+    findPriceInJsonLd(html),
+    findPriceInMetaTags(html),
+    findPriceInEmbeddedJson(html),
+    findPriceInCurrencyText(html)
+  ];
+
+  for (const candidates of groups) {
+    const valid = candidates.filter(
+      candidate =>
+        Number.isFinite(candidate.price) &&
+        candidate.price > 0 &&
+        candidate.price < 10000000
+    );
+
+    if (valid.length) {
+      return {
+        price: valid[0].price,
+        method: valid[0].method,
+        candidates: valid.slice(0, 10)
+      };
+    }
+  }
+
+  throw new Error('Não foi possível identificar um preço válido no HTML da página.');
+}
+
+async function fetchProductPrice(url) {
+  const response = await axios.get(url, {
+    timeout: 25000,
+    maxRedirects: 5,
+    responseType: 'text',
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache'
+    },
+    validateStatus: status => status >= 200 && status < 400
+  });
+
+  const html = String(response.data || '');
+
+  if (!html.trim()) {
+    throw new Error('A loja retornou uma página vazia.');
+  }
+
+  const extracted = extractPriceFromHtml(html);
+
+  return {
+    ...extracted,
+    title: extractProductTitle(html),
+    finalUrl: response.request?.res?.responseUrl || url,
+    httpStatus: response.status
+  };
+}
+
+async function checkPriceMonitor(monitor) {
+  const checkedAt = dayjs().tz(TZ).toISOString();
+  const previousPrice =
+    monitor.lastPrice === null || monitor.lastPrice === undefined
+      ? null
+      : Number(monitor.lastPrice);
+
+  const fetched = await fetchProductPrice(monitor.url);
+  const currentPrice = Number(fetched.price.toFixed(2));
+  const changed =
+    previousPrice !== null &&
+    Number(previousPrice.toFixed(2)) !== currentPrice;
+
+  const difference =
+    previousPrice === null
+      ? null
+      : Number((currentPrice - previousPrice).toFixed(2));
+
+  const differencePercent =
+    previousPrice && previousPrice > 0
+      ? Number((((currentPrice - previousPrice) / previousPrice) * 100).toFixed(2))
+      : null;
+
+  const targetReached =
+    monitor.targetPrice !== null &&
+    monitor.targetPrice !== undefined &&
+    currentPrice <= Number(monitor.targetPrice);
+
+  return {
+    checkedAt,
+    previousPrice,
+    currentPrice,
+    changed,
+    difference,
+    differencePercent,
+    targetPrice: monitor.targetPrice ?? null,
+    targetReached,
+    extractionMethod: fetched.method,
+    extractionCandidates: fetched.candidates,
+    pageTitle: fetched.title,
+    finalUrl: fetched.finalUrl,
+    httpStatus: fetched.httpStatus
+  };
+}
+
 function requirePriceMonitorAuth(req, res, next) {
   if (!PRICE_MONITOR_API_TOKEN) {
     return res.status(503).json({
@@ -2429,6 +2730,64 @@ app.post('/api/price-monitors', async (req, res) => {
     const message = describeError(error);
     console.error('Erro ao criar monitor de preço:', message);
     res.status(400).json({ error: message });
+  }
+});
+
+
+app.post('/api/price-monitors/:id/check', async (req, res) => {
+  const monitors = await readPriceMonitors();
+  const index = monitors.findIndex(monitor => monitor.id === req.params.id);
+
+  if (index < 0) {
+    return res.status(404).json({ error: 'Monitor de preço não encontrado.' });
+  }
+
+  const monitor = monitors[index];
+  const now = dayjs().tz(TZ).toISOString();
+
+  try {
+    const result = await checkPriceMonitor(monitor);
+
+    const updated = {
+      ...monitor,
+      lastPrice: result.currentPrice,
+      lastCheckedAt: result.checkedAt,
+      lastChangeAt: result.changed ? result.checkedAt : monitor.lastChangeAt,
+      lastError: null,
+      lastExtractionMethod: result.extractionMethod,
+      lastPageTitle: result.pageTitle,
+      updatedAt: now
+    };
+
+    monitors[index] = updated;
+    await writePriceMonitors(monitors);
+
+    return res.status(200).json({
+      monitor: updated,
+      check: result
+    });
+  } catch (error) {
+    const message = describeError(error);
+
+    monitors[index] = {
+      ...monitor,
+      lastCheckedAt: now,
+      lastError: typeof message === 'string' ? message : JSON.stringify(message),
+      updatedAt: now
+    };
+
+    await writePriceMonitors(monitors);
+
+    console.error(
+      `Erro ao verificar preço do monitor ${monitor.id} (${monitor.name}):`,
+      message
+    );
+
+    return res.status(502).json({
+      error: 'Não foi possível consultar o preço do produto.',
+      detail: message,
+      monitor: monitors[index]
+    });
   }
 });
 
