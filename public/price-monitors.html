@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitor de Preços</title>
+  <style>
+    :root{color-scheme:light dark;--bg:#f5f7fa;--card:#fff;--text:#18212f;--muted:#667085;--border:#d0d5dd;--accent:#2563eb;--danger:#b42318;--ok:#067647;--warn:#b54708}
+    @media(prefers-color-scheme:dark){:root{--bg:#111827;--card:#1f2937;--text:#f3f4f6;--muted:#9ca3af;--border:#374151;--accent:#60a5fa;--danger:#f97066;--ok:#32d583;--warn:#fdb022}}
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+    .wrap{max-width:1180px;margin:0 auto;padding:24px}.top{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}
+    h1{font-size:28px;margin:0}.muted{color:var(--muted)} .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:16px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.full{grid-column:1/-1}@media(max-width:720px){.grid{grid-template-columns:1fr}}
+    label{display:block;font-weight:600;font-size:14px;margin-bottom:6px} input[type=text],input[type=url],input[type=number],input[type=email]{width:100%;padding:11px 12px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--text);font-size:16px}
+    .check{display:flex;align-items:center;gap:8px;padding-top:6px}.check input{width:18px;height:18px}
+    button{border:0;border-radius:9px;padding:10px 14px;font-weight:650;cursor:pointer;background:var(--accent);color:white}.secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.danger{background:var(--danger)}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}.hidden{display:none!important}.status{padding:10px 12px;border-radius:9px;margin:10px 0;background:rgba(37,99,235,.08)}
+    .status.error{color:var(--danger);background:rgba(180,35,24,.08)}
+    .monitor{display:grid;grid-template-columns:minmax(0,2fr) repeat(3,minmax(120px,.8fr));gap:14px;align-items:start;padding:16px 0;border-top:1px solid var(--border)}.monitor:first-child{border-top:0}
+    .name{font-size:18px;font-weight:750}.price{font-size:22px;font-weight:750}.ok{color:var(--ok)}.warn{color:var(--warn)}.err{color:var(--danger)}
+    .tiny{font-size:12px;color:var(--muted);word-break:break-all}.pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);margin-right:6px}
+    @media(max-width:850px){.monitor{grid-template-columns:1fr 1fr}.monitor .main{grid-column:1/-1}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div><h1>Monitor de Preços</h1><div class="muted">Cadastro e acompanhamento dos produtos monitorados.</div></div>
+    <div class="actions"><button id="newBtn" class="secondary">+ Novo produto</button><button id="reloadBtn" class="secondary">Atualizar</button><button id="logoutBtn" class="secondary">Sair</button></div>
+  </div>
+
+  <section id="loginCard" class="card">
+    <h2>Acesso</h2>
+    <p class="muted">Informe a PRICE_MONITOR_API_TOKEN configurada no Render. A chave fica apenas nesta aba do navegador.</p>
+    <div class="grid"><div class="full"><label for="token">API Token</label><input id="token" type="text" autocomplete="off" placeholder="Cole a PRICE_MONITOR_API_TOKEN"></div></div>
+    <div class="actions" style="margin-top:12px"><button id="loginBtn">Entrar</button></div>
+  </section>
+
+  <div id="status" class="status hidden"></div>
+
+  <section id="formCard" class="card hidden">
+    <h2 id="formTitle">Novo produto</h2>
+    <form id="monitorForm">
+      <input id="monitorId" type="hidden">
+      <div class="grid">
+        <div><label for="name">Nome</label><input id="name" required type="text" placeholder="Logitech RS50"></div>
+        <div><label for="targetPrice">Preço-alvo (R$)</label><input id="targetPrice" type="number" step="0.01" min="0" placeholder="4500.00"></div>
+        <div class="full"><label for="url">URL do produto</label><input id="url" required type="url" placeholder="https://..."></div>
+        <div><label for="notifyEmail">E-mail no Mattermost</label><input id="notifyEmail" type="email" placeholder="Se vazio, usa o padrão do Render"></div>
+        <div>
+          <label>Notificações</label>
+          <div class="check"><input id="notifyOnAnyChange" type="checkbox" checked><span>Avisar em qualquer alteração de preço</span></div>
+          <div class="check"><input id="active" type="checkbox" checked><span>Monitor ativo</span></div>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:16px"><button type="submit">Salvar</button><button id="cancelBtn" class="secondary" type="button">Cancelar</button></div>
+    </form>
+  </section>
+
+  <section id="listCard" class="card hidden">
+    <div class="top" style="margin-bottom:0"><h2 style="margin:0">Produtos</h2><div id="count" class="muted"></div></div>
+    <div id="list"></div>
+  </section>
+</div>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const state = { token: sessionStorage.getItem('priceMonitorToken') || '', monitors: [] };
+  const money = v => v == null ? '—' : Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+  const when = v => !v ? '—' : new Date(v).toLocaleString('pt-BR');
+  function showStatus(msg, error=false){ const el=$('status'); el.textContent=msg; el.classList.remove('hidden'); el.classList.toggle('error',error); }
+  function clearStatus(){ $('status').classList.add('hidden'); }
+  function setLogged(logged){ $('loginCard').classList.toggle('hidden',logged); $('listCard').classList.toggle('hidden',!logged); $('newBtn').classList.toggle('hidden',!logged); $('reloadBtn').classList.toggle('hidden',!logged); $('logoutBtn').classList.toggle('hidden',!logged); if(!logged)$('formCard').classList.add('hidden'); }
+  async function api(path, options={}){
+    const headers = Object.assign({'Authorization':'Bearer '+state.token}, options.headers||{});
+    if(options.body) headers['Content-Type']='application/json';
+    const res = await fetch(path, Object.assign({},options,{headers}));
+    if(res.status===204) return null;
+    let data; try{data=await res.json()}catch{data={error:'Resposta inválida do servidor.'}}
+    if(!res.ok) throw new Error(data.error||data.detail||('HTTP '+res.status));
+    return data;
+  }
+  async function load(){ clearStatus(); try{ const data=await api('/api/price-monitors'); state.monitors=data.monitors||[]; render(); setLogged(true); }catch(e){ showStatus(e.message,true); if(/autoriz/i.test(e.message)){state.token='';sessionStorage.removeItem('priceMonitorToken');setLogged(false);} } }
+  function render(){ $('count').textContent=state.monitors.length+' monitor(es)'; const list=$('list'); list.innerHTML=''; if(!state.monitors.length){ list.innerHTML='<p class="muted">Nenhum produto cadastrado.</p>'; return; }
+    state.monitors.forEach(m=>{ const row=document.createElement('div'); row.className='monitor'; const targetClass=(m.lastPrice!=null&&m.targetPrice!=null&&m.lastPrice<=m.targetPrice)?'ok':''; row.innerHTML=`
+      <div class="main"><div class="name"></div><div class="tiny url"></div><div style="margin-top:8px"><span class="pill">${m.active!==false?'Ativo':'Inativo'}</span><span class="pill">${m.notifyOnAnyChange!==false?'Avisa alterações':'Só preço-alvo'}</span></div><div class="tiny error" style="margin-top:8px"></div></div>
+      <div><div class="muted">Preço atual</div><div class="price ${targetClass}">${money(m.lastPrice)}</div><div class="tiny method"></div></div>
+      <div><div class="muted">Preço-alvo</div><div class="price">${money(m.targetPrice)}</div><div class="tiny">Última consulta: ${when(m.lastCheckedAt)}</div></div>
+      <div><div class="actions"></div><div class="tiny email" style="margin-top:8px"></div></div>`;
+      row.querySelector('.name').textContent=m.name; row.querySelector('.url').textContent=m.url; row.querySelector('.method').textContent=m.lastExtractionMethod?('Método: '+m.lastExtractionMethod):''; row.querySelector('.email').textContent=m.notifyEmail?('Mattermost: '+m.notifyEmail):'Mattermost: padrão'; if(m.lastError){const e=row.querySelector('.error');e.textContent='Último erro: '+m.lastError;e.classList.add('err')}
+      const acts=row.querySelector('.actions');
+      const check=document.createElement('button'); check.className='secondary'; check.textContent='Verificar agora'; check.addEventListener('click',()=>checkNow(m.id,check)); acts.appendChild(check);
+      const edit=document.createElement('button'); edit.className='secondary'; edit.textContent='Editar'; edit.addEventListener('click',()=>openEdit(m)); acts.appendChild(edit);
+      const del=document.createElement('button'); del.className='danger'; del.textContent='Excluir'; del.addEventListener('click',()=>removeMonitor(m)); acts.appendChild(del);
+      list.appendChild(row);
+    });
+  }
+  function resetForm(){ $('monitorForm').reset(); $('monitorId').value=''; $('notifyOnAnyChange').checked=true; $('active').checked=true; $('formTitle').textContent='Novo produto'; }
+  function openNew(){ resetForm(); $('formCard').classList.remove('hidden'); $('name').focus(); }
+  function openEdit(m){ $('monitorId').value=m.id; $('name').value=m.name||''; $('url').value=m.url||''; $('targetPrice').value=m.targetPrice??''; $('notifyEmail').value=m.notifyEmail||''; $('notifyOnAnyChange').checked=m.notifyOnAnyChange!==false; $('active').checked=m.active!==false; $('formTitle').textContent='Editar produto'; $('formCard').classList.remove('hidden'); $('name').focus(); }
+  async function save(ev){ ev.preventDefault(); const id=$('monitorId').value; const body={name:$('name').value.trim(),url:$('url').value.trim(),notifyOnAnyChange:$('notifyOnAnyChange').checked,active:$('active').checked}; const tp=$('targetPrice').value.trim(); body.targetPrice=tp===''?null:Number(tp); const email=$('notifyEmail').value.trim(); if(email) body.notifyEmail=email; else if(id) body.notifyEmail=''; try{ await api(id?('/api/price-monitors/'+encodeURIComponent(id)):'/api/price-monitors',{method:id?'PATCH':'POST',body:JSON.stringify(body)}); $('formCard').classList.add('hidden'); showStatus(id?'Monitor atualizado.':'Monitor criado.'); await load(); }catch(e){showStatus(e.message,true);} }
+  async function checkNow(id,btn){ btn.disabled=true; btn.textContent='Consultando...'; try{const data=await api('/api/price-monitors/'+encodeURIComponent(id)+'/check',{method:'POST'}); const c=data.check||{}; showStatus('Preço verificado: '+money(c.currentPrice)+(c.effectiveChanged?' — houve alteração.':'')); await load();}catch(e){showStatus(e.message,true);}finally{btn.disabled=false;btn.textContent='Verificar agora';} }
+  async function removeMonitor(m){ if(!confirm('Excluir o monitor "'+m.name+'"?'))return; try{await api('/api/price-monitors/'+encodeURIComponent(m.id),{method:'DELETE'});showStatus('Monitor excluído.');await load();}catch(e){showStatus(e.message,true);} }
+  $('loginBtn').addEventListener('click',async()=>{const t=$('token').value.trim();if(!t){showStatus('Informe a API Token.',true);return}state.token=t;sessionStorage.setItem('priceMonitorToken',t);await load();});
+  $('token').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click()}); $('newBtn').addEventListener('click',openNew); $('reloadBtn').addEventListener('click',load); $('cancelBtn').addEventListener('click',()=>$('formCard').classList.add('hidden')); $('monitorForm').addEventListener('submit',save); $('logoutBtn').addEventListener('click',()=>{state.token='';sessionStorage.removeItem('priceMonitorToken');$('token').value='';setLogged(false);clearStatus();});
+  if(state.token){load()}else{setLogged(false)}
+})();
+</script>
+</body>
+</html>

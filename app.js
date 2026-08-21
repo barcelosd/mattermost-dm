@@ -2746,6 +2746,14 @@ async function notifyPriceMonitorMattermost(monitor, result, reason) {
   };
 }
 
+
+// ---------------------------------------------------------
+// INTERFACE WEB — MONITOR DE PREÇOS
+// ---------------------------------------------------------
+app.get(['/price-monitors', '/price-monitors/'], (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'price-monitors.html'));
+});
+
 function requirePriceMonitorAuth(req, res, next) {
   if (!PRICE_MONITOR_API_TOKEN) {
     return res.status(503).json({
