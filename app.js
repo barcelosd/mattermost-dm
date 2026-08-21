@@ -4,6 +4,8 @@ const express = require('express');
 const axios = require('axios');
 const Redis = require('ioredis');
 const path = require('path');
+const fs = require('fs/promises');
+const { randomUUID } = require('crypto');
 const { google } = require('googleapis');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
@@ -73,11 +75,17 @@ const {
   ERROR_NOTIFICATION_ENABLED = 'true',
   ERROR_NOTIFICATION_WEBHOOK_URL,
   ERROR_NOTIFICATION_WHATSAPP_GROUP_ID,
-  ERROR_NOTIFICATION_MIN_INTERVAL_SECONDS = 300
+  ERROR_NOTIFICATION_MIN_INTERVAL_SECONDS = 300,
+
+  PRICE_MONITOR_API_TOKEN,
+  PERSISTENT_DATA_DIR
 } = process.env;
 
 const TZ = 'America/Sao_Paulo';
 const WA_AUTH_DIR = WHATSAPP_AUTH_DIR || path.join(__dirname, '.wwebjs_auth');
+const PRICE_MONITOR_DATA_DIR =
+  PERSISTENT_DATA_DIR || path.join(WA_AUTH_DIR, 'data');
+const PRICE_MONITORS_FILE = path.join(PRICE_MONITOR_DATA_DIR, 'price-monitors.json');
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -2266,6 +2274,231 @@ const app = express();
 
 app.use(express.json());
 
+// ---------------------------------------------------------
+// MONITORAMENTO DE PREÇOS - PERSISTÊNCIA / API
+// ---------------------------------------------------------
+async function ensurePriceMonitorStorage() {
+  await fs.mkdir(PRICE_MONITOR_DATA_DIR, { recursive: true });
+
+  try {
+    await fs.access(PRICE_MONITORS_FILE);
+  } catch {
+    await fs.writeFile(PRICE_MONITORS_FILE, '[]\n', 'utf8');
+  }
+}
+
+async function readPriceMonitors() {
+  await ensurePriceMonitorStorage();
+
+  const raw = await fs.readFile(PRICE_MONITORS_FILE, 'utf8');
+
+  if (!raw.trim()) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    console.error('Arquivo de monitores de preço inválido:', error.message);
+    throw new Error('Não foi possível ler os monitores de preço persistidos.');
+  }
+}
+
+async function writePriceMonitors(monitors) {
+  await ensurePriceMonitorStorage();
+
+  const tempFile = `${PRICE_MONITORS_FILE}.tmp`;
+  const contents = `${JSON.stringify(monitors, null, 2)}\n`;
+
+  await fs.writeFile(tempFile, contents, 'utf8');
+  await fs.rename(tempFile, PRICE_MONITORS_FILE);
+}
+
+function parseOptionalPrice(value, fieldName) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+
+  const numberValue = Number(value);
+
+  if (!Number.isFinite(numberValue) || numberValue < 0) {
+    throw new Error(`${fieldName} deve ser um número maior ou igual a zero.`);
+  }
+
+  return Number(numberValue.toFixed(2));
+}
+
+function validateMonitorUrl(value) {
+  if (!value || typeof value !== 'string') {
+    throw new Error('url é obrigatória.');
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    throw new Error('url inválida.');
+  }
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('url deve usar http ou https.');
+  }
+
+  return parsed.toString();
+}
+
+function requirePriceMonitorAuth(req, res, next) {
+  if (!PRICE_MONITOR_API_TOKEN) {
+    return res.status(503).json({
+      error: 'PRICE_MONITOR_API_TOKEN não configurado no servidor.'
+    });
+  }
+
+  const authorization = String(req.headers.authorization || '');
+  const [type, token] = authorization.split(' ');
+
+  if (type !== 'Bearer' || !token || token !== PRICE_MONITOR_API_TOKEN) {
+    return res.status(401).json({
+      error: 'Não autorizado.'
+    });
+  }
+
+  return next();
+}
+
+app.use('/api/price-monitors', requirePriceMonitorAuth);
+
+app.get('/api/price-monitors', async (req, res) => {
+  try {
+    const monitors = await readPriceMonitors();
+
+    res.status(200).json({
+      total: monitors.length,
+      monitors
+    });
+  } catch (error) {
+    console.error('Erro ao listar monitores de preço:', describeError(error));
+    res.status(500).json({ error: describeError(error) });
+  }
+});
+
+app.post('/api/price-monitors', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = String(body.name || '').trim();
+
+    if (!name) {
+      return res.status(400).json({ error: 'name é obrigatório.' });
+    }
+
+    const url = validateMonitorUrl(body.url);
+    const targetPrice = parseOptionalPrice(body.targetPrice, 'targetPrice');
+    const now = dayjs().tz(TZ).toISOString();
+    const monitors = await readPriceMonitors();
+
+    const duplicate = monitors.find(
+      monitor => monitor.active !== false && monitor.url === url
+    );
+
+    if (duplicate) {
+      return res.status(409).json({
+        error: 'Já existe um monitor ativo para esta URL.',
+        monitor: duplicate
+      });
+    }
+
+    const monitor = {
+      id: randomUUID(),
+      name,
+      url,
+      targetPrice: targetPrice ?? null,
+      notifyOnAnyChange: body.notifyOnAnyChange !== false,
+      active: body.active !== false,
+      lastPrice: null,
+      lastCheckedAt: null,
+      lastChangeAt: null,
+      lastError: null,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    monitors.push(monitor);
+    await writePriceMonitors(monitors);
+
+    res.status(201).json(monitor);
+  } catch (error) {
+    const message = describeError(error);
+    console.error('Erro ao criar monitor de preço:', message);
+    res.status(400).json({ error: message });
+  }
+});
+
+app.patch('/api/price-monitors/:id', async (req, res) => {
+  try {
+    const monitors = await readPriceMonitors();
+    const index = monitors.findIndex(monitor => monitor.id === req.params.id);
+
+    if (index < 0) {
+      return res.status(404).json({ error: 'Monitor de preço não encontrado.' });
+    }
+
+    const current = monitors[index];
+    const body = req.body || {};
+    const updated = { ...current };
+
+    if (body.name !== undefined) {
+      const name = String(body.name || '').trim();
+      if (!name) return res.status(400).json({ error: 'name não pode ser vazio.' });
+      updated.name = name;
+    }
+
+    if (body.url !== undefined) {
+      updated.url = validateMonitorUrl(body.url);
+    }
+
+    if (body.targetPrice !== undefined) {
+      updated.targetPrice = parseOptionalPrice(body.targetPrice, 'targetPrice');
+    }
+
+    if (body.notifyOnAnyChange !== undefined) {
+      updated.notifyOnAnyChange = Boolean(body.notifyOnAnyChange);
+    }
+
+    if (body.active !== undefined) {
+      updated.active = Boolean(body.active);
+    }
+
+    updated.updatedAt = dayjs().tz(TZ).toISOString();
+
+    monitors[index] = updated;
+    await writePriceMonitors(monitors);
+
+    res.status(200).json(updated);
+  } catch (error) {
+    const message = describeError(error);
+    console.error('Erro ao atualizar monitor de preço:', message);
+    res.status(400).json({ error: message });
+  }
+});
+
+app.delete('/api/price-monitors/:id', async (req, res) => {
+  try {
+    const monitors = await readPriceMonitors();
+    const index = monitors.findIndex(monitor => monitor.id === req.params.id);
+
+    if (index < 0) {
+      return res.status(404).json({ error: 'Monitor de preço não encontrado.' });
+    }
+
+    monitors.splice(index, 1);
+    await writePriceMonitors(monitors);
+
+    res.status(204).send();
+  } catch (error) {
+    console.error('Erro ao excluir monitor de preço:', describeError(error));
+    res.status(500).json({ error: describeError(error) });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
@@ -2280,7 +2513,9 @@ app.get('/health', (req, res) => {
     whatsappDebugLogs: WHATSAPP_DEBUG_LOGS,
     errorNotificationEnabled: ERROR_NOTIFICATION_ENABLED,
     errorNotificationWebhookConfigured: Boolean(ERROR_NOTIFICATION_WEBHOOK_URL),
-    errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID)
+    errorNotificationWhatsappConfigured: Boolean(ERROR_NOTIFICATION_WHATSAPP_GROUP_ID),
+    priceMonitorApiConfigured: Boolean(PRICE_MONITOR_API_TOKEN),
+    priceMonitorDataDir: PRICE_MONITOR_DATA_DIR
   });
 });
 
