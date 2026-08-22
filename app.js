@@ -2473,14 +2473,21 @@ function findPriceInMetaTags(html) {
 
 function findPriceInEmbeddedJson(html) {
   const candidates = [];
+  const priceKeys = [
+    'salePrice', 'bestPrice', 'spotPrice', 'currentPrice', 'price',
+    'finalPrice', 'discountPrice', 'discountedPrice', 'promotionPrice',
+    'promotionalPrice', 'pixPrice', 'pricePix', 'cashPrice', 'salesPrice',
+    'priceValue', 'final_price', 'sale_price', 'offerPrice'
+  ].join('|');
+
   const patterns = [
     {
-      regex: /["'](?:salePrice|bestPrice|spotPrice|currentPrice|price)["']\s*:\s*["']?([0-9]+(?:[.,][0-9]+)?)/gi,
+      regex: new RegExp(`["'](?:${priceKeys})["']\\s*:\s*["']?([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:[.,][0-9]+)?)`, 'gi'),
       method: 'embedded-json:price',
       cents: false
     },
     {
-      regex: /["'](?:sellingPrice|bestPrice)["']\s*:\s*([0-9]{3,})/gi,
+      regex: /["'](?:sellingPrice|bestPrice|priceInCents|salePriceInCents)["']\s*:\s*([0-9]{3,})/gi,
       method: 'embedded-json:cents',
       cents: true
     }
@@ -2496,11 +2503,53 @@ function findPriceInEmbeddedJson(html) {
         price = Number((Number(match[1]) / 100).toFixed(2));
       }
 
-      if (price) {
+      if (price && price < 10000000) {
         candidates.push({ price, method: pattern.method });
       }
 
-      if (candidates.length >= 20) break;
+      if (candidates.length >= 80) break;
+    }
+  }
+
+  return candidates;
+}
+
+function findLgPixPriceCandidates(html) {
+  const candidates = [];
+  const lower = String(html || '').toLowerCase();
+  const anchors = ['no pix', 'pix', 'preço pix', 'preco pix', 'pricepix', 'pixprice'];
+  const seen = new Set();
+
+  for (const anchor of anchors) {
+    let pos = 0;
+    while ((pos = lower.indexOf(anchor, pos)) !== -1) {
+      const start = Math.max(0, pos - 600);
+      const end = Math.min(html.length, pos + 900);
+      const window = html.slice(start, end);
+      const regexes = [
+        /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2}))/gi,
+        /(?:price|value|amount)["']?\s*[:=]\s*["']?([0-9]{3,6}(?:\.[0-9]{1,2})?)/gi,
+        /([0-9]{4,6}(?:\.[0-9]{1,2}))(?=[^0-9]|$)/g
+      ];
+
+      for (const rx of regexes) {
+        let m;
+        while ((m = rx.exec(window)) !== null) {
+          const price = parsePriceValue(m[1]);
+          if (!price || price < 500 || price > 1000000) continue;
+          const key = price.toFixed(2);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({
+            price,
+            method: 'lg:pix-context',
+            score: 20,
+            context: window.replace(/\s+/g, ' ').slice(0, 500)
+          });
+        }
+      }
+      pos += anchor.length;
+      if (candidates.length >= 30) return candidates;
     }
   }
 
@@ -2571,8 +2620,11 @@ function extractProductTitle(html) {
 function extractPriceFromHtml(html, options = {}) {
   const targetPrice = Number(options.targetPrice);
   const hasTargetPrice = Number.isFinite(targetPrice) && targetPrice > 0;
+  const url = String(options.url || '').toLowerCase();
+  const isLg = url.includes('lg.com/');
 
   const structuredCandidates = [
+    ...(isLg ? findLgPixPriceCandidates(html) : []),
     ...findPriceInJsonLd(html),
     ...findPriceInMetaTags(html),
     ...findPriceInEmbeddedJson(html)
@@ -2590,43 +2642,47 @@ function extractPriceFromHtml(html, options = {}) {
       candidate.price < 10000000
   );
 
-  let candidates;
-  let method;
+  const targetFloor = hasTargetPrice ? Math.max(50, targetPrice * 0.5) : 500;
+  const targetCeiling = hasTargetPrice ? targetPrice * 4 : 10000000;
 
-  if (structuredCandidates.length) {
-    candidates = structuredCandidates;
-    method = 'selected:min-structured-candidate';
-  } else {
-    let plausible = fallbackCandidates.filter(candidate => candidate.score >= 0);
+  const withinPlausibleRange = candidate =>
+    candidate.price >= targetFloor && candidate.price <= targetCeiling;
 
-    if (hasTargetPrice) {
-      const targetFloor = Math.max(10, targetPrice * 0.2);
-      const targetCeiling = targetPrice * 5;
-      const byTarget = plausible.filter(
-        candidate => candidate.price >= targetFloor && candidate.price <= targetCeiling
-      );
-      if (byTarget.length) plausible = byTarget;
+  let candidates = structuredCandidates.filter(withinPlausibleRange);
+  let method = isLg ? 'selected:lg-product-price' : 'selected:min-structured-candidate';
+
+  // Se não houver estruturado plausível, usa texto contextual, mas nunca cai
+  // para valores muito abaixo do preço-alvo (parcelas, cupons, cashback etc.).
+  if (!candidates.length) {
+    let plausible = fallbackCandidates.filter(
+      candidate => candidate.score >= 0 && withinPlausibleRange(candidate)
+    );
+
+    if (!plausible.length) {
+      plausible = fallbackCandidates.filter(withinPlausibleRange);
     }
 
-    if (plausible.length > 1) {
-      const maxPrice = Math.max(...plausible.map(candidate => candidate.price));
-      if (maxPrice >= 500) {
-        const clustered = plausible.filter(candidate => candidate.price >= maxPrice * 0.15);
-        if (clustered.length) plausible = clustered;
-      }
+    if (!plausible.length && !hasTargetPrice) {
+      plausible = fallbackCandidates.filter(candidate => candidate.price >= 500);
     }
 
-    candidates = plausible.length ? plausible : fallbackCandidates;
+    candidates = plausible;
     method = 'selected:contextual-currency-candidate';
   }
 
   if (!candidates.length) {
-    throw new Error('Não foi possível identificar um preço válido no HTML da página.');
+    throw new Error(
+      'Não foi possível identificar um preço plausível do produto. Informe um preço-alvo aproximado para ajudar a filtrar parcelas, cupons e outros valores da página.'
+    );
   }
 
+  // Prioridade: contexto LG/Pix > maior score > menor preço plausível.
   const selected = candidates
     .slice()
     .sort((a, b) => {
+      const lgA = a.method === 'lg:pix-context' ? 1 : 0;
+      const lgB = b.method === 'lg:pix-context' ? 1 : 0;
+      if (lgA !== lgB) return lgB - lgA;
       const scoreA = Number(a.score || 0);
       const scoreB = Number(b.score || 0);
       if (scoreA !== scoreB) return scoreB - scoreA;
@@ -2640,7 +2696,7 @@ function extractPriceFromHtml(html, options = {}) {
     candidates: candidates
       .slice()
       .sort((a, b) => a.price - b.price)
-      .slice(0, 30)
+      .slice(0, 40)
   };
 }
 
@@ -2667,7 +2723,7 @@ async function fetchProductPrice(url, options = {}) {
     throw new Error('A loja retornou uma página vazia.');
   }
 
-  const extracted = extractPriceFromHtml(html, options);
+  const extracted = extractPriceFromHtml(html, { ...options, url });
 
   return {
     ...extracted,

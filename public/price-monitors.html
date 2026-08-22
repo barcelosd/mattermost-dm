@@ -19,7 +19,8 @@
     .monitor{display:grid;grid-template-columns:minmax(0,2fr) repeat(3,minmax(120px,.8fr));gap:14px;align-items:start;padding:16px 0;border-top:1px solid var(--border)}.monitor:first-child{border-top:0}
     .name{font-size:18px;font-weight:750}.price{font-size:22px;font-weight:750}.ok{color:var(--ok)}.warn{color:var(--warn)}.err{color:var(--danger)}
     .tiny{font-size:12px;color:var(--muted);word-break:break-all}.pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);margin-right:6px}
-    @media(max-width:850px){.monitor{grid-template-columns:1fr 1fr}.monitor .main{grid-column:1/-1}}
+    .filters{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr 1.3fr;gap:8px;margin:14px 0 4px}.filters input,.filters select{width:100%;padding:9px 10px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--text);font-size:14px}.summary{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 2px}.summary .box{border:1px solid var(--border);border-radius:10px;padding:8px 11px;min-width:130px}.summary .n{font-size:18px;font-weight:750}.summary .lbl{font-size:12px;color:var(--muted)}
+    @media(max-width:1000px){.filters{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:850px){.monitor{grid-template-columns:1fr 1fr}.monitor .main{grid-column:1/-1}}@media(max-width:650px){.filters{grid-template-columns:1fr 1fr}.summary .box{flex:1 1 45%}}
   </style>
 </head>
 <body>
@@ -61,6 +62,21 @@
 
   <section id="listCard" class="card hidden">
     <div class="top" style="margin-bottom:0"><h2 style="margin:0">Produtos</h2><div id="count" class="muted"></div></div>
+    <div class="filters" aria-label="Filtros dos produtos">
+      <input id="filterName" type="text" placeholder="Produto">
+      <input id="filterBrand" type="text" placeholder="Marca">
+      <input id="filterStore" type="text" placeholder="Loja">
+      <input id="filterCurrent" type="number" min="0" step="0.01" placeholder="Preço atual ≤">
+      <input id="filterTarget" type="number" min="0" step="0.01" placeholder="Preço-alvo ≤">
+      <select id="filterStatus"><option value="">Status: todos</option><option value="active">Ativos</option><option value="inactive">Inativos</option><option value="target">Alvo atingido</option><option value="error">Com erro</option></select>
+      <input id="filterEmail" type="text" placeholder="Mattermost">
+    </div>
+    <div class="summary">
+      <div class="box"><div id="sumShown" class="n">0</div><div class="lbl">Exibidos</div></div>
+      <div class="box"><div id="sumTotal" class="n">0</div><div class="lbl">Total</div></div>
+      <div class="box"><div id="sumActive" class="n">0</div><div class="lbl">Ativos</div></div>
+      <div class="box"><div id="sumTarget" class="n">0</div><div class="lbl">Alvo atingido</div></div>
+    </div>
     <div id="list"></div>
   </section>
 </div>
@@ -83,8 +99,40 @@
     return data;
   }
   async function load(){ clearStatus(); try{ const data=await api('/api/price-monitors'); state.monitors=data.monitors||[]; render(); setLogged(true); }catch(e){ showStatus(e.message,true); if(/autoriz/i.test(e.message)){state.token='';sessionStorage.removeItem('priceMonitorToken');setLogged(false);} } }
-  function render(){ $('count').textContent=state.monitors.length+' monitor(es)'; const list=$('list'); list.innerHTML=''; if(!state.monitors.length){ list.innerHTML='<p class="muted">Nenhum produto cadastrado.</p>'; return; }
-    state.monitors.forEach(m=>{ const row=document.createElement('div'); row.className='monitor'; const targetClass=(m.lastPrice!=null&&m.targetPrice!=null&&m.lastPrice<=m.targetPrice)?'ok':''; row.innerHTML=`
+  function filteredMonitors(){
+    const name=$('filterName').value.trim().toLowerCase();
+    const brand=$('filterBrand').value.trim().toLowerCase();
+    const store=$('filterStore').value.trim().toLowerCase();
+    const currentRaw=$('filterCurrent').value.trim();
+    const targetRaw=$('filterTarget').value.trim();
+    const status=$('filterStatus').value;
+    const email=$('filterEmail').value.trim().toLowerCase();
+    const currentMax=currentRaw===''?null:Number(currentRaw);
+    const targetMax=targetRaw===''?null:Number(targetRaw);
+    return state.monitors.filter(m=>{
+      if(name && !String(m.name||'').toLowerCase().includes(name)) return false;
+      if(brand && !String(m.brand||'').toLowerCase().includes(brand)) return false;
+      if(store && !String(m.store||'').toLowerCase().includes(store)) return false;
+      if(currentMax!==null && (m.lastPrice==null || Number(m.lastPrice)>currentMax)) return false;
+      if(targetMax!==null && (m.targetPrice==null || Number(m.targetPrice)>targetMax)) return false;
+      const targetReached=m.lastPrice!=null&&m.targetPrice!=null&&Number(m.lastPrice)<=Number(m.targetPrice);
+      if(status==='active' && m.active===false) return false;
+      if(status==='inactive' && m.active!==false) return false;
+      if(status==='target' && !targetReached) return false;
+      if(status==='error' && !m.lastError) return false;
+      if(email && !String(m.notifyEmail||'').toLowerCase().includes(email)) return false;
+      return true;
+    });
+  }
+  function render(){
+    const shown=filteredMonitors();
+    const total=state.monitors.length;
+    const active=state.monitors.filter(m=>m.active!==false).length;
+    const target=state.monitors.filter(m=>m.lastPrice!=null&&m.targetPrice!=null&&Number(m.lastPrice)<=Number(m.targetPrice)).length;
+    $('count').textContent=shown.length+' de '+total+' monitor(es)';
+    $('sumShown').textContent=shown.length; $('sumTotal').textContent=total; $('sumActive').textContent=active; $('sumTarget').textContent=target;
+    const list=$('list'); list.innerHTML=''; if(!shown.length){ list.innerHTML='<p class="muted">Nenhum produto encontrado com os filtros atuais.</p>'; return; }
+    shown.forEach(m=>{ const row=document.createElement('div'); row.className='monitor'; const targetClass=(m.lastPrice!=null&&m.targetPrice!=null&&m.lastPrice<=m.targetPrice)?'ok':''; row.innerHTML=`
       <div class="main"><div class="name"></div><div class="tiny brandstore"></div><div class="tiny url"></div><div style="margin-top:8px"><span class="pill">${m.active!==false?'Ativo':'Inativo'}</span><span class="pill">${m.notifyOnAnyChange!==false?'Avisa alterações':'Só preço-alvo'}</span></div><div class="tiny error" style="margin-top:8px"></div></div>
       <div><div class="muted">Preço atual</div><div class="price ${targetClass}">${money(m.lastPrice)}</div><div class="tiny method"></div></div>
       <div><div class="muted">Preço-alvo</div><div class="price">${money(m.targetPrice)}</div><div class="tiny">Última consulta: ${when(m.lastCheckedAt)}</div></div>
@@ -105,6 +153,9 @@
   async function removeMonitor(m){ if(!confirm('Excluir o monitor "'+m.name+'"?'))return; try{await api('/api/price-monitors/'+encodeURIComponent(m.id),{method:'DELETE'});showStatus('Monitor excluído.');await load();}catch(e){showStatus(e.message,true);} }
   $('loginBtn').addEventListener('click',async()=>{const t=$('token').value.trim();if(!t){showStatus('Informe a API Token.',true);return}state.token=t;sessionStorage.setItem('priceMonitorToken',t);await load();});
   $('token').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click()}); $('newBtn').addEventListener('click',openNew); $('reloadBtn').addEventListener('click',load); $('cancelBtn').addEventListener('click',()=>$('formCard').classList.add('hidden')); $('monitorForm').addEventListener('submit',save); $('logoutBtn').addEventListener('click',()=>{state.token='';sessionStorage.removeItem('priceMonitorToken');$('token').value='';setLogged(false);clearStatus();});
+  ['filterName','filterBrand','filterStore','filterCurrent','filterTarget','filterStatus','filterEmail'].forEach(id=>{
+    $(id).addEventListener(id==='filterStatus'?'change':'input',render);
+  });
   if(state.token){load()}else{setLogged(false)}
 })();
 </script>
