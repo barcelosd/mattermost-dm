@@ -87,7 +87,7 @@ const WA_AUTH_DIR = WHATSAPP_AUTH_DIR || path.join(__dirname, '.wwebjs_auth');
 const PRICE_MONITOR_DATA_DIR =
   PERSISTENT_DATA_DIR || path.join(WA_AUTH_DIR, 'data');
 const PRICE_MONITORS_FILE = path.join(PRICE_MONITOR_DATA_DIR, 'price-monitors.json');
-const PRICE_SELECTION_VERSION = 'product-price-context-v2';
+const PRICE_SELECTION_VERSION = 'domain-adapters-stock-v4';
 
 const redmineHeaders = {
   'X-Redmine-API-Key': REDMINE_API_KEY,
@@ -2514,42 +2514,64 @@ function findPriceInEmbeddedJson(html) {
   return candidates;
 }
 
+function normalizeCommerceHtml(html) {
+  return String(html || '')
+    .replace(/\\u0024/gi, '$')
+    .replace(/\\u00a0/gi, ' ')
+    .replace(/&#x20;|&#32;|&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'");
+}
+
 function findLgPixPriceCandidates(html) {
   const candidates = [];
-  const lower = String(html || '').toLowerCase();
+  const normalized = normalizeCommerceHtml(html);
+  const lower = normalized.toLowerCase();
   const anchors = ['no pix', 'pix', 'preço pix', 'preco pix', 'pricepix', 'pixprice'];
   const seen = new Set();
+
+  function add(price, method, score, context) {
+    if (!Number.isFinite(price) || price < 300 || price > 1000000) return;
+    const key = `${price.toFixed(2)}:${method}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ price, method, score, context: context.slice(0, 700) });
+  }
 
   for (const anchor of anchors) {
     let pos = 0;
     while ((pos = lower.indexOf(anchor, pos)) !== -1) {
-      const start = Math.max(0, pos - 600);
-      const end = Math.min(html.length, pos + 900);
-      const window = html.slice(start, end);
-      const regexes = [
-        /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2}))/gi,
-        /(?:price|value|amount)["']?\s*[:=]\s*["']?([0-9]{3,6}(?:\.[0-9]{1,2})?)/gi,
-        /([0-9]{4,6}(?:\.[0-9]{1,2}))(?=[^0-9]|$)/g
-      ];
+      const start = Math.max(0, pos - 1200);
+      const end = Math.min(normalized.length, pos + 1800);
+      const window = normalized.slice(start, end);
+      const compact = window.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
 
-      for (const rx of regexes) {
-        let m;
-        while ((m = rx.exec(window)) !== null) {
-          const price = parsePriceValue(m[1]);
-          if (!price || price < 500 || price > 1000000) continue;
-          const key = price.toFixed(2);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          candidates.push({
-            price,
-            method: 'lg:pix-context',
-            score: 20,
-            context: window.replace(/\s+/g, ' ').slice(0, 500)
-          });
-        }
+      let m;
+      const currencyRx = /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2}))/gi;
+      while ((m = currencyRx.exec(compact)) !== null) {
+        const price = parsePriceValue(m[1]);
+        const distance = Math.abs((start + m.index) - pos);
+        add(price, 'lg:pix-currency-context', Math.max(25, 80 - Math.floor(distance / 40)), compact);
       }
+
+      const decimalRx = /(?:pixPrice|pricePix|finalPrice|salePrice|discountPrice|price|amount|value)["']?\s*[:=]\s*["']?([0-9]{3,7}(?:[.,][0-9]{1,2})?)/gi;
+      while ((m = decimalRx.exec(window)) !== null) {
+        let raw = Number(String(m[1]).replace(',', '.'));
+        if (!Number.isFinite(raw)) continue;
+        if (raw >= 100000 && Number.isInteger(raw)) raw /= 100;
+        add(Number(raw.toFixed(2)), 'lg:pix-json-context', 90, compact);
+      }
+
+      // Alguns payloads de e-commerce gravam preço em centavos sem nome de campo próximo.
+      const centsRx = /\b([3-9][0-9]{5}|[1-9][0-9]{6})\b/g;
+      while ((m = centsRx.exec(window)) !== null) {
+        const price = Number((Number(m[1]) / 100).toFixed(2));
+        add(price, 'lg:pix-cents-context', 35, compact);
+      }
+
       pos += anchor.length;
-      if (candidates.length >= 30) return candidates;
+      if (candidates.length >= 60) break;
     }
   }
 
@@ -2558,63 +2580,57 @@ function findLgPixPriceCandidates(html) {
 
 function findPriceInCurrencyText(html) {
   const candidates = [];
-  const text = html
+  const text = normalizeCommerceHtml(html)
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;|&#160;/gi, ' ')
     .replace(/\s+/g, ' ');
 
   const regex = /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2})?)/gi;
   let match;
-
-  const positiveTerms = [
-    'preço', 'preco', 'por', 'à vista', 'a vista', 'pix', 'oferta',
-    'price', 'sale', 'valor', 'agora'
-  ];
-  const negativeTerms = [
-    'parcela', 'parcelas', 'x de', 'cashback', 'economize', 'cupom',
-    'frete', 'desconto de', 'juros', 'mensal', 'assinatura', 'entrada'
-  ];
+  const positiveTerms = ['preço','preco','por','à vista','a vista','pix','oferta','price','sale','valor','agora','comprar'];
+  const negativeTerms = ['parcela','parcelas','x de','cashback','economize','cupom','frete','desconto de','juros','mensal','assinatura','entrada'];
 
   while ((match = regex.exec(text)) !== null) {
     const price = parsePriceValue(match[1]);
     if (!price) continue;
-
-    const start = Math.max(0, match.index - 120);
-    const end = Math.min(text.length, regex.lastIndex + 120);
+    const start = Math.max(0, match.index - 160);
+    const end = Math.min(text.length, regex.lastIndex + 160);
     const context = text.slice(start, end).toLowerCase();
-
     let score = 0;
-    for (const term of positiveTerms) {
-      if (context.includes(term)) score += 2;
-    }
-    for (const term of negativeTerms) {
-      if (context.includes(term)) score -= 4;
-    }
-
-    candidates.push({
-      price,
-      method: 'currency-text',
-      score,
-      context: context.slice(0, 240)
-    });
-
-    if (candidates.length >= 50) break;
+    for (const term of positiveTerms) if (context.includes(term)) score += 3;
+    for (const term of negativeTerms) if (context.includes(term)) score -= 6;
+    candidates.push({ price, method: 'currency-text', score, context: context.slice(0, 320) });
+    if (candidates.length >= 80) break;
   }
-
   return candidates;
 }
 
 function extractProductTitle(html) {
-  const ogTitle = html.match(
-    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i
-  );
-
-  if (ogTitle?.[1]) return ogTitle[1].trim();
-
+  const ogTitle = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
+  if (ogTitle?.[1]) return normalizeCommerceHtml(ogTitle[1]).trim();
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return title?.[1]?.replace(/\s+/g, ' ').trim() || null;
+}
+
+function detectAvailabilityFromHtml(html) {
+  const normalized = normalizeCommerceHtml(html);
+  const text = normalized.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+  const rawLower = normalized.toLowerCase();
+
+  const outPatterns = ['produto esgotado','esgotado','sem estoque','fora de estoque','indisponível','indisponivel','sold out','out of stock','unavailable'];
+  const inPatterns = ['adicionar ao carrinho','adicionar no carrinho','add to cart','comprar','em estoque','in stock'];
+
+  const jsonOut = /https?:\\?\/\\?\/schema\.org\\?\/(?:outofstock|soldout|discontinued)/i.test(rawLower) || /["']availability["']\s*:\s*["'][^"']*(?:outofstock|soldout|discontinued)/i.test(rawLower);
+  const jsonIn = /https?:\\?\/\\?\/schema\.org\\?\/instock/i.test(rawLower) || /["']availability["']\s*:\s*["'][^"']*instock/i.test(rawLower);
+
+  if (jsonOut || outPatterns.some(term => text.includes(term))) {
+    return { inStock: false, canAddToCart: false, method: jsonOut ? 'structured:out-of-stock' : 'text:out-of-stock' };
+  }
+  if (jsonIn || inPatterns.some(term => text.includes(term))) {
+    return { inStock: true, canAddToCart: true, method: jsonIn ? 'structured:in-stock' : 'text:buy-action' };
+  }
+  return { inStock: null, canAddToCart: null, method: 'unknown' };
 }
 
 function extractPriceFromHtml(html, options = {}) {
@@ -2623,159 +2639,182 @@ function extractPriceFromHtml(html, options = {}) {
   const url = String(options.url || '').toLowerCase();
   const isLg = url.includes('lg.com/');
 
-  const structuredCandidates = [
+  let structuredCandidates = [
     ...(isLg ? findLgPixPriceCandidates(html) : []),
     ...findPriceInJsonLd(html),
     ...findPriceInMetaTags(html),
     ...findPriceInEmbeddedJson(html)
-  ].filter(
-    candidate =>
-      Number.isFinite(candidate.price) &&
-      candidate.price > 0 &&
-      candidate.price < 10000000
-  );
+  ].filter(c => Number.isFinite(c.price) && c.price > 0 && c.price < 10000000);
 
-  const fallbackCandidates = findPriceInCurrencyText(html).filter(
-    candidate =>
-      Number.isFinite(candidate.price) &&
-      candidate.price > 0 &&
-      candidate.price < 10000000
-  );
-
-  const targetFloor = hasTargetPrice ? Math.max(50, targetPrice * 0.5) : 500;
+  const fallbackCandidates = findPriceInCurrencyText(html).filter(c => Number.isFinite(c.price) && c.price > 0 && c.price < 10000000);
+  const targetFloor = hasTargetPrice ? Math.max(300, targetPrice * 0.55) : 500;
   const targetCeiling = hasTargetPrice ? targetPrice * 4 : 10000000;
+  const plausible = c => c.price >= targetFloor && c.price <= targetCeiling;
 
-  const withinPlausibleRange = candidate =>
-    candidate.price >= targetFloor && candidate.price <= targetCeiling;
+  // Em LG, candidatos próximos de "PIX" têm prioridade absoluta. O score considera
+  // proximidade e evita escolher preço cheio/cartão quando o preço PIX existe.
+  if (isLg) {
+    const lgCandidates = structuredCandidates.filter(c => String(c.method).startsWith('lg:') && plausible(c));
+    if (lgCandidates.length) {
+      const bestScore = Math.max(...lgCandidates.map(c => Number(c.score || 0)));
+      const bestBand = lgCandidates.filter(c => Number(c.score || 0) >= bestScore - 8);
+      const selected = bestBand.slice().sort((a,b) => a.price - b.price)[0];
+      return {
+        price: Number(selected.price.toFixed(2)),
+        method: 'adapter:lg-pix',
+        selectedSourceMethod: selected.method,
+        candidates: lgCandidates.slice().sort((a,b)=>b.score-a.score || a.price-b.price).slice(0,40)
+      };
+    }
+  }
 
-  let candidates = structuredCandidates.filter(withinPlausibleRange);
-  let method = isLg ? 'selected:lg-product-price' : 'selected:min-structured-candidate';
-
-  // Se não houver estruturado plausível, usa texto contextual, mas nunca cai
-  // para valores muito abaixo do preço-alvo (parcelas, cupons, cashback etc.).
+  let candidates = structuredCandidates.filter(plausible);
+  let method = 'selected:min-structured-candidate';
   if (!candidates.length) {
-    let plausible = fallbackCandidates.filter(
-      candidate => candidate.score >= 0 && withinPlausibleRange(candidate)
-    );
-
-    if (!plausible.length) {
-      plausible = fallbackCandidates.filter(withinPlausibleRange);
-    }
-
-    if (!plausible.length && !hasTargetPrice) {
-      plausible = fallbackCandidates.filter(candidate => candidate.price >= 500);
-    }
-
-    candidates = plausible;
+    candidates = fallbackCandidates.filter(c => c.score >= 0 && plausible(c));
+    if (!candidates.length) candidates = fallbackCandidates.filter(plausible);
     method = 'selected:contextual-currency-candidate';
   }
 
   if (!candidates.length) {
-    throw new Error(
-      'Não foi possível identificar um preço plausível do produto. Informe um preço-alvo aproximado para ajudar a filtrar parcelas, cupons e outros valores da página.'
-    );
+    throw new Error('Não foi possível identificar um preço plausível do produto na resposta da loja.');
   }
 
-  // Prioridade: contexto LG/Pix > maior score > menor preço plausível.
-  const selected = candidates
-    .slice()
-    .sort((a, b) => {
-      const lgA = a.method === 'lg:pix-context' ? 1 : 0;
-      const lgB = b.method === 'lg:pix-context' ? 1 : 0;
-      if (lgA !== lgB) return lgB - lgA;
-      const scoreA = Number(a.score || 0);
-      const scoreB = Number(b.score || 0);
-      if (scoreA !== scoreB) return scoreB - scoreA;
-      return a.price - b.price;
-    })[0];
-
+  const maxScore = Math.max(...candidates.map(c => Number(c.score || 0)));
+  const scoreBand = candidates.filter(c => Number(c.score || 0) >= maxScore - 4);
+  const selected = scoreBand.slice().sort((a,b)=>a.price-b.price)[0];
   return {
     price: Number(selected.price.toFixed(2)),
     method,
     selectedSourceMethod: selected.method,
-    candidates: candidates
-      .slice()
-      .sort((a, b) => a.price - b.price)
-      .slice(0, 40)
+    candidates: candidates.slice().sort((a,b)=>a.price-b.price).slice(0,40)
   };
 }
 
+function getBrowserHeaders() {
+  return {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache'
+  };
+}
+
+function isShopifyProductUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return /\/products\/[^/?#]+/i.test(parsed.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function fetchShopifyAdapter(url) {
+  const parsed = new URL(url);
+  const match = parsed.pathname.match(/\/products\/([^/?#]+)/i);
+  if (!match) return null;
+  const handle = match[1];
+  const jsonUrl = `${parsed.origin}/products/${handle}.js`;
+
+  try {
+    const response = await axios.get(jsonUrl, {
+      timeout: 20000,
+      maxRedirects: 5,
+      headers: getBrowserHeaders(),
+      validateStatus: status => status >= 200 && status < 400
+    });
+    const product = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    const variants = Array.isArray(product?.variants) ? product.variants : [];
+    if (!variants.length) return null;
+
+    const requestedVariantId = parsed.searchParams.get('variant');
+    let variant = requestedVariantId
+      ? variants.find(v => String(v.id) === String(requestedVariantId))
+      : null;
+    if (!variant) variant = variants.find(v => v.available === true) || variants[0];
+
+    let rawPrice = Number(variant.price);
+    if (!Number.isFinite(rawPrice)) return null;
+    const price = rawPrice >= 1000 ? rawPrice / 100 : rawPrice;
+    const inStock = variant.available === true;
+
+    return {
+      price: Number(price.toFixed(2)),
+      method: 'adapter:shopify-product-json',
+      selectedSourceMethod: 'shopify:variant',
+      candidates: [{ price: Number(price.toFixed(2)), method: 'shopify:variant', variantId: variant.id }],
+      title: product.title || null,
+      finalUrl: url,
+      httpStatus: response.status,
+      inStock,
+      canAddToCart: inStock,
+      availabilityMethod: 'shopify:variant.available',
+      variantId: variant.id
+    };
+  } catch (error) {
+    console.warn('Adapter Shopify indisponível, usando HTML:', describeError(error));
+    return null;
+  }
+}
+
 async function fetchProductPrice(url, options = {}) {
+  if (isShopifyProductUrl(url)) {
+    const shopify = await fetchShopifyAdapter(url);
+    if (shopify) return shopify;
+  }
+
   const response = await axios.get(url, {
     timeout: 25000,
     maxRedirects: 5,
     responseType: 'text',
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      Accept:
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-      'Cache-Control': 'no-cache',
-      Pragma: 'no-cache'
-    },
+    headers: getBrowserHeaders(),
     validateStatus: status => status >= 200 && status < 400
   });
 
   const html = String(response.data || '');
-
-  if (!html.trim()) {
-    throw new Error('A loja retornou uma página vazia.');
-  }
+  if (!html.trim()) throw new Error('A loja retornou uma página vazia.');
 
   const extracted = extractPriceFromHtml(html, { ...options, url });
-
+  const availability = detectAvailabilityFromHtml(html);
   return {
     ...extracted,
     title: extractProductTitle(html),
     finalUrl: response.request?.res?.responseUrl || url,
-    httpStatus: response.status
+    httpStatus: response.status,
+    ...availability
   };
 }
 
 async function checkPriceMonitor(monitor) {
   const checkedAt = dayjs().tz(TZ).toISOString();
-  const previousPrice =
-    monitor.lastPrice === null || monitor.lastPrice === undefined
-      ? null
-      : Number(monitor.lastPrice);
+  const previousPrice = monitor.lastPrice == null ? null : Number(monitor.lastPrice);
+  const previousInStock = monitor.lastInStock == null ? null : Boolean(monitor.lastInStock);
 
   const fetched = await fetchProductPrice(monitor.url, { targetPrice: monitor.targetPrice });
   const currentPrice = Number(fetched.price.toFixed(2));
-  const changed =
-    previousPrice !== null &&
-    Number(previousPrice.toFixed(2)) !== currentPrice;
-
-  const difference =
-    previousPrice === null
-      ? null
-      : Number((currentPrice - previousPrice).toFixed(2));
-
-  const differencePercent =
-    previousPrice && previousPrice > 0
-      ? Number((((currentPrice - previousPrice) / previousPrice) * 100).toFixed(2))
-      : null;
-
-  const targetReached =
-    monitor.targetPrice !== null &&
-    monitor.targetPrice !== undefined &&
-    currentPrice <= Number(monitor.targetPrice);
+  const inStock = fetched.inStock == null ? null : Boolean(fetched.inStock);
+  const canAddToCart = fetched.canAddToCart == null ? null : Boolean(fetched.canAddToCart);
+  const changed = previousPrice !== null && Number(previousPrice.toFixed(2)) !== currentPrice;
+  const stockChanged = previousInStock !== null && inStock !== null && previousInStock !== inStock;
+  const restocked = stockChanged && inStock === true;
+  const wentOutOfStock = stockChanged && inStock === false;
+  const difference = previousPrice === null ? null : Number((currentPrice - previousPrice).toFixed(2));
+  const differencePercent = previousPrice && previousPrice > 0 ? Number((((currentPrice - previousPrice) / previousPrice) * 100).toFixed(2)) : null;
+  const targetReached = monitor.targetPrice != null && currentPrice <= Number(monitor.targetPrice);
 
   return {
-    checkedAt,
-    previousPrice,
-    currentPrice,
-    changed,
-    difference,
-    differencePercent,
-    targetPrice: monitor.targetPrice ?? null,
-    targetReached,
+    checkedAt, previousPrice, currentPrice, changed, difference, differencePercent,
+    targetPrice: monitor.targetPrice ?? null, targetReached,
+    previousInStock, inStock, canAddToCart, stockChanged, restocked, wentOutOfStock,
+    availabilityMethod: fetched.availabilityMethod ?? null,
     extractionMethod: fetched.method,
     selectedSourceMethod: fetched.selectedSourceMethod ?? null,
     extractionCandidates: fetched.candidates,
     pageTitle: fetched.title,
     finalUrl: fetched.finalUrl,
-    httpStatus: fetched.httpStatus
+    httpStatus: fetched.httpStatus,
+    variantId: fetched.variantId ?? null
   };
 }
 
@@ -2809,55 +2848,32 @@ function formatCurrencyBRL(value) {
 
 async function notifyPriceMonitorMattermost(monitor, result, reason) {
   const email = getPriceMonitorNotifyEmail(monitor);
+  if (!email) return { sent: false, reason: 'missing_notify_email' };
 
-  if (!email) {
-    return {
-      sent: false,
-      reason: 'missing_notify_email'
-    };
-  }
-
-  const direction = result.difference === null
-    ? ''
-    : result.difference < 0
-      ? '📉'
-      : result.difference > 0
-        ? '📈'
-        : '➖';
+  const reasonText = {
+    target_reached: '🎯 O produto atingiu o preço-alvo.',
+    price_changed: result.difference < 0 ? '📉 O preço do produto caiu.' : '📈 O preço do produto aumentou.',
+    restocked: '🟢 O produto voltou ao estoque e pode ser comprado.',
+    out_of_stock: '🔴 O produto ficou sem estoque.'
+  }[reason] || 'Houve uma alteração no produto monitorado.';
 
   const lines = [
-    `### ${direction || '💰'} Monitor de Preço`,
+    `### Monitor de Preço — ${reasonText}`,
     `**${monitor.name}**`,
     monitor.brand ? `Marca: **${monitor.brand}**` : null,
     monitor.store ? `Loja: **${monitor.store}**` : null,
-    reason === 'target_reached'
-      ? '🎯 O produto atingiu o preço-alvo.'
-      : 'O menor preço disponível do produto mudou.',
-    result.previousPrice !== null
-      ? `Preço anterior: **${formatCurrencyBRL(result.previousPrice)}**`
-      : null,
+    result.previousPrice !== null ? `Preço anterior: **${formatCurrencyBRL(result.previousPrice)}**` : null,
     `Preço atual: **${formatCurrencyBRL(result.currentPrice)}**`,
-    result.difference !== null
-      ? `Variação: **${formatCurrencyBRL(result.difference)} (${result.differencePercent ?? 0}%)**`
-      : null,
-    monitor.targetPrice !== null && monitor.targetPrice !== undefined
-      ? `Preço-alvo: **${formatCurrencyBRL(monitor.targetPrice)}**`
-      : null,
+    result.difference !== null ? `Variação: **${formatCurrencyBRL(result.difference)} (${result.differencePercent ?? 0}%)**` : null,
+    monitor.targetPrice != null ? `Preço-alvo: **${formatCurrencyBRL(monitor.targetPrice)}**` : null,
+    result.inStock === true ? 'Estoque: **Disponível**' : result.inStock === false ? 'Estoque: **Esgotado**' : 'Estoque: **Não identificado**',
+    result.canAddToCart === true ? 'Adicionar ao carrinho: **Sim**' : result.canAddToCart === false ? 'Adicionar ao carrinho: **Não**' : null,
     `Link: ${monitor.url}`
   ].filter(Boolean);
 
-  await notifyTargets(
-    [{ email, name: email }],
-    lines.join('\n')
-  );
-
-  return {
-    sent: true,
-    email,
-    reason
-  };
+  await notifyTargets([{ email, name: email }], lines.join('\n'));
+  return { sent: true, email, reason };
 }
-
 
 // ---------------------------------------------------------
 // INTERFACE WEB — MONITOR DE PREÇOS
@@ -2939,6 +2955,8 @@ app.post('/api/price-monitors', async (req, res) => {
       url,
       targetPrice: targetPrice ?? null,
       notifyOnAnyChange: body.notifyOnAnyChange !== false,
+      notifyOnRestock: body.notifyOnRestock !== false,
+      notifyOnOutOfStock: body.notifyOnOutOfStock === true,
       notifyEmail,
       active: body.active !== false,
       lastPrice: null,
@@ -2946,6 +2964,9 @@ app.post('/api/price-monitors', async (req, res) => {
       lastChangeAt: null,
       lastError: null,
       lastTargetReached: false,
+      lastInStock: null,
+      lastCanAddToCart: null,
+      lastStockChangeAt: null,
       priceSelectionVersion: null,
       createdAt: now,
       updatedAt: now
@@ -2982,25 +3003,18 @@ app.post('/api/price-monitors/:id/check', async (req, res) => {
     // Isso evita notificar uma falsa queda causada pela troca de algoritmo.
     const rebaselined = monitor.priceSelectionVersion !== PRICE_SELECTION_VERSION;
     const effectiveChanged = !rebaselined && result.changed;
-    const targetCrossed =
-      !rebaselined &&
-      result.targetReached &&
-      monitor.lastTargetReached !== true;
+    const effectiveStockChanged = !rebaselined && result.stockChanged;
+    const targetCrossed = !rebaselined && result.targetReached && monitor.lastTargetReached !== true;
 
     let notification = { sent: false, reason: 'not_required' };
-
-    if (targetCrossed) {
-      notification = await notifyPriceMonitorMattermost(
-        monitor,
-        result,
-        'target_reached'
-      );
+    if (effectiveStockChanged && result.restocked && monitor.notifyOnRestock !== false) {
+      notification = await notifyPriceMonitorMattermost(monitor, result, 'restocked');
+    } else if (targetCrossed) {
+      notification = await notifyPriceMonitorMattermost(monitor, result, 'target_reached');
     } else if (effectiveChanged && monitor.notifyOnAnyChange !== false) {
-      notification = await notifyPriceMonitorMattermost(
-        monitor,
-        result,
-        'price_changed'
-      );
+      notification = await notifyPriceMonitorMattermost(monitor, result, 'price_changed');
+    } else if (effectiveStockChanged && result.wentOutOfStock && monitor.notifyOnOutOfStock === true) {
+      notification = await notifyPriceMonitorMattermost(monitor, result, 'out_of_stock');
     }
 
     const updated = {
@@ -3013,6 +3027,10 @@ app.post('/api/price-monitors/:id/check', async (req, res) => {
       lastSelectedSourceMethod: result.selectedSourceMethod ?? null,
       lastPageTitle: result.pageTitle,
       lastTargetReached: result.targetReached,
+      lastInStock: result.inStock,
+      lastCanAddToCart: result.canAddToCart,
+      lastAvailabilityMethod: result.availabilityMethod,
+      lastStockChangeAt: effectiveStockChanged ? result.checkedAt : monitor.lastStockChangeAt,
       priceSelectionVersion: PRICE_SELECTION_VERSION,
       notifyEmail: getPriceMonitorNotifyEmail(monitor),
       updatedAt: now
@@ -3026,7 +3044,8 @@ app.post('/api/price-monitors/:id/check', async (req, res) => {
       check: {
         ...result,
         rebaselined,
-        effectiveChanged
+        effectiveChanged,
+        effectiveStockChanged
       },
       notification
     });
@@ -3092,6 +3111,14 @@ app.patch('/api/price-monitors/:id', async (req, res) => {
 
     if (body.notifyOnAnyChange !== undefined) {
       updated.notifyOnAnyChange = Boolean(body.notifyOnAnyChange);
+    }
+
+    if (body.notifyOnRestock !== undefined) {
+      updated.notifyOnRestock = Boolean(body.notifyOnRestock);
+    }
+
+    if (body.notifyOnOutOfStock !== undefined) {
+      updated.notifyOnOutOfStock = Boolean(body.notifyOnOutOfStock);
     }
 
     if (body.notifyEmail !== undefined) {
