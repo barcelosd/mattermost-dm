@@ -2701,6 +2701,138 @@ function getBrowserHeaders() {
   };
 }
 
+function isLgProductUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase().includes('lg.com');
+  } catch (_) {
+    return false;
+  }
+}
+
+function extractLgPixFromRenderedText(text, targetPrice = null) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+
+  const target = Number(targetPrice);
+  const hasTarget = Number.isFinite(target) && target > 0;
+  const floor = hasTarget ? Math.max(300, target * 0.55) : 500;
+  const ceiling = hasTarget ? target * 4 : 10000000;
+  const candidates = [];
+  const lower = normalized.toLowerCase();
+  let pos = 0;
+
+  while ((pos = lower.indexOf('pix', pos)) !== -1) {
+    const start = Math.max(0, pos - 220);
+    const end = Math.min(normalized.length, pos + 360);
+    const context = normalized.slice(start, end);
+    const rx = /R\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2}))/gi;
+    let match;
+
+    while ((match = rx.exec(context)) !== null) {
+      const price = parsePriceValue(match[1]);
+      if (!Number.isFinite(price) || price < floor || price > ceiling) continue;
+      candidates.push({
+        price: Number(price.toFixed(2)),
+        method: 'lg:browser-pix-text',
+        context: context.slice(0, 500)
+      });
+    }
+
+    pos += 3;
+    if (candidates.length >= 30) break;
+  }
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => a.price - b.price);
+
+  return {
+    price: candidates[0].price,
+    selected: candidates[0],
+    candidates
+  };
+}
+
+async function fetchLgBrowserAdapter(url, options = {}) {
+  let puppeteer;
+  try {
+    puppeteer = require('puppeteer');
+  } catch (_) {
+    throw new Error(
+      'O adaptador LG precisa do Puppeteer. Instale com: npm install puppeteer'
+    );
+  }
+
+  let browser = null;
+
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent(getBrowserHeaders()['User-Agent']);
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+    });
+    await page.setViewport({ width: 1440, height: 1000 });
+
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000
+    });
+
+    try {
+      await page.waitForFunction(
+        () => /pix/i.test(document.body?.innerText || '') && /R\$/.test(document.body?.innerText || ''),
+        { timeout: 15000 }
+      );
+    } catch (_) {
+      // A página pode terminar de renderizar sem expor imediatamente o texto esperado.
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 2500));
+
+    const renderedText = await page.evaluate(() => document.body?.innerText || '');
+    const html = await page.content();
+    const title = await page.title();
+
+    const pix = extractLgPixFromRenderedText(renderedText, options.targetPrice);
+    let extracted;
+
+    if (pix) {
+      extracted = {
+        price: pix.price,
+        method: 'adapter:lg-browser-pix',
+        selectedSourceMethod: pix.selected.method,
+        candidates: pix.candidates
+      };
+    } else {
+      extracted = extractPriceFromHtml(html, { ...options, url });
+      extracted.method = `adapter:lg-browser:${extracted.method}`;
+    }
+
+    const availability = detectAvailabilityFromHtml(html);
+
+    return {
+      ...extracted,
+      title: title || extractProductTitle(html),
+      finalUrl: page.url() || url,
+      httpStatus: response?.status?.() ?? 200,
+      ...availability
+    };
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+  }
+}
+
 function isShopifyProductUrl(url) {
   try {
     const parsed = new URL(url);
@@ -2759,6 +2891,12 @@ async function fetchShopifyAdapter(url) {
 }
 
 async function fetchProductPrice(url, options = {}) {
+  // LG carrega preço e disponibilidade por JavaScript. Para esse domínio usamos
+  // navegador headless para ler o DOM já renderizado.
+  if (isLgProductUrl(url)) {
+    return fetchLgBrowserAdapter(url, options);
+  }
+
   if (isShopifyProductUrl(url)) {
     const shopify = await fetchShopifyAdapter(url);
     if (shopify) return shopify;
