@@ -15,7 +15,9 @@ const qrcode = require('qrcode-terminal');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  fetchLatestWaWebVersion,
+  fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
@@ -186,6 +188,25 @@ function scheduleWhatsAppReconnect(reason) {
   }, 15000);
 }
 
+async function resolveWhatsAppWebVersion() {
+  const webVersion = await fetchLatestWaWebVersion();
+
+  if (webVersion.isLatest) {
+    return { version: webVersion.version, source: 'WhatsApp Web' };
+  }
+
+  console.warn(
+    'WhatsApp: não foi possível consultar a versão do WhatsApp Web; tentando a versão mais recente do Baileys.',
+    describeError(webVersion.error) || ''
+  );
+
+  const baileysVersion = await fetchLatestBaileysVersion();
+  return {
+    version: baileysVersion.version,
+    source: baileysVersion.isLatest ? 'Baileys' : 'Baileys local'
+  };
+}
+
 async function initWhatsApp() {
   if (waInitializing) return;
 
@@ -197,9 +218,13 @@ async function initWhatsApp() {
     console.log(`WhatsApp: inicializando sessão em ${WA_AUTH_DIR}`);
 
     const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);
+    const { version, source } = await resolveWhatsAppWebVersion();
+
+    console.log(`WhatsApp: usando versão ${version.join('.')} (${source})`);
 
     waSocket = makeWASocket({
       auth: state,
+      version,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
       browser: ['Bot NewNorte', 'Chrome', '1.0.0']
