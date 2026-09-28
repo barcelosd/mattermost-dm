@@ -26,3 +26,21 @@ que será o remetente das notificações e ter acesso à conta configurada.
 Não é necessário configurar caixa de entrada, contato nem ID de conversa.
 
 Com `CHATWOOT_ENABLED=false` (valor padrão), nenhuma chamada ao Chatwoot é feita.
+
+### O que é enviado ao Chatwoot
+
+- Notificações de tarefas (Novo/Reaberta).
+- Lembretes de compromissos em **Aguardando Data** (padrão: 10 e 2 minutos antes).
+- Resumo de compromissos do próximo dia útil (padrão: 17h45, dias úteis).
+
+Cada entrega é registrada por canal e por destinatário. Se o Chatwoot falhar, a
+próxima execução tenta de novo só o que faltou, sem repetir o Mattermost. O
+resumo diário é tentado a cada minuto durante `DAILY_SUMMARY_RETRY_MINUTES`
+(padrão 30) a partir de `DAILY_SUMMARY_HOUR:DAILY_SUMMARY_MINUTE`.
+
+O ID da conversa direta de cada agente fica salvo no Redis. Se a criação da
+conversa falhar porque ela já existe, a integração a localiza na lista de
+conversas internas.
+
+Diagnóstico: `GET /debug-chatwoot?email=usuario@empresa.com` mostra se o
+Chatwoot está ativo, se o agente foi encontrado e qual conversa será usada.

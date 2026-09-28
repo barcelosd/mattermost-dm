@@ -59,6 +59,7 @@ const {
   DAILY_SUMMARY_ENABLED = 'true',
   DAILY_SUMMARY_HOUR = 17,
   DAILY_SUMMARY_MINUTE = 45,
+  DAILY_SUMMARY_RETRY_MINUTES = 30,
 
   CLIENT_SUMMARY_ENABLED = 'true',
   CLIENT_SUMMARY_TIME = '08:30',
@@ -659,10 +660,16 @@ function isDailySummaryTime() {
 
   if (isWeekendDate(now)) return false;
 
-  return (
-    now.hour() === Number(DAILY_SUMMARY_HOUR) &&
-    now.minute() === Number(DAILY_SUMMARY_MINUTE)
-  );
+  // Janela em vez de minuto exato: tolera atraso do setInterval, reinício do
+  // processo e permite novas tentativas quando algum canal falhar.
+  const start = now
+    .hour(Number(DAILY_SUMMARY_HOUR))
+    .minute(Number(DAILY_SUMMARY_MINUTE))
+    .second(0)
+    .millisecond(0);
+  const end = start.add(Number(DAILY_SUMMARY_RETRY_MINUTES || 30), 'minute');
+
+  return !now.isBefore(start) && now.isBefore(end);
 }
 
 function getNextBusinessSummaryDateString() {
@@ -953,13 +960,24 @@ async function sendMattermostMessage(channelId, message) {
   );
 }
 
+// Retorna os e-mails cujo envio falhou e pode ser tentado novamente.
 async function notifyMattermostTargets(targets, message) {
+  const failedEmails = [];
+
   try {
     const botUser = await getMattermostBotUser();
 
     for (const target of targets) {
       try {
-        const mmUser = await getMattermostUserByEmail(target.email);
+        let mmUser;
+
+        try {
+          mmUser = await getMattermostUserByEmail(target.email);
+        } catch (error) {
+          if (error.response?.status !== 404) throw error;
+          console.log(`Mattermost ignorado, usuário não encontrado: ${target.email}`);
+          continue;
+        }
 
         if (mmUser.delete_at && mmUser.delete_at > 0) {
           console.log(`Mattermost ignorado, usuário baixado: ${target.email}`);
@@ -972,6 +990,7 @@ async function notifyMattermostTargets(targets, message) {
 
         console.log(`Mattermost enviado para ${target.email}`);
       } catch (error) {
+        failedEmails.push(target.email);
         console.error(
           `Erro ao enviar Mattermost para ${target.email}:`,
           error.response?.data || error.message
@@ -990,16 +1009,27 @@ async function notifyMattermostTargets(targets, message) {
       'Erro geral no Mattermost',
       err.response?.data || err.message
     );
+
+    return targets.map(target => target.email);
   }
+
+  return failedEmails;
 }
 
 // ---------------------------------------------------------
 // CHATWOOT
 // ---------------------------------------------------------
 const CHATWOOT_AGENTS_CACHE_TTL_MS = 60 * 1000;
+const CHATWOOT_REQUEST_TIMEOUT_MS = 15 * 1000;
+const CHATWOOT_CONVERSATION_KEY_PREFIX = 'chatwoot:direct_conversation';
 let chatwootAgentsCache = null;
 let chatwootAgentsCacheExpiresAt = 0;
 const chatwootConversationCache = new Map();
+
+const chatwootRequestConfig = {
+  headers: chatwootHeaders,
+  timeout: CHATWOOT_REQUEST_TIMEOUT_MS
+};
 
 function chatwootIsEnabled() {
   return String(CHATWOOT_ENABLED).toLowerCase() === 'true';
@@ -1028,7 +1058,7 @@ async function getChatwootAgents() {
 
   const response = await axios.get(
     getChatwootApiUrl('/agents'),
-    { headers: chatwootHeaders }
+    chatwootRequestConfig
   );
   const agents = Array.isArray(response.data)
     ? response.data
@@ -1040,34 +1070,122 @@ async function getChatwootAgents() {
   return agents;
 }
 
+async function findChatwootAgentByEmail(email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const agents = await getChatwootAgents();
+
+  return agents.find(agent =>
+    String(agent.email || '').trim().toLowerCase() === normalizedEmail
+  ) || null;
+}
+
 function getChatwootPayload(data) {
   if (Array.isArray(data?.payload)) return data.payload[0] || null;
   if (data?.payload && typeof data.payload === 'object') return data.payload;
   return data || null;
 }
 
-async function getOrCreateChatwootConversation(agent) {
-  const cached = chatwootConversationCache.get(String(agent.id));
+function getChatwootList(data) {
+  const candidates = [
+    data,
+    data?.payload,
+    data?.data,
+    data?.internal_conversations,
+    data?.payload?.internal_conversations,
+    data?.data?.internal_conversations
+  ];
+
+  return candidates.find(Array.isArray) || [];
+}
+
+function chatwootConversationHasUser(conversation, userId) {
+  const expectedId = String(userId);
+  const participants = [
+    ...(conversation?.participants || []),
+    ...(conversation?.members || []),
+    ...(conversation?.users || [])
+  ];
+  const ids = [
+    conversation?.user_id,
+    conversation?.other_user_id,
+    conversation?.recipient_id,
+    conversation?.user?.id,
+    conversation?.other_user?.id,
+    conversation?.recipient?.id,
+    ...participants.map(p => p?.user_id ?? p?.user?.id ?? p?.id)
+  ];
+
+  return ids.some(id => id !== undefined && id !== null && String(id) === expectedId);
+}
+
+// Recupera a conversa direta já existente com o agente. Necessário quando o
+// processo reinicia (cache vazio) e o Chatwoot recusa criar outra conversa
+// direta com o mesmo usuário.
+async function findExistingChatwootDirectConversation(agent) {
+  const response = await axios.get(
+    getChatwootApiUrl('/internal_conversations'),
+    chatwootRequestConfig
+  );
+
+  return getChatwootList(response.data).find(conversation =>
+    (!conversation.kind || conversation.kind === 'direct') &&
+    chatwootConversationHasUser(conversation, agent.id)
+  ) || null;
+}
+
+async function getOrCreateChatwootConversationId(agent) {
+  const agentId = String(agent.id);
+  const cached = chatwootConversationCache.get(agentId);
   if (cached) return cached;
 
-  const createResponse = await axios.post(
-    getChatwootApiUrl('/internal_conversations'),
-    {
-      internal_conversation: {
-        kind: 'direct',
-        user_id: agent.id
-      }
-    },
-    { headers: chatwootHeaders }
-  );
-  const conversation = getChatwootPayload(createResponse.data);
+  const redisKey = `${CHATWOOT_CONVERSATION_KEY_PREFIX}:${CHATWOOT_ACCOUNT_ID}:${agentId}`;
+  const stored = await redisGet(redisKey).catch(() => null);
+
+  if (stored) {
+    chatwootConversationCache.set(agentId, stored);
+    return stored;
+  }
+
+  let conversation = null;
+
+  try {
+    const createResponse = await axios.post(
+      getChatwootApiUrl('/internal_conversations'),
+      {
+        internal_conversation: {
+          kind: 'direct',
+          user_id: agent.id
+        }
+      },
+      chatwootRequestConfig
+    );
+    conversation = getChatwootPayload(createResponse.data);
+  } catch (error) {
+    console.warn(
+      `[Chatwoot] Falha ao criar conversa direta com ${agent.email}; buscando conversa existente.`,
+      error.response?.data || error.message
+    );
+    conversation = await findExistingChatwootDirectConversation(agent);
+
+    if (!conversation) throw error;
+  }
 
   if (!conversation?.id) {
     throw new Error('O Chatwoot não retornou o ID da conversa interna direta.');
   }
 
-  chatwootConversationCache.set(String(agent.id), conversation);
-  return conversation;
+  const conversationId = String(conversation.id);
+  chatwootConversationCache.set(agentId, conversationId);
+  await redisSet(redisKey, conversationId).catch(() => {});
+
+  return conversationId;
+}
+
+async function forgetChatwootConversation(agent) {
+  const agentId = String(agent.id);
+  chatwootConversationCache.delete(agentId);
+  await redisDel(`${CHATWOOT_CONVERSATION_KEY_PREFIX}:${CHATWOOT_ACCOUNT_ID}:${agentId}`)
+    .catch(() => {});
 }
 
 async function sendChatwootMessage(conversationId, message) {
@@ -1081,12 +1199,28 @@ async function sendChatwootMessage(conversationId, message) {
         mentions_everyone: false
       }
     },
-    { headers: chatwootHeaders }
+    chatwootRequestConfig
   );
 }
 
+async function sendChatwootDirectMessage(agent, message) {
+  const conversationId = await getOrCreateChatwootConversationId(agent);
+
+  try {
+    await sendChatwootMessage(conversationId, message);
+  } catch (error) {
+    // Conversa salva pode ter sido removida no Chatwoot: recria uma vez.
+    if (![403, 404].includes(error.response?.status)) throw error;
+
+    await forgetChatwootConversation(agent);
+    const newConversationId = await getOrCreateChatwootConversationId(agent);
+    await sendChatwootMessage(newConversationId, message);
+  }
+}
+
+// Retorna os e-mails cujo envio falhou e pode ser tentado novamente.
 async function notifyChatwootTargets(targets, message) {
-  if (!chatwootIsEnabled()) return;
+  if (!chatwootIsEnabled()) return [];
 
   const configurationError = getChatwootConfigurationError();
   if (configurationError) {
@@ -1096,20 +1230,14 @@ async function notifyChatwootTargets(targets, message) {
       'Configuração incompleta do Chatwoot',
       configurationError
     );
-    return;
+    return targets.map(target => target.email);
   }
 
-  try {
-    const agents = await getChatwootAgents();
-    const agentsByEmail = new Map(
-      agents
-        .filter(agent => agent.email)
-        .map(agent => [String(agent.email).trim().toLowerCase(), agent])
-    );
+  const failedEmails = [];
 
+  try {
     for (const target of targets) {
-      const email = String(target.email || '').trim().toLowerCase();
-      const agent = agentsByEmail.get(email);
+      const agent = await findChatwootAgentByEmail(target.email);
 
       if (!agent) {
         console.log(`Chatwoot ignorado, agente não encontrado: ${target.email}`);
@@ -1117,10 +1245,10 @@ async function notifyChatwootTargets(targets, message) {
       }
 
       try {
-        const conversation = await getOrCreateChatwootConversation(agent);
-        await sendChatwootMessage(conversation.id, message);
+        await sendChatwootDirectMessage(agent, message);
         console.log(`Chatwoot enviado para ${target.email}`);
       } catch (error) {
+        failedEmails.push(target.email);
         console.error(
           `Erro ao enviar Chatwoot para ${target.email}:`,
           error.response?.data || error.message
@@ -1139,14 +1267,58 @@ async function notifyChatwootTargets(targets, message) {
       'Erro geral no Chatwoot',
       error.response?.data || error.message
     );
+
+    return targets.map(target => target.email);
   }
+
+  return failedEmails;
 }
 
+const NOTIFICATION_CHANNELS = [
+  { name: 'mattermost', send: notifyMattermostTargets },
+  { name: 'chatwoot', send: notifyChatwootTargets, isEnabled: chatwootIsEnabled }
+];
+
 async function notifyTargets(targets, message) {
-  await Promise.all([
-    notifyMattermostTargets(targets, message),
-    notifyChatwootTargets(targets, message)
-  ]);
+  await Promise.all(
+    NOTIFICATION_CHANNELS.map(channel => channel.send(targets, message))
+  );
+}
+
+// Envia por canal e por destinatário, registrando cada entrega separadamente.
+// Assim, se um canal falhar, a próxima execução tenta apenas o que faltou,
+// sem repetir mensagens já entregues nos outros canais.
+async function notifyTargetsOnce(targets, message, keyPrefix, store) {
+  let allDelivered = true;
+
+  await Promise.all(
+    NOTIFICATION_CHANNELS
+      .filter(channel => !channel.isEnabled || channel.isEnabled())
+      .map(async channel => {
+        const pending = [];
+
+        for (const target of targets) {
+          const key = `${keyPrefix}:${channel.name}:${target.email}`;
+          if (!(await store.wasSent(key))) pending.push({ target, key });
+        }
+
+        if (!pending.length) return;
+
+        const failedEmails = new Set(
+          await channel.send(pending.map(item => item.target), message)
+        );
+
+        for (const { target, key } of pending) {
+          if (failedEmails.has(target.email)) {
+            allDelivered = false;
+          } else {
+            await store.markSent(key);
+          }
+        }
+      })
+  );
+
+  return allDelivered;
 }
 
 // ---------------------------------------------------------
@@ -1332,7 +1504,7 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
   );
   incrementAlertStat(stats, 'checkedWindow');
 
-  async function sendMattermostAlert(minutes) {
+  async function sendResponsibleAlert(minutes) {
     const targetSec = minutes * 60;
     const lowerBoundSeconds = Math.max(
       APPOINTMENT_ALERT_STOP_BEFORE_SECONDS,
@@ -1343,7 +1515,7 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
       diffSegundos <= targetSec &&
       diffSegundos >= lowerBoundSeconds
     ) {
-      const alertKey = `redmine:mm:${issue.id}:${appointmentKey}:${minutes}`;
+      const alertKey = `redmine:alert:${issue.id}:${appointmentKey}:${minutes}`;
 
       if (await wasAppointmentAlertSent(alertKey)) {
         incrementAlertStat(stats, 'alreadySent');
@@ -1353,19 +1525,27 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
       const targets = await getResponsibleTargets(issue);
 
       if (!targets.length) {
-        console.log(`Tarefa #${issue.id} sem responsável ativo para Mattermost.`);
+        console.log(`Tarefa #${issue.id} sem responsável ativo para alerta.`);
         return;
       }
 
-      await notifyTargets(
+      const allDelivered = await notifyTargetsOnce(
         targets,
-        buildAppointmentMessage(issue, minutes, appointment.timeLabel)
+        buildAppointmentMessage(issue, minutes, appointment.timeLabel),
+        alertKey,
+        { wasSent: wasAppointmentAlertSent, markSent: markAppointmentAlertSent }
       );
 
-      await markAppointmentAlertSent(alertKey);
-      incrementAlertStat(stats, 'sentMattermost');
+      if (!allDelivered) {
+        incrementAlertStat(stats, 'pendingRetry');
+        console.log(`Alerta (${minutes} min) da tarefa #${issue.id} com falhas; nova tentativa no próximo ciclo.`);
+        return;
+      }
 
-      console.log(`Mattermost enviado (${minutes} min) para tarefa #${issue.id}`);
+      await markAppointmentAlertSent(alertKey);
+      incrementAlertStat(stats, 'sentResponsible');
+
+      console.log(`Alerta Mattermost/Chatwoot enviado (${minutes} min) para tarefa #${issue.id}`);
     }
   }
 
@@ -1417,9 +1597,9 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
     }
   }
 
-  await sendMattermostAlert(mmMin1);
+  await sendResponsibleAlert(mmMin1);
   await sendWhatsAppAlert(waMin);
-  await sendMattermostAlert(mmMin2);
+  await sendResponsibleAlert(mmMin2);
 
   return 'checked';
 }
@@ -2057,7 +2237,16 @@ async function fetchIssuesByDate(dateStr) {
   }
 }
 
+let appointmentAlertsRunning = false;
+
 async function pollingAppointmentAlerts() {
+  if (appointmentAlertsRunning) {
+    console.log('[Alertas] Ciclo anterior ainda em execução; ignorando este ciclo.');
+    return;
+  }
+
+  appointmentAlertsRunning = true;
+
   try {
     const today = dayjs().tz(TZ).format('YYYY-MM-DD');
     const stats = {
@@ -2070,7 +2259,8 @@ async function pollingAppointmentAlerts() {
       skippedCompleted: 0,
       checkedWindow: 0,
       alreadySent: 0,
-      sentMattermost: 0,
+      sentResponsible: 0,
+      pendingRetry: 0,
       sentWhatsapp: 0,
       errors: 0
     };
@@ -2130,19 +2320,26 @@ async function pollingAppointmentAlerts() {
       'Erro geral no polling de alertas',
       error.response?.data || error.message
     );
+  } finally {
+    appointmentAlertsRunning = false;
   }
 }
 
 // ---------------------------------------------------------
-// RESUMO MATTERMOST
+// RESUMO MATTERMOST / CHATWOOT
 // ---------------------------------------------------------
+let dailySummaryRunning = false;
+
 async function processDailySummary() {
-  if (!isDailySummaryTime()) return;
+  if (!isDailySummaryTime() || dailySummaryRunning) return;
 
   const targetDate = getNextBusinessSummaryDateString();
+  // Mantém o nome histórico da chave para não reenviar resumos já concluídos.
   const summaryKey = `redmine:summary:mattermost:${targetDate}`;
 
   if (await wasAlreadyNotified(summaryKey)) return;
+
+  dailySummaryRunning = true;
 
   try {
     const issueSummaries = await fetchIssuesByDate(targetDate);
@@ -2185,6 +2382,8 @@ async function processDailySummary() {
       }
     }
 
+    let allDelivered = true;
+
     for (const { target, lines } of groupedByEmail.values()) {
       lines.sort((a, b) => a.sort.localeCompare(b.sort));
 
@@ -2194,22 +2393,36 @@ async function processDailySummary() {
         ...lines.map(l => l.text)
       ].join('\n');
 
-      await notifyTargets([target], message);
+      const delivered = await notifyTargetsOnce(
+        [target],
+        message,
+        `redmine:summary:${targetDate}`,
+        { wasSent: wasAlreadyNotified, markSent: markAsNotified }
+      );
+
+      if (!delivered) allDelivered = false;
+    }
+
+    if (!allDelivered) {
+      console.log(`Resumo do dia ${targetDate} com falhas; nova tentativa no próximo minuto.`);
+      return;
     }
 
     await markAsNotified(summaryKey);
 
-    console.log(`Resumo Mattermost enviado para ${targetDate}`);
+    console.log(`Resumo Mattermost/Chatwoot enviado para ${targetDate}`);
   } catch (error) {
     console.error(
-      'Erro no resumo Mattermost:',
+      'Erro no resumo Mattermost/Chatwoot:',
       error.response?.data || error.message
     );
     await notifyAttention(
       `daily_summary_mattermost_error:${targetDate}`,
-      'Erro no resumo diário do Mattermost',
+      'Erro no resumo diário do Mattermost/Chatwoot',
       { targetDate, error: error.response?.data || error.message }
     );
+  } finally {
+    dailySummaryRunning = false;
   }
 }
 
@@ -3596,6 +3809,37 @@ app.get('/debug-alerts/:id', async (req, res) => {
   }
 });
 
+// Diagnóstico do Chatwoot: /debug-chatwoot?email=usuario@empresa.com
+app.get('/debug-chatwoot', async (req, res) => {
+  const response = {
+    enabled: chatwootIsEnabled(),
+    configurationError: getChatwootConfigurationError(),
+    email: req.query.email || null
+  };
+
+  if (!response.enabled || response.configurationError || !response.email) {
+    return res.json(response);
+  }
+
+  try {
+    const agent = await findChatwootAgentByEmail(response.email);
+    response.agent = agent
+      ? { id: agent.id, name: agent.name, email: agent.email }
+      : null;
+
+    if (agent) {
+      response.conversationId = await getOrCreateChatwootConversationId(agent);
+    }
+
+    res.json(response);
+  } catch (err) {
+    res.status(500).json({
+      ...response,
+      erro: err.response?.data || describeError(err)
+    });
+  }
+});
+
 // ... (outras funções que já existem no seu arquivo acima)
 
 // ==========================================
@@ -3809,6 +4053,10 @@ app.listen(PORT, () => {
     alertFieldName: ALERT_FIELD_NAME,
     meetStatusName: MEET_STATUS_NAME,
     whatsappAlertMinutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
+    chatwootEnabled: chatwootIsEnabled(),
+    chatwootConfigurationError: chatwootIsEnabled() ? getChatwootConfigurationError() : null,
+    dailySummaryEnabled: DAILY_SUMMARY_ENABLED,
+    dailySummaryTime: `${String(DAILY_SUMMARY_HOUR).padStart(2, '0')}:${String(DAILY_SUMMARY_MINUTE).padStart(2, '0')}`,
     clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
     clientSummaryTime: CLIENT_SUMMARY_TIME,
     whatsappGroupFieldName: WHATSAPP_GROUP_FIELD_NAME,
