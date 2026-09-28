@@ -1027,7 +1027,7 @@ async function getChatwootAgents() {
   }
 
   const response = await axios.get(
-    getChatwootApiUrl('/internal_conversations/available_users'),
+    getChatwootApiUrl('/agents'),
     { headers: chatwootHeaders }
   );
   const agents = Array.isArray(response.data)
