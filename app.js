@@ -37,6 +37,12 @@ const {
   MATTERMOST_URL,
   MATTERMOST_TOKEN,
 
+  CHATWOOT_ENABLED = 'false',
+  CHATWOOT_URL,
+  CHATWOOT_API_ACCESS_TOKEN,
+  CHATWOOT_ACCOUNT_ID,
+  CHATWOOT_INBOX_ID,
+
   REDIS_URL,
   REDIS_TTL_DAYS = 90,
 
@@ -98,6 +104,11 @@ const redmineHeaders = {
 
 const mattermostHeaders = {
   Authorization: `Bearer ${MATTERMOST_TOKEN}`,
+  'Content-Type': 'application/json'
+};
+
+const chatwootHeaders = {
+  api_access_token: CHATWOOT_API_ACCESS_TOKEN,
   'Content-Type': 'application/json'
 };
 
@@ -943,7 +954,7 @@ async function sendMattermostMessage(channelId, message) {
   );
 }
 
-async function notifyTargets(targets, message) {
+async function notifyMattermostTargets(targets, message) {
   try {
     const botUser = await getMattermostBotUser();
 
@@ -981,6 +992,263 @@ async function notifyTargets(targets, message) {
       err.response?.data || err.message
     );
   }
+}
+
+// ---------------------------------------------------------
+// CHATWOOT
+// ---------------------------------------------------------
+const CHATWOOT_AGENTS_CACHE_TTL_MS = 60 * 1000;
+let chatwootAgentsCache = null;
+let chatwootAgentsCacheExpiresAt = 0;
+let chatwootIntegrationContactPromise = null;
+const chatwootConversationCache = new Map();
+
+function chatwootIsEnabled() {
+  return String(CHATWOOT_ENABLED).toLowerCase() === 'true';
+}
+
+function getChatwootConfigurationError() {
+  const missing = [];
+
+  if (!CHATWOOT_URL) missing.push('CHATWOOT_URL');
+  if (!CHATWOOT_API_ACCESS_TOKEN) missing.push('CHATWOOT_API_ACCESS_TOKEN');
+  if (!CHATWOOT_ACCOUNT_ID) missing.push('CHATWOOT_ACCOUNT_ID');
+  if (!CHATWOOT_INBOX_ID) missing.push('CHATWOOT_INBOX_ID');
+
+  return missing.length
+    ? `Configuração incompleta do Chatwoot: ${missing.join(', ')}`
+    : null;
+}
+
+function getChatwootApiUrl(pathname) {
+  return `${String(CHATWOOT_URL).replace(/\/$/, '')}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}${pathname}`;
+}
+
+async function getChatwootAgents() {
+  if (chatwootAgentsCache && Date.now() < chatwootAgentsCacheExpiresAt) {
+    return chatwootAgentsCache;
+  }
+
+  const response = await axios.get(
+    getChatwootApiUrl('/agents'),
+    { headers: chatwootHeaders }
+  );
+  const agents = Array.isArray(response.data)
+    ? response.data
+    : response.data?.payload || [];
+
+  chatwootAgentsCache = agents;
+  chatwootAgentsCacheExpiresAt = Date.now() + CHATWOOT_AGENTS_CACHE_TTL_MS;
+
+  return agents;
+}
+
+function buildChatwootMention(agent) {
+  const displayName = String(agent.available_name || agent.name || agent.email)
+    .replace(/[\[\]()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return `[@${displayName}](mention://user/${agent.id}/${encodeURIComponent(displayName)})`;
+}
+
+function getChatwootContactFromResponse(data) {
+  if (Array.isArray(data?.payload)) return data.payload[0] || null;
+  if (data?.payload && typeof data.payload === 'object') return data.payload;
+  return data?.id ? data : null;
+}
+
+async function getOrCreateChatwootIntegrationContact() {
+  if (chatwootIntegrationContactPromise) return chatwootIntegrationContactPromise;
+
+  chatwootIntegrationContactPromise = createOrFindChatwootIntegrationContact();
+
+  try {
+    return await chatwootIntegrationContactPromise;
+  } catch (error) {
+    chatwootIntegrationContactPromise = null;
+    throw error;
+  }
+}
+
+async function createOrFindChatwootIntegrationContact() {
+  const identifier = `redmine-alerts-${CHATWOOT_ACCOUNT_ID}-${CHATWOOT_INBOX_ID}`;
+  const filterResponse = await axios.post(
+    getChatwootApiUrl('/contacts/filter'),
+    {
+      payload: [{
+        attribute_key: 'identifier',
+        filter_operator: 'equal_to',
+        values: [identifier],
+        query_operator: null
+      }]
+    },
+    { headers: chatwootHeaders }
+  );
+
+  let contact = (filterResponse.data?.payload || [])
+    .find(item => item.identifier === identifier);
+
+  if (!contact) {
+    const createResponse = await axios.post(
+      getChatwootApiUrl('/contacts'),
+      {
+        inbox_id: Number(CHATWOOT_INBOX_ID),
+        name: 'Alertas Redmine',
+        identifier
+      },
+      { headers: chatwootHeaders }
+    );
+    contact = getChatwootContactFromResponse(createResponse.data);
+  }
+
+  if (!contact?.id) {
+    throw new Error('Não foi possível localizar ou criar o contato da integração no Chatwoot.');
+  }
+
+  let contactInbox = (contact.contact_inboxes || [])
+    .find(item => String(item.inbox?.id) === String(CHATWOOT_INBOX_ID));
+
+  if (!contactInbox?.source_id) {
+    const sourceId = `redmine-alerts-${CHATWOOT_ACCOUNT_ID}-${CHATWOOT_INBOX_ID}`;
+    const contactInboxResponse = await axios.post(
+      getChatwootApiUrl(`/contacts/${contact.id}/contact_inboxes`),
+      {
+        inbox_id: Number(CHATWOOT_INBOX_ID),
+        source_id: sourceId
+      },
+      { headers: chatwootHeaders }
+    );
+    contactInbox = contactInboxResponse.data;
+  }
+
+  return {
+    id: contact.id,
+    sourceId: contactInbox.source_id
+  };
+}
+
+async function getOrCreateChatwootConversation(agent, integrationContact) {
+  const cached = chatwootConversationCache.get(String(agent.id));
+  if (cached) return cached;
+
+  const response = await axios.get(
+    getChatwootApiUrl(`/contacts/${integrationContact.id}/conversations`),
+    { headers: chatwootHeaders }
+  );
+  const conversations = response.data?.payload || [];
+  const existing = conversations.find(conversation =>
+    String(conversation.inbox_id) === String(CHATWOOT_INBOX_ID) &&
+    (
+      String(conversation.additional_attributes?.redmine_alert_agent_id) === String(agent.id) ||
+      String(conversation.meta?.assignee?.id) === String(agent.id)
+    )
+  );
+
+  if (existing) {
+    chatwootConversationCache.set(String(agent.id), existing);
+    return existing;
+  }
+
+  const createResponse = await axios.post(
+    getChatwootApiUrl('/conversations'),
+    {
+      source_id: integrationContact.sourceId,
+      inbox_id: Number(CHATWOOT_INBOX_ID),
+      contact_id: integrationContact.id,
+      status: 'open',
+      assignee_id: agent.id,
+      additional_attributes: {
+        redmine_alert_agent_id: String(agent.id),
+        redmine_alert_email: agent.email
+      }
+    },
+    { headers: chatwootHeaders }
+  );
+
+  chatwootConversationCache.set(String(agent.id), createResponse.data);
+  return createResponse.data;
+}
+
+async function sendChatwootMessage(conversationId, agent, message) {
+  await axios.post(
+    getChatwootApiUrl(`/conversations/${conversationId}/messages`),
+    {
+      content: `${buildChatwootMention(agent)}\n\n${message}`,
+      message_type: 'outgoing',
+      private: true,
+      content_type: 'text'
+    },
+    { headers: chatwootHeaders }
+  );
+}
+
+async function notifyChatwootTargets(targets, message) {
+  if (!chatwootIsEnabled()) return;
+
+  const configurationError = getChatwootConfigurationError();
+  if (configurationError) {
+    console.error(configurationError);
+    await notifyAttention(
+      'chatwoot_configuration_error',
+      'Configuração incompleta do Chatwoot',
+      configurationError
+    );
+    return;
+  }
+
+  try {
+    const agents = await getChatwootAgents();
+    const integrationContact = await getOrCreateChatwootIntegrationContact();
+    const agentsByEmail = new Map(
+      agents
+        .filter(agent => agent.email)
+        .map(agent => [String(agent.email).trim().toLowerCase(), agent])
+    );
+
+    for (const target of targets) {
+      const email = String(target.email || '').trim().toLowerCase();
+      const agent = agentsByEmail.get(email);
+
+      if (!agent) {
+        console.log(`Chatwoot ignorado, agente não encontrado: ${target.email}`);
+        continue;
+      }
+
+      try {
+        const conversation = await getOrCreateChatwootConversation(
+          agent,
+          integrationContact
+        );
+        await sendChatwootMessage(conversation.id, agent, message);
+        console.log(`Chatwoot enviado para ${target.email}`);
+      } catch (error) {
+        console.error(
+          `Erro ao enviar Chatwoot para ${target.email}:`,
+          error.response?.data || error.message
+        );
+        await notifyAttention(
+          `chatwoot_send_error:${target.email}`,
+          'Erro ao enviar mensagem pelo Chatwoot',
+          { target: target.email, error: error.response?.data || error.message }
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Erro geral no Chatwoot:', error.response?.data || error.message);
+    await notifyAttention(
+      'chatwoot_general_error',
+      'Erro geral no Chatwoot',
+      error.response?.data || error.message
+    );
+  }
+}
+
+async function notifyTargets(targets, message) {
+  await Promise.all([
+    notifyMattermostTargets(targets, message),
+    notifyChatwootTargets(targets, message)
+  ]);
 }
 
 // ---------------------------------------------------------
@@ -3331,6 +3599,8 @@ app.get('/health', (req, res) => {
     whatsapp: getWhatsAppRuntimeStatus(),
     redisConnected: !!redis,
     pollingEnabled: POLLING_ENABLED,
+    chatwootEnabled: chatwootIsEnabled(),
+    chatwootConfigured: !getChatwootConfigurationError(),
     notifyStatuses: NOTIFY_STATUSES,
     meetStatusName: MEET_STATUS_NAME,
     clientSummaryEnabled: CLIENT_SUMMARY_ENABLED,
