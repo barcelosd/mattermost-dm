@@ -1027,7 +1027,7 @@ async function getChatwootAgents() {
   }
 
   const response = await axios.get(
-    getChatwootApiUrl('/agents'),
+    getChatwootApiUrl('/internal_conversations/available_users'),
     { headers: chatwootHeaders }
   );
   const agents = Array.isArray(response.data)
@@ -1051,8 +1051,13 @@ async function getOrCreateChatwootConversation(agent) {
   if (cached) return cached;
 
   const createResponse = await axios.post(
-    getChatwootApiUrl('/internal_conversations/direct'),
-    { user_id: agent.id },
+    getChatwootApiUrl('/internal_conversations'),
+    {
+      internal_conversation: {
+        kind: 'direct',
+        user_id: agent.id
+      }
+    },
     { headers: chatwootHeaders }
   );
   const conversation = getChatwootPayload(createResponse.data);
@@ -1068,7 +1073,14 @@ async function getOrCreateChatwootConversation(agent) {
 async function sendChatwootMessage(conversationId, message) {
   await axios.post(
     getChatwootApiUrl(`/internal_conversations/${conversationId}/messages`),
-    { content: message },
+    {
+      internal_message: {
+        content: message,
+        mentioned_user_ids: [],
+        reply_to_id: null,
+        mentions_everyone: false
+      }
+    },
     { headers: chatwootHeaders }
   );
 }
