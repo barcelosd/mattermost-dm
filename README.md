@@ -8,22 +8,21 @@ O envio ao Chatwoot é adicional: ativá-lo não desativa nem modifica os envios
 Mattermost. Os destinatários são localizados entre os agentes da conta pelo
 e-mail, que deve ser igual ao e-mail do usuário no Redmine.
 
-Crie uma caixa de entrada dedicada aos alertas, dê acesso aos destinatários e
-configure:
+Configure o usuário da integração:
 
 ```env
 CHATWOOT_ENABLED=true
 CHATWOOT_URL=https://chatwoot.exemplo.com
 CHATWOOT_API_ACCESS_TOKEN=token_do_usuario_da_integracao
 CHATWOOT_ACCOUNT_ID=1
-CHATWOOT_INBOX_ID=25
 ```
 
-No primeiro alerta, a integração cria automaticamente um contato técnico e uma
-conversa individual atribuída ao agente encontrado pelo e-mail. Os próximos
-alertas reutilizam essa conversa. Cada alerta é uma nota privada que menciona o
-agente, gerando a notificação no Chatwoot. O token deve pertencer a um usuário
-com acesso à conta e à caixa configuradas, e os agentes notificados precisam ter
-acesso a essa caixa de entrada.
+No primeiro alerta para cada usuário, a integração cria ou recupera
+automaticamente a conversa direta entre o usuário da integração e o agente
+encontrado pelo e-mail. A mensagem aparece em **Chat interno > Direto** e os
+próximos alertas reutilizam a mesma conversa. O token deve pertencer ao usuário
+que será o remetente das notificações e ter acesso à conta configurada.
+
+Não é necessário configurar caixa de entrada, contato nem ID de conversa.
 
 Com `CHATWOOT_ENABLED=false` (valor padrão), nenhuma chamada ao Chatwoot é feita.
