@@ -2,6 +2,20 @@
 
 Integração de alertas do Redmine com Mattermost, Chatwoot e WhatsApp.
 
+## Mattermost
+
+O Mattermost fica desativado por padrão. Para ativá-lo explicitamente:
+
+```env
+MATTERMOST_ENABLED=true
+MATTERMOST_URL=https://mattermost.exemplo.com
+MATTERMOST_TOKEN=token_do_bot
+```
+
+Com `MATTERMOST_ENABLED=false` (ou sem essa variável), nenhuma chamada ao
+Mattermost é realizada. As confirmações e os lembretes enviados pelo WhatsApp
+continuam funcionando de forma independente.
+
 ## Chatwoot
 
 O envio ao Chatwoot é adicional: ativá-lo não desativa nem modifica os envios ao

@@ -36,6 +36,7 @@ const {
 
   MATTERMOST_URL,
   MATTERMOST_TOKEN,
+  MATTERMOST_ENABLED = 'false',
 
   CHATWOOT_ENABLED = 'false',
   CHATWOOT_URL,
@@ -105,6 +106,17 @@ const redmineHeaders = {
 const mattermostHeaders = {
   Authorization: `Bearer ${MATTERMOST_TOKEN}`,
   'Content-Type': 'application/json'
+};
+
+const MATTERMOST_REQUEST_TIMEOUT_MS = 15 * 1000;
+
+function mattermostIsEnabled() {
+  return String(MATTERMOST_ENABLED).toLowerCase() === 'true';
+}
+
+const mattermostRequestConfig = {
+  headers: mattermostHeaders,
+  timeout: MATTERMOST_REQUEST_TIMEOUT_MS
 };
 
 const chatwootHeaders = {
@@ -924,7 +936,7 @@ async function sendWhatsAppText(groupId, text, contextLabel) {
 async function getMattermostBotUser() {
   const response = await axios.get(
     `${MATTERMOST_URL}/api/v4/users/me`,
-    { headers: mattermostHeaders }
+    mattermostRequestConfig
   );
 
   return response.data;
@@ -933,7 +945,7 @@ async function getMattermostBotUser() {
 async function getMattermostUserByEmail(email) {
   const response = await axios.get(
     `${MATTERMOST_URL}/api/v4/users/email/${encodeURIComponent(email)}`,
-    { headers: mattermostHeaders }
+    mattermostRequestConfig
   );
 
   return response.data;
@@ -943,7 +955,7 @@ async function createDirectChannel(botUserId, targetUserId) {
   const response = await axios.post(
     `${MATTERMOST_URL}/api/v4/channels/direct`,
     [botUserId, targetUserId],
-    { headers: mattermostHeaders }
+    mattermostRequestConfig
   );
 
   return response.data;
@@ -956,7 +968,7 @@ async function sendMattermostMessage(channelId, message) {
       channel_id: channelId,
       message
     },
-    { headers: mattermostHeaders }
+    mattermostRequestConfig
   );
 }
 
@@ -1275,13 +1287,15 @@ async function notifyChatwootTargets(targets, message) {
 }
 
 const NOTIFICATION_CHANNELS = [
-  { name: 'mattermost', send: notifyMattermostTargets },
+  { name: 'mattermost', send: notifyMattermostTargets, isEnabled: mattermostIsEnabled },
   { name: 'chatwoot', send: notifyChatwootTargets, isEnabled: chatwootIsEnabled }
 ];
 
 async function notifyTargets(targets, message) {
   await Promise.all(
-    NOTIFICATION_CHANNELS.map(channel => channel.send(targets, message))
+    NOTIFICATION_CHANNELS
+      .filter(channel => !channel.isEnabled || channel.isEnabled())
+      .map(channel => channel.send(targets, message))
   );
 }
 
@@ -3710,6 +3724,7 @@ app.get('/health', (req, res) => {
     whatsapp: getWhatsAppRuntimeStatus(),
     redisConnected: !!redis,
     pollingEnabled: POLLING_ENABLED,
+    mattermostEnabled: mattermostIsEnabled(),
     chatwootEnabled: chatwootIsEnabled(),
     chatwootConfigured: !getChatwootConfigurationError(),
     notifyStatuses: NOTIFY_STATUSES,
@@ -4053,6 +4068,7 @@ app.listen(PORT, () => {
     alertFieldName: ALERT_FIELD_NAME,
     meetStatusName: MEET_STATUS_NAME,
     whatsappAlertMinutesBefore: Number(WHATSAPP_ALERT_MINUTES_BEFORE || 5),
+    mattermostEnabled: mattermostIsEnabled(),
     chatwootEnabled: chatwootIsEnabled(),
     chatwootConfigurationError: chatwootIsEnabled() ? getChatwootConfigurationError() : null,
     dailySummaryEnabled: DAILY_SUMMARY_ENABLED,
