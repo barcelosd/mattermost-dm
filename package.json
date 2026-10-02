@@ -4,7 +4,8 @@
   "description": "Integração Redmine com Mattermost para envio de mensagens diretas",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "test": "node --test"
   },
   "keywords": [
     "redmine",

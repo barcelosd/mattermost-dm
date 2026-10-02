@@ -787,8 +787,11 @@ async function getRedmineGroup(groupId) {
     );
 
     return response.data.group;
-  } catch {
-    return null;
+  } catch (error) {
+    // Apenas 404 significa que o responsável não é um grupo.
+    // Falhas de acesso ou de rede precisam ser tentadas novamente.
+    if (error.response?.status === 404) return null;
+    throw error;
   }
 }
 
@@ -797,58 +800,52 @@ function isRedmineUserActive(user) {
 }
 
 async function getResponsibleTargets(issue) {
-  const assignee = issue.assignee || issue.assigned_to;
+  const assignee = issue.assigned_to || issue.assignee;
 
   if (!assignee) return [];
 
   if (typeof assignee.id === 'string' && assignee.id.includes('@')) {
-    return [
-      {
-        email: assignee.id.trim().toLowerCase(),
-        name: assignee.name || assignee.id
-      }
-    ];
+    return [{
+      email: assignee.id.trim().toLowerCase(),
+      name: assignee.name || assignee.id
+    }];
   }
 
-  // Tentar primeiro como GRUPO para evitar conflito de IDs baixos de usuários
   const group = await getRedmineGroup(assignee.id);
+  let users;
 
-  if (group && group.users && group.users.length > 0) {
-    const users = await Promise.all(
-      group.users.map(async gUser => {
-        try {
-          const fullUser = await getRedmineUser(gUser.id);
-  
-          if (isRedmineUserActive(fullUser)) {
-            return {
-              email: fullUser.mail.toLowerCase(),
-              name: `${fullUser.firstname} ${fullUser.lastname}`.trim()
-            };
-          }
-        } catch {}
-  
-        return null;
-      })
-    );
-  
-    return users.filter(Boolean);
+  if (group) {
+    if (!Array.isArray(group.users)) {
+      throw new Error(`Grupo #${assignee.id}: a consulta não retornou os membros.`);
+    }
+
+    // Não descartar membros cuja consulta falhou: isso concluiria o envio
+    // do grupo sem avisar todos. O chamador mantém o evento para nova tentativa.
+    users = await Promise.all(group.users.map(async member => {
+      try {
+        return member.mail ? member : await getRedmineUser(member.id);
+      } catch (error) {
+        throw new Error(
+          `Erro ao consultar membro #${member.id} do grupo #${assignee.id}: ${describeError(error)}`
+        );
+      }
+    }));
+  } else {
+    users = [await getRedmineUser(assignee.id)];
   }
 
-  // Se não for um grupo válido com usuários, tenta tratar como usuário único
-  try {
-    const user = await getRedmineUser(assignee.id);
+  const targets = new Map();
+  for (const user of users) {
+    if (!isRedmineUserActive(user)) continue;
+    const email = user.mail.trim().toLowerCase();
+    if (!email) continue;
+    targets.set(email, {
+      email,
+      name: [user.firstname, user.lastname].filter(Boolean).join(' ') || user.name || email
+    });
+  }
 
-    if (isRedmineUserActive(user)) {
-      return [
-        {
-          email: user.mail.toLowerCase(),
-          name: `${user.firstname} ${user.lastname}`.trim()
-        }
-      ];
-    }
-  } catch {}
-
-  return [];
+  return [...targets.values()];
 }
 
 async function getWhatsAppGroupId(issue) {
@@ -1536,7 +1533,18 @@ async function checkAppointmentAlert(issue, preferredDate = null, stats = null) 
         return;
       }
 
-      const targets = await getResponsibleTargets(issue);
+      let targets;
+      try {
+        targets = await getResponsibleTargets(issue);
+      } catch (error) {
+        incrementAlertStat(stats, 'pendingRetry');
+        await notifyAttention(
+          `appointment_responsible_error:${issue.id}`,
+          'Erro ao consultar responsáveis pelo compromisso',
+          { issueId: issue.id, error: describeError(error) }
+        );
+        return;
+      }
 
       if (!targets.length) {
         console.log(`Tarefa #${issue.id} sem responsável ativo para alerta.`);

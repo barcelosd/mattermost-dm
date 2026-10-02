@@ -47,6 +47,12 @@ Com `CHATWOOT_ENABLED=false` (valor padrão), nenhuma chamada ao Chatwoot é fei
 - Lembretes de compromissos em **Aguardando Data** (padrão: 10 e 2 minutos antes).
 - Resumo de compromissos do próximo dia útil (padrão: 17h45, dias úteis).
 
+Quando a tarefa está atribuída a um grupo do Redmine, os alertas de 10 e 2
+minutos e o resumo do próximo dia útil são enviados individualmente a todos os
+membros ativos com e-mail cadastrado. A integração precisa de acesso à consulta
+do grupo e de seus usuários. Falhas nessas consultas mantêm o envio pendente
+para nova tentativa e geram uma notificação de erro.
+
 Cada entrega é registrada por canal e por destinatário. Se o Chatwoot falhar, a
 próxima execução tenta de novo só o que faltou, sem repetir o Mattermost. O
 resumo diário é tentado a cada minuto durante `DAILY_SUMMARY_RETRY_MINUTES`
