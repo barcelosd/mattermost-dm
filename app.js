@@ -1801,6 +1801,11 @@ async function processGoogleMeet(issue) {
     eventId = event?.id || null;
   }
 
+  // Só cria um novo agendamento se o campo Google Meet estiver em branco.
+  if (!eventId && String(getCustomFieldValue(issue, 'Google Meet') ?? '').trim()) {
+    return;
+  }
+
   if (eventId && oldSignature === signature) {
     const meetLink = await redisGet(`redmine:meet:link:${issue.id}`);
 
