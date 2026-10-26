@@ -185,3 +185,38 @@ Execute `npm test`. Os testes Q-Desk iniciam apenas um servidor local em
 inicializar `app.js`. Cobrem autenticação, parser, regra, consulta do estado,
 simulação, POST real simulado, concorrência, deduplicação e falhas. A validação
 com o Redis e os payloads reais de produção permanece uma etapa de homologação.
+
+### Supressão de consultas repetidas
+
+O hash dos eventos usa serialização estável: a ordem das chaves dos objetos
+não muda a identidade do evento; a ordem dos arrays é preservada.
+
+Após GET válido, estados com time fora da origem, grupo válido e `updated_at`
+numérico positivo ficam no Redis por uma janela de até 2 segundos contada do
+início da consulta. Consultas mais lentas que essa janela não criam cache.
+O registro contém somente IDs de time/grupo, versão e horários técnicos.
+Eventos repetidos não renovam a janela. A ordem observada pode ser atualizada,
+mas conserva o instante inicial e usa somente o prazo restante.
+
+A resposta `recent_confirmed_state` indica que o GET foi suprimido. Isso exige
+metadados completos iguais ao estado confirmado, versão não anterior à versão
+confirmada ou à última observada, e `changed_attributes` válido. A lista de
+alterações pode estar vazia somente para a mesma versão confirmada. Alterações
+de `status` ou `priority` podem ser reutilizadas se o delta incluir valores
+anterior/atual e o valor atual corresponder ao campo do evento. Outros atributos
+exigem GET por precaução, inclusive mudanças de time/grupo e campos desconhecidos.
+
+Eventos novos indicando time 129 sempre consultam a API, assim como eventos
+atrasados, inconsistentes ou incompletos. Reentregas de eventos idênticos já
+concluídos continuam seguindo a deduplicação de 24 horas. Eventos apenas
+suprimidos não recebem esse marcador: após a janela voltam a consultar.
+O retorno 151 → 129 não é bloqueado pelo cache; nenhum POST usa estado em cache.
+Antes de nova consulta, o cache anterior é invalidado, inclusive se a API falhar.
+O bloqueio por conversa também protege a leitura e atualização desse cache.
+Não foram acrescentadas variáveis de ambiente nem alterados os modos dry-run/real.
+
+A otimização não garante detectar uma alteração cujo evento nunca seja entregue.
+Um evento fora da origem compatível com estado recente pode ser suprimido antes
+da chegada do evento de retorno; o evento de retorno deve ser entregue para
+acionar imediatamente a avaliação. Sem dados/versionamento suficientes, o módulo
+prefere consultar a API.

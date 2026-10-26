@@ -9,7 +9,7 @@ const current = (team = 129, group = 200) => ({
   id: 42, account_id: 15,
   meta: { team: { id: team }, sender: { company: { group_company: { id: group } } } }
 });
-async function harness(t, { env = {}, conversation = current(), redisMissing = false } = {}) {
+async function harness(t, { env = {}, conversation = current(), redisMissing = false, now = Date.now } = {}) {
   const values = new Map();
   const logs = [];
   const calls = [];
@@ -20,6 +20,7 @@ async function harness(t, { env = {}, conversation = current(), redisMissing = f
       return 'OK';
     },
     async get(key) { return values.get(key) ?? null; },
+    async del(key) { return values.delete(key); },
     async eval(script, count, key, owner) {
       if (values.get(key) === owner) values.delete(key);
     }
@@ -30,7 +31,7 @@ async function harness(t, { env = {}, conversation = current(), redisMissing = f
   };
   const app = express();
   app.use('/qdesk/webhook', createQdeskRouter({
-    redis: redisMissing ? null : redis, http,
+    redis: redisMissing ? null : redis, http, now,
     env: { QDESK_ENABLED: 'true', QDESK_WEBHOOK_SECRET: secret, QDESK_API_ACCESS_TOKEN: 'private-api-token', ...env },
     logger: { info: (...args) => logs.push(args) }
   }));
@@ -225,3 +226,184 @@ for (const [team, group] of [[129, 175], [151, 200], [129, null]]) {
     assert.deepEqual(h.calls.map(call => call.method), ['get']);
   });
 }
+
+const confirmedOutside = () => ({ ...current(151, 176), updated_at: 100 });
+const outsideEvent = (changes = {}) => ({
+  event: 'conversation_updated', id: 42, meta: current(151, 176).meta,
+  updated_at: 100, changed_attributes: [], ...changes
+});
+
+test('serialização estável deduplica objetos e objetos dentro de arrays com chaves reordenadas', async t => {
+  const h = await harness(t);
+  const first = { ...event, changed_attributes: [{ priority: { current_value: 1, previous_value: 0 } }] };
+  const reordered = { changed_attributes: [{ priority: { previous_value: 0, current_value: 1 } }], account: { id: 15 }, id: 42, event: 'conversation_updated' };
+  await h.send(first);
+  assert.equal((await h.send(reordered)).body.status, 'duplicate');
+  assert.equal(h.calls.length, 1);
+});
+
+test('estado confirmado suprime eventos equivalentes por 2 segundos sem renovar janela', async t => {
+  let clock = 10000;
+  const h = await harness(t, { conversation: confirmedOutside(), now: () => clock });
+  await h.send(outsideEvent({ messages: [{ id: 1 }] }));
+  const key = [...h.values.keys()].find(key => key.includes(':state:'));
+  const original = h.values.get(key);
+  clock += 1000;
+  const second = outsideEvent({ messages: [{ id: 2 }] });
+  assert.equal((await h.send(second)).body.decision, 'recent_confirmed_state');
+  assert.equal(h.values.get(key), original);
+  assert.equal(h.calls.length, 1);
+  clock += 999;
+  assert.equal((await h.send(second)).body.decision, 'recent_confirmed_state');
+  clock += 1;
+  assert.equal((await h.send(second)).body.decision, 'no_change');
+  assert.equal(h.calls.length, 2);
+});
+
+test('nova versão com mudança conhecida irrelevante e consistente reutiliza estado', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  await h.send(outsideEvent());
+  assert.equal((await h.send(outsideEvent({ updated_at: 101, status: 'open',
+    changed_attributes: [{ status: { previous_value: 'pending', current_value: 'open' } }] }))).body.decision,
+  'recent_confirmed_state');
+  assert.equal(h.calls.length, 1);
+});
+
+for (const [name, changes] of [
+  ['time 129', { meta: current(129, 176).meta }],
+  ['troca de time', { changed_attributes: [{ team_id: { previous_value: 129, current_value: 151 } }] }],
+  ['troca de grupo', { changed_attributes: [{ group_company: { previous_value: 175, current_value: 176 } }] }],
+  ['grupo diferente', { meta: current(151, 177).meta }],
+  ['metadados ausentes', { meta: {} }],
+  ['grupo inválido', { meta: current(151, true).meta }],
+  ['versão ausente', { updated_at: null }],
+  ['versão antiga', { updated_at: 99 }],
+  ['nova versão sem alterações', { updated_at: 101 }],
+  ['alterações ausentes', { changed_attributes: null }],
+  ['alterações inválidas', { changed_attributes: [null] }],
+  ['atributo desconhecido', { changed_attributes: [{ custom_attributes: {} }] }],
+  ['status contraditório', { status: 'open', changed_attributes: [{ status: { current_value: 'pending', previous_value: 'open' } }] }],
+  ['delta incompleto', { status: 'open', changed_attributes: [{ status: { current_value: 'open' } }] }]
+]) {
+  test(`${name} exige nova consulta mesmo com cache recente`, async t => {
+    const h = await harness(t, { conversation: confirmedOutside() });
+    await h.send(outsideEvent());
+    await h.send(outsideEvent({ marker: 'different', ...changes }));
+    assert.equal(h.calls.filter(call => call.method === 'get').length, 2);
+  });
+}
+
+test('retorno 151 → 129 transfere mesmo dentro da janela e não usa evento atrasado para transferir de novo', async t => {
+  const c = confirmedOutside();
+  const h = await harness(t, { conversation: c, env: { QDESK_DRY_RUN: 'false' } });
+  await h.send(outsideEvent());
+  c.meta = current(129, 176).meta;
+  c.updated_at = 102;
+  assert.equal((await h.send(outsideEvent({ meta: c.meta, updated_at: 102 }))).body.decision, 'transferred');
+  c.meta = current(151, 176).meta;
+  c.updated_at = 103;
+  // Um evento antigo consulta o estado atual; nunca atribui com base no payload antigo.
+  await h.send(outsideEvent({ meta: current(129, 176).meta, updated_at: 101 }));
+  assert.equal(h.calls.filter(call => call.method === 'post').length, 1);
+  assert.equal(h.calls.filter(call => call.method === 'get').length, 3);
+});
+
+test('evento atrasado fora do time de origem ainda detecta estado atual elegível', async t => {
+  const c = confirmedOutside();
+  const h = await harness(t, { conversation: c, env: { QDESK_DRY_RUN: 'false' } });
+  await h.send(outsideEvent());
+  c.meta = current(129, 176).meta;
+  c.updated_at = 102;
+  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).body.decision, 'transferred');
+  assert.equal(h.calls.filter(call => call.method === 'post').length, 1);
+});
+
+test('falha de API invalida cache anterior e permite nova tentativa', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  await h.send(outsideEvent());
+  const get = h.http.get;
+  h.http.get = async () => { throw new Error('API unavailable'); };
+  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).status, 503);
+  assert.equal([...h.values.keys()].some(key => key.includes(':state:')), false);
+  h.http.get = get;
+  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).body.decision, 'no_change');
+  assert.equal(h.calls.length, 2);
+});
+
+test('cache malformado consulta API; falha na leitura Redis não consulta nem transfere', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  h.values.set('qdesk:15:42:state:dry', '{');
+  await h.send(outsideEvent());
+  assert.equal(h.calls.length, 1);
+  const get = h.redis.get;
+  h.redis.get = async key => { if (key.includes(':state:')) throw new Error('Redis failure'); return get(key); };
+  assert.equal((await h.send(outsideEvent({ messages: [2] }))).status, 503);
+  assert.equal(h.calls.length, 1);
+});
+
+test('falha na gravação do cache não marca evento; repetição tenta novamente', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  const set = h.redis.set;
+  h.redis.set = async (key, ...args) => { if (key.includes(':state:')) throw new Error('Redis failure'); return set(key, ...args); };
+  assert.equal((await h.send(outsideEvent())).status, 503);
+  assert.equal([...h.values.keys()].some(key => key.includes(':event:')), false);
+  h.redis.set = set;
+  assert.equal((await h.send(outsideEvent())).status, 200);
+  assert.equal(h.calls.length, 2);
+});
+
+test('consulta lenta não cria janela baseada em estado antigo', async t => {
+  let clock = 10000;
+  const h = await harness(t, { conversation: confirmedOutside(), now: () => clock });
+  h.http.get = async () => { clock += 2001; return { data: confirmedOutside() }; };
+  await h.send(outsideEvent());
+  assert.equal([...h.values.keys()].some(key => key.includes(':state:')), false);
+});
+
+test('versão intermediária atrasada consulta API sem estender a janela de supressão', async t => {
+  let clock = 10000;
+  const h = await harness(t, { conversation: confirmedOutside(), now: () => clock });
+  const writes = [];
+  const set = h.redis.set;
+  h.redis.set = async (key, value, ...args) => {
+    if (key.includes(':state:')) writes.push({ value: JSON.parse(value), args });
+    return set(key, value, ...args);
+  };
+  await h.send(outsideEvent());
+  clock += 1000;
+  const newer = outsideEvent({ updated_at: 102, priority: 1,
+    changed_attributes: [{ priority: { previous_value: 0, current_value: 1 } }] });
+  assert.equal((await h.send(newer)).body.decision, 'recent_confirmed_state');
+  assert.equal(writes[1].value.confirmedAt, 10000);
+  assert.deepEqual(writes[1].args, ['PX', 1000]);
+  assert.equal((await h.send({ ...newer, updated_at: 101 })).body.decision, 'no_change');
+  assert.equal(h.calls.length, 2);
+});
+
+test('eventos concorrentes com estado fora da origem mantêm bloqueio; sequência posterior usa cache', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  let enter;
+  let release;
+  const ready = new Promise(resolve => { enter = resolve; });
+  const get = h.http.get;
+  h.http.get = async (...args) => {
+    enter();
+    await new Promise(resolve => { release = resolve; });
+    return get(...args);
+  };
+  const first = h.send(outsideEvent());
+  await ready;
+  const next = outsideEvent({ messages: [2] });
+  assert.equal((await h.send(next)).body.status, 'busy');
+  release();
+  assert.equal((await first).body.decision, 'no_change');
+  assert.equal((await h.send(next)).body.decision, 'recent_confirmed_state');
+  assert.equal(h.calls.length, 1);
+});
+
+test('falha ao invalidar estado Redis impede consulta e transferência', async t => {
+  const h = await harness(t, { env: { QDESK_DRY_RUN: 'false' } });
+  h.redis.del = async () => { throw new Error('Redis failure'); };
+  assert.equal((await h.send()).status, 503);
+  assert.equal(h.calls.length, 0);
+});

@@ -6,6 +6,49 @@ const EVENTS = new Set(['conversation_created', 'conversation_updated']);
 const RELEASE_LOCK = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 const LOCK_SECONDS = 60;
 const DEDUP_SECONDS = 86400;
+const STATE_WINDOW_MS = 2000;
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function version(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (!/^\d+(\.\d+)?$/.test(String(value))) return null;
+  const result = Number(value);
+  return Number.isFinite(result) && result > 0 ? result : null;
+}
+
+function canSuppress(body, cached, source, now) {
+  if (!cached || !positiveId(cached.team) || !positiveId(cached.group) ||
+      !Number.isFinite(cached.confirmedAt) || now < cached.confirmedAt ||
+      now - cached.confirmedAt >= STATE_WINDOW_MS) return false;
+  const team = positiveId(body.meta?.team?.id);
+  const group = positiveId(body.meta?.sender?.company?.group_company?.id);
+  const eventVersion = version(body.updated_at);
+  const confirmedVersion = version(cached.version);
+  if (!team || !group || team === source || team !== cached.team || group !== cached.group ||
+      !eventVersion || !confirmedVersion || eventVersion < confirmedVersion ||
+      eventVersion < (version(cached.lastEventVersion) || confirmedVersion)) return false;
+  // Somente atributos explicitamente conhecidos como irrelevantes podem reutilizar estado.
+  const safeAttributes = new Set(['status', 'priority']);
+  if (!Array.isArray(body.changed_attributes)) return false;
+  if (eventVersion > confirmedVersion && body.changed_attributes.length === 0) return false;
+  return body.changed_attributes.every(change => {
+    if (!change || typeof change !== 'object' || Array.isArray(change)) return false;
+    const keys = Object.keys(change);
+    return keys.length > 0 && keys.every(key => {
+      const delta = change[key];
+      return safeAttributes.has(key) && delta && typeof delta === 'object' && !Array.isArray(delta) &&
+        Object.hasOwn(delta, 'current_value') && Object.hasOwn(delta, 'previous_value') &&
+        Object.hasOwn(body, key) && delta.current_value === body[key];
+    });
+  });
+}
 
 function positiveId(value) {
   if (typeof value !== 'number' && typeof value !== 'string') return null;
@@ -68,7 +111,7 @@ function identifyEvent(body, authenticatedAccount) {
   return { account: authenticatedAccount, conversation, event: body.event };
 }
 
-function createQdeskRouter({ redis, env = process.env, http = axios, logger = console } = {}) {
+function createQdeskRouter({ redis, env = process.env, http = axios, logger = console, now = Date.now } = {}) {
   const router = express.Router();
   const config = configuration(env);
   const log = details => logger.info('[qdesk]', details);
@@ -91,9 +134,10 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
 
     const context = { account: identity.account, conversation: identity.conversation, event: identity.event, dryRun: config.dryRun };
     const base = `qdesk:${config.account}:${identity.conversation}`;
-    const fingerprint = createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
+    const fingerprint = createHash('sha256').update(stableJson(req.body)).digest('hex');
     const eventKey = `${base}:event:${config.dryRun ? 'dry' : 'live'}:${fingerprint}`;
     const lockKey = `${base}:lock`;
+    const stateKey = `${base}:state:${config.dryRun ? 'dry' : 'live'}`;
     const owner = randomUUID();
     let locked = false;
     let phase = 'redis';
@@ -102,12 +146,31 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       if (!locked) return res.status(503).json({ status: 'busy', retryable: true });
       if (await redis.get(eventKey)) return res.status(200).json({ status: 'duplicate' });
 
+      let cached;
+      const stored = await redis.get(stateKey);
+      try { cached = stored ? JSON.parse(stored) : null; } catch { cached = null; }
+      if (canSuppress(req.body, cached, config.source, now())) {
+        // Atualiza somente a ordem observada, conservando o prazo original da janela.
+        if (version(req.body.updated_at) > (version(cached.lastEventVersion) || cached.version)) {
+          const remaining = STATE_WINDOW_MS - (now() - cached.confirmedAt);
+          if (remaining <= 0) throw new Error('state_window_expired');
+          await redis.set(stateKey, JSON.stringify({ ...cached, lastEventVersion: version(req.body.updated_at) }),
+            'PX', remaining);
+        }
+        // Não marca evento: a supressão não pode persistir além da janela original.
+        log({ ...context, decision: 'recent_confirmed_state', team: cached.team, group: cached.group });
+        return res.status(200).json({ status: 'processed', decision: 'recent_confirmed_state' });
+      }
+      // Remove estado anterior antes de qualquer consulta ou transferência, inclusive em falhas.
+      await redis.del(stateKey);
+
       const api = `${config.url}/api/v1/accounts/${config.account}/conversations/${identity.conversation}`;
       const options = {
         headers: { api_access_token: config.token, 'Content-Type': 'application/json' },
         timeout: 10000, maxRedirects: 0, maxContentLength: 2 * 1024 * 1024
       };
       phase = 'read_conversation';
+      const confirmedAt = now();
       const { data: conversation } = await http.get(api, options);
       if (!conversation || positiveId(conversation.id) !== identity.conversation ||
           (conversation.account_id !== undefined && positiveId(conversation.account_id) !== config.account) ||
@@ -124,6 +187,13 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
         phase = 'assign';
         await http.post(`${api}/assignments`, { team_id: config.target }, options);
         decision = 'transferred';
+      }
+      if (team && group && team !== config.source && version(conversation.updated_at) &&
+          now() - confirmedAt < STATE_WINDOW_MS) {
+        phase = 'cache_state';
+        await redis.set(stateKey, JSON.stringify({ team, group, version: version(conversation.updated_at),
+          lastEventVersion: Math.max(version(conversation.updated_at), version(req.body.updated_at) || 0), confirmedAt }),
+          'PX', STATE_WINDOW_MS);
       }
       log({ ...context, decision, team, group });
       // Dados ausentes podem ser enriquecidos antes de uma reentrega do mesmo evento.
