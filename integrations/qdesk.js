@@ -56,13 +56,16 @@ function structure(body) {
 }
 
 // Adaptador explícito para eventos de conversa. Formatos desconhecidos nunca acionam a API.
-function identifyEvent(body) {
+function identifyEvent(body, authenticatedAccount) {
   if (!body || typeof body !== 'object' || Array.isArray(body) || !EVENTS.has(body.event)) return null;
-  const account = positiveId(body.account?.id ?? body.account_id);
   const conversation = positiveId(body.id);
-  if (!account || !conversation) return null;
-  if (body.account_id !== undefined && positiveId(body.account_id) !== account) return null;
-  return { account, conversation, event: body.event };
+  if (!conversation) return null;
+  // Executado somente após autenticar o segredo deste endpoint/conta.
+  // Nenhum identificador do payload pode escolher a conta usada na API.
+  for (const explicitAccount of [body.account?.id, body.account_id]) {
+    if (explicitAccount !== undefined && positiveId(explicitAccount) !== authenticatedAccount) return null;
+  }
+  return { account: authenticatedAccount, conversation, event: body.event };
 }
 
 function createQdeskRouter({ redis, env = process.env, http = axios, logger = console } = {}) {
@@ -80,12 +83,11 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
     if (!req.is('application/json')) return res.status(415).json({ status: 'json_required' });
     return next();
   }, express.json({ limit: '256kb', strict: true }), async (req, res) => {
-    const identity = identifyEvent(req.body);
+    const identity = identifyEvent(req.body, config.account);
     if (!identity) {
       log({ decision: 'unsupported_event_shape', structure: structure(req.body) });
       return res.status(200).json({ status: 'ignored', reason: 'unsupported_event_shape' });
     }
-    if (identity.account !== config.account) return res.status(200).json({ status: 'ignored', reason: 'other_account' });
 
     const context = { account: identity.account, conversation: identity.conversation, event: identity.event, dryRun: config.dryRun };
     const base = `qdesk:${config.account}:${identity.conversation}`;

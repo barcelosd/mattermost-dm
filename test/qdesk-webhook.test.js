@@ -169,3 +169,59 @@ test('um novo evento pode reaplicar regra após retorno ao time de origem', asyn
   await h.send({ ...event, updated_at: 2 });
   assert.equal(h.calls.filter(c => c.method === 'post').length, 2);
 });
+
+for (const eventName of ['conversation_created', 'conversation_updated']) {
+  test(`${eventName} sem conta no topo usa contexto autenticado e permanece em dry-run`, async t => {
+    const conversation = current();
+    delete conversation.account_id;
+    const h = await harness(t, { conversation });
+    const body = { event: eventName, id: 42, inbox_id: 7, messages: [{ account_id: 999 }] };
+    assert.equal((await h.send(body)).body.decision, 'would_transfer');
+    assert.equal((await h.send(body)).body.status, 'duplicate');
+    assert.deepEqual(h.calls.map(call => call.method), ['get']);
+    assert.equal(h.calls[0].url, 'https://suporte.questor.com.br/api/v1/accounts/15/conversations/42');
+    assert.equal(h.calls[0].options.headers.api_access_token, 'private-api-token');
+  });
+}
+
+test('evento sem conta não consulta API sem autenticação válida', async t => {
+  const h = await harness(t);
+  assert.equal((await h.send({ event: 'conversation_updated', id: 42 }, { token: 'wrong' })).status, 401);
+  assert.equal(h.calls.length, 0);
+});
+
+for (const explicit of [
+  { account_id: 16 }, { account: { id: 16 } },
+  { account: { id: 16 }, account_id: 15 }, { account: { id: 15 }, account_id: 16 },
+  { account_id: null }, { account: { id: 'invalid' } }
+]) {
+  test(`conta explícita divergente ou inválida não usa fallback: ${JSON.stringify(explicit)}`, async t => {
+    const h = await harness(t);
+    assert.equal((await h.send({ event: 'conversation_updated', id: 42, ...explicit })).body.status, 'ignored');
+    assert.equal(h.calls.length, 0);
+  });
+}
+
+for (const response of [{ ...current(), account_id: 16 }, { ...current(), account: { id: 16 } }, { ...current(), id: 99 }]) {
+  test(`evento sem conta rejeita resposta de API divergente: ${JSON.stringify({ id: response.id, account_id: response.account_id, account: response.account })}`, async t => {
+    const h = await harness(t, { conversation: response, env: { QDESK_DRY_RUN: 'false' } });
+    assert.equal((await h.send({ event: 'conversation_updated', id: 42 })).status, 503);
+    assert.deepEqual(h.calls.map(call => call.method), ['get']);
+    assert.equal([...h.values.keys()].some(key => key.includes(':event:')), false);
+  });
+}
+
+test('conversa sem acesso pela API não é processada nem marcada', async t => {
+  const h = await harness(t);
+  h.http.get = async () => { throw Object.assign(new Error('not found'), { response: { status: 404 } }); };
+  assert.equal((await h.send({ event: 'conversation_updated', id: 42 })).status, 503);
+  assert.equal(h.values.size, 0);
+});
+
+for (const [team, group] of [[129, 175], [151, 200], [129, null]]) {
+  test(`evento sem conta preserva regra sem transferência: time=${team}, grupo=${group}`, async t => {
+    const h = await harness(t, { conversation: current(team, group), env: { QDESK_DRY_RUN: 'false' } });
+    assert.equal((await h.send({ event: 'conversation_updated', id: 42 })).status, 200);
+    assert.deepEqual(h.calls.map(call => call.method), ['get']);
+  });
+}

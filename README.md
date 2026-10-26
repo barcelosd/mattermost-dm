@@ -114,9 +114,15 @@ Somente `QDESK_DRY_RUN=false` habilita POSTs; o padrão é simulação.
    com segredo na URL depende somente do envio à URL cadastrada. Verifique no
    primeiro evento real se o Q-Desk preserva a query string.
 4. Gere um evento real. O adaptador inicial aceita apenas eventos de conversa
-   com `event`, ID de conversa em `id`, e conta em `account.id` ou `account_id`.
-   Isso é um contrato explícito a confirmar, não uma suposição validada sobre
-   o fork Q-Desk. Formatos diferentes recebem `200 ignored` e geram diagnóstico
+   com `event` e ID de conversa em `id`. A conta vem de `QDESK_ACCOUNT_ID`,
+   vinculada ao segredo autenticado deste endpoint. Use um segredo exclusivo
+   para a conta 15. `account.id` e `account_id` são opcionais no evento;
+   quando presentes, ambos precisam ser válidos e corresponder à conta configurada.
+   A conversa é consultada exclusivamente na URL da conta configurada, com o
+   token da integração. Seu ID e quaisquer IDs de conta retornados pela API
+   são validados antes de avaliar a regra. Campos de mensagens ou contas
+   aninhadas não são usados para escolher outra conta. Confirme os campos
+   personalizados do fork Q-Desk no evento real. Formatos diferentes recebem `200 ignored` e geram diagnóstico
    `unsupported_event_shape`; não são convertidos automaticamente nem acionam
    a API. Nesses casos, ajuste o adaptador com base na estrutura real antes de
    habilitar transferências.
@@ -151,7 +157,7 @@ Redis. Simulação e execução real usam marcadores separados.
 Falhas não marcam sucesso. Bloqueio ocupado, Redis indisponível, falhas de API
 ou perda do bloqueio respondem `503`; autenticação inválida responde `401`,
 JSON inválido `400`, tipo de conteúdo incorreto `415` e excesso de corpo `413`.
-Eventos de outra conta ou desconhecidos respondem `200 ignored`.
+Eventos com conta explícita divergente/inválida ou desconhecidos respondem `200 ignored`.
 Não há fila persistente neste módulo: confirme a política de reentrega do
 Q-Desk. Se ele não repetir `503`, será necessário reenvio operacional ou uma
 fila antes de exigir entrega garantida. Nunca se inicia trabalho em background
