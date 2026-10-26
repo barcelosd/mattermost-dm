@@ -64,3 +64,118 @@ conversas internas.
 
 Diagnóstico: `GET /debug-chatwoot?email=usuario@empresa.com` mostra se o
 Chatwoot está ativo, se o agente foi encontrado e qual conversa será usada.
+
+## Q-Desk — distribuição de conversas
+
+O endpoint `POST /qdesk/webhook` é independente das notificações `CHATWOOT_*`.
+Consulta `GET /api/v1/accounts/15/conversations/{id}` e só transfere quando o
+estado **atual** tiver `meta.team.id = 129` e um ID de grupo válido em
+`meta.sender.company.group_company.id`, diferente de `175`. Campos ausentes,
+nulos ou inválidos não causam transferência. O único body enviado a
+`POST .../assignments` é `{"team_id":151}`.
+
+### Variáveis no Render
+
+```env
+QDESK_ENABLED=false
+QDESK_DRY_RUN=true
+QDESK_URL=https://suporte.questor.com.br
+QDESK_API_ACCESS_TOKEN=
+QDESK_ACCOUNT_ID=15
+QDESK_SOURCE_TEAM_ID=129
+QDESK_GENERAL_GROUP_ID=175
+QDESK_TARGET_TEAM_ID=151
+QDESK_WEBHOOK_SECRET=
+# Usar a conexão Redis já existente, se disponível:
+REDIS_URL=redis://...
+```
+
+O token precisa consultar e atribuir conversas da conta configurada. O segredo
+recebido pelo webhook é independente do token da API: gere um valor aleatório de
+pelo menos 32 bytes, por exemplo com `openssl rand -hex 32`. Não publique esses
+valores. Redis é obrigatório para esta integração; não há fallback em memória.
+Configuração incompleta ou integração desabilitada responde `503`, sem afetar
+as rotinas existentes. Apenas `QDESK_ENABLED=true` habilita o processamento.
+Somente `QDESK_DRY_RUN=false` habilita POSTs; o padrão é simulação.
+
+### Configurar e validar o webhook
+
+1. Após publicação autorizada, configure as variáveis e mantenha
+   `QDESK_DRY_RUN=true`. Ative `QDESK_ENABLED=true` para receber testes.
+2. Na conta 15 do Q-Desk, procure **Configurações → Integrações → Webhooks**.
+   Cadastre a URL pública real do serviço Render:
+   `https://<dominio-do-servico>/qdesk/webhook?secret=<segredo>`.
+   O parâmetro deve ser codificado como componente de URL. Se a instalação
+   permitir cabeçalhos personalizados, prefira a URL sem query e
+   `Authorization: Bearer <segredo>`.
+3. Selecione `conversation_created` e `conversation_updated`, caso disponíveis.
+   Não cadastre todos os eventos. Não foi confirmado suporte a assinatura HMAC
+   na instalação Q-Desk 4.9.1; o módulo não presume esse suporte. A alternativa
+   com segredo na URL depende somente do envio à URL cadastrada. Verifique no
+   primeiro evento real se o Q-Desk preserva a query string.
+4. Gere um evento real. O adaptador inicial aceita apenas eventos de conversa
+   com `event`, ID de conversa em `id`, e conta em `account.id` ou `account_id`.
+   Isso é um contrato explícito a confirmar, não uma suposição validada sobre
+   o fork Q-Desk. Formatos diferentes recebem `200 ignored` e geram diagnóstico
+   `unsupported_event_shape`; não são convertidos automaticamente nem acionam
+   a API. Nesses casos, ajuste o adaptador com base na estrutura real antes de
+   habilitar transferências.
+5. O diagnóstico registra somente tipos/presença de caminhos conhecidos, nunca
+   conteúdo de mensagens, nomes, e-mails, tokens ou chaves arbitrárias do JSON.
+   Para eventos reconhecidos, os logs contêm IDs técnicos de conta/conversa,
+   time/grupo, evento, modo e decisão. Resposta da API fora do contrato
+   (`id`, `meta.team.id`, `meta.sender.company.group_company.id`) não autoriza
+   transferência; ID divergente gera falha, e metadados ausentes geram
+   `missing_team_or_group`. Valide também esse retorno real.
+6. Em simulação, confirme `would_transfer` para grupo diferente de 175 e time
+   129; `no_change` para grupo 175 ou outro time. Não há POST em simulação.
+   Somente depois da validação e autorização altere `QDESK_DRY_RUN=false`.
+
+O módulo nunca registra a URL recebida. Porém, segredo em query pode aparecer
+em logs do proxy/Render e na tela de configuração do Q-Desk: restrinja acesso e
+configure ocultação da query nesses serviços; prefira Bearer quando disponível.
+HTTPS é obrigatório para a API. Redirecionamentos da API são recusados para não
+encaminhar credenciais a outro destino. O webhook limita JSON a 256 KiB e
+valida autenticação antes de interpretar o corpo. Proteção adicional contra
+volume abusivo pode ser configurada no proxy, conforme a infraestrutura real.
+
+### Redis, repetição e falhas
+
+Chaves usam exclusivamente `qdesk:`. Cada conversa possui bloqueio atômico
+`SET NX EX` de 60 segundos, liberado via Lua somente pelo proprietário.
+As chamadas à API têm timeout de 10 segundos cada; o bloqueio é revalidado antes
+do POST. Eventos concluídos com time/grupo válidos são identificados pelo hash
+SHA-256 do JSON recebido e deduplicados por 24 horas. O corpo não é salvo no
+Redis. Simulação e execução real usam marcadores separados.
+
+Falhas não marcam sucesso. Bloqueio ocupado, Redis indisponível, falhas de API
+ou perda do bloqueio respondem `503`; autenticação inválida responde `401`,
+JSON inválido `400`, tipo de conteúdo incorreto `415` e excesso de corpo `413`.
+Eventos de outra conta ou desconhecidos respondem `200 ignored`.
+Não há fila persistente neste módulo: confirme a política de reentrega do
+Q-Desk. Se ele não repetir `503`, será necessário reenvio operacional ou uma
+fila antes de exigir entrega garantida. Nunca se inicia trabalho em background
+após responder sucesso.
+
+Antes de qualquer nova tentativa, o estado é consultado outra vez. Assim, se
+um POST tiver sido aplicado mas sua resposta se perder, a próxima consulta ao
+time 151 evita repeti-lo. Eventos gerados pela própria atribuição também não
+satisfazem a regra. Um novo evento pode reaplicar a regra se a conversa voltar
+ao time 129. O hash identifica o evento completo; entregas semanticamente iguais
+com JSON diferente podem gerar novas consultas, mas o estado atual protege
+contra nova atribuição quando a conversa já está no destino.
+
+O GET seguido de POST não é transação: uma alteração manual entre as duas
+chamadas ainda pode disputar a atribuição. O bloqueio Redis coordena apenas
+instâncias desta integração. Evicção/perda de Redis ou pausa do processo além
+do prazo do bloqueio também impedem garantia absoluta de execução única.
+Alterar somente o grupo no cadastro do cliente pode não emitir evento de
+conversa; isso deve ser validado no Q-Desk.
+
+### Testes
+
+Execute `npm test`. Os testes Q-Desk iniciam apenas um servidor local em
+`127.0.0.1` e usam API/Redis simulados, sem chamar o Q-Desk, enviar mensagens ou
+inicializar `app.js`. Cobrem autenticação, parser, regra, consulta do estado,
+simulação, POST real simulado, concorrência, deduplicação e falhas. A validação
+com o Redis e os payloads reais de produção permanece uma etapa de homologação.

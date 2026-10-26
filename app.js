@@ -2705,6 +2705,9 @@ async function processClientMorningSummary(options = {}) {
 // ---------------------------------------------------------
 const app = express();
 
+// Parser e autenticação exclusivos: não alteram as rotas existentes.
+app.use('/qdesk/webhook', require('./integrations/qdesk').createQdeskRouter({ redis }));
+
 app.use(express.json());
 
 // ---------------------------------------------------------
