@@ -86,6 +86,17 @@ function equalSecret(actual, expected) {
   return timingSafeEqual(hash(actual), hash(expected));
 }
 
+function requestOptions(config) {
+  return {
+    headers: { api_access_token: config.token, 'Content-Type': 'application/json' },
+    timeout: 10000, maxRedirects: 0, maxContentLength: 2 * 1024 * 1024
+  };
+}
+
+function transferConversation(http, api, team, options) {
+  return http.post(`${api}/assignments`, { team_id: team }, options);
+}
+
 // Somente caminhos conhecidos e tipos. Nunca registra valores ou nomes de chaves arbitrárias.
 function structure(body) {
   const paths = ['event', 'id', 'account.id', 'account_id', 'conversation.id',
@@ -165,10 +176,7 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       await redis.del(stateKey);
 
       const api = `${config.url}/api/v1/accounts/${config.account}/conversations/${identity.conversation}`;
-      const options = {
-        headers: { api_access_token: config.token, 'Content-Type': 'application/json' },
-        timeout: 10000, maxRedirects: 0, maxContentLength: 2 * 1024 * 1024
-      };
+      const options = requestOptions(config);
       phase = 'read_conversation';
       const confirmedAt = now();
       const { data: conversation } = await http.get(api, options);
@@ -185,7 +193,7 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
         phase = 'verify_lock';
         if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
         phase = 'assign';
-        await http.post(`${api}/assignments`, { team_id: config.target }, options);
+        await transferConversation(http, api, config.target, options);
         decision = 'transferred';
       }
       if (team && group && team !== config.source && version(conversation.updated_at) &&
@@ -222,4 +230,278 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
   return router;
 }
 
-module.exports = { createQdeskRouter, positiveId, structure };
+
+// Distribuição secundária: usa a mesma configuração, token, API e locks do webhook.
+const BACKFILL_LOCK_SECONDS = 300;
+const MAX_BACKFILL_PAGES = 10;
+
+function requireData(condition, reason) {
+  if (!condition) throw new Error(reason);
+}
+
+function validConversation(conversation, id, account) {
+  return conversation && positiveId(conversation.id) === id &&
+    (conversation.account_id === undefined || positiveId(conversation.account_id) === account) &&
+    (conversation.account?.id === undefined || positiveId(conversation.account.id) === account);
+}
+
+function unassigned(conversation) {
+  const meta = conversation.meta;
+  if (!meta || typeof meta !== 'object') return false;
+  // No Chatwoot, campos de assignee ausentes significam ausência de responsável.
+  return meta.assignee == null && meta.assignee_type == null &&
+    conversation.assignee_id == null && conversation.assignee_agent_bot_id == null;
+}
+
+function candidate(conversation, config) {
+  return positiveId(conversation?.id) && validConversation(conversation, positiveId(conversation.id), config.account) &&
+    conversation.status === 'open' && unassigned(conversation) &&
+    positiveId(conversation.meta.team?.id) === config.source &&
+    positiveId(conversation.meta.sender?.company?.group_company?.id) === config.group;
+}
+
+function workingNow(team, instant) {
+  if (team.working_hours_enabled === false) return true;
+  requireData(team.working_hours_enabled === true && typeof team.timezone === 'string' &&
+    Array.isArray(team.working_hours), 'invalid_working_hours');
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: team.timezone, weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date(instant)).map(part => [part.type, part.value]));
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(parts.weekday);
+  const hours = team.working_hours.filter(hour => hour.day_of_week === day);
+  requireData(hours.length === 1, 'invalid_working_hours');
+  const hour = hours[0];
+  requireData(typeof hour.closed_all_day === 'boolean' && typeof hour.open_all_day === 'boolean' &&
+    !(hour.closed_all_day && hour.open_all_day), 'invalid_working_hours');
+  if (hour.closed_all_day) return false;
+  if (!hour.open_all_day) {
+    for (const [key, limit] of [['open_hour', 23], ['close_hour', 23], ['open_minutes', 59], ['close_minutes', 59]]) {
+      requireData(Number.isInteger(hour[key]) && hour[key] >= 0 && hour[key] <= limit, 'invalid_working_hours');
+    }
+  }
+  const start = hour.open_all_day ? 0 : hour.open_hour * 60 + hour.open_minutes;
+  const end = hour.open_all_day ? 1440 : hour.close_hour * 60 + hour.close_minutes;
+  requireData(end > start, 'invalid_working_hours');
+  const minute = Number(parts.hour) * 60 + Number(parts.minute);
+  const breakFields = ['break_start_hour', 'break_start_minutes', 'break_end_hour', 'break_end_minutes'];
+  if (breakFields.some(key => hour[key] != null)) {
+    for (const key of breakFields) {
+      const max = key.endsWith('_hour') ? 23 : 59;
+      requireData(Number.isInteger(hour[key]) && hour[key] >= 0 && hour[key] <= max, 'invalid_working_hours');
+    }
+    const breakStart = hour.break_start_hour * 60 + hour.break_start_minutes;
+    const breakEnd = hour.break_end_hour * 60 + hour.break_end_minutes;
+    requireData(breakEnd > breakStart && breakStart >= start && breakEnd <= end, 'invalid_working_hours');
+    if (minute >= breakStart && minute < breakEnd) return false;
+  }
+  return minute >= start && minute < end;
+}
+
+function metricMap(rows, key) {
+  requireData(Array.isArray(rows), 'invalid_metrics');
+  const result = new Map();
+  for (const row of rows) {
+    requireData(row && Object.hasOwn(row, key) && (row[key] === null || positiveId(row[key])) &&
+      Number.isSafeInteger(row.open) && row.open >= 0 &&
+      Number.isSafeInteger(row.unassigned) && row.unassigned >= 0 && row.unassigned <= row.open,
+    'invalid_metrics');
+    const id = row[key] === null ? null : positiveId(row[key]);
+    requireData(!result.has(id), 'duplicate_metrics');
+    result.set(id, row);
+  }
+  return result;
+}
+
+function createQdeskBackfill({ redis, env = process.env, http = axios, logger = console, now = Date.now } = {}) {
+  // Reutiliza a validação comum, mas o modo do backfill é inteiramente independente do webhook.
+  const config = configuration({ ...env, QDESK_DRY_RUN: env.QDESK_BACKFILL_DRY_RUN ?? 'true' });
+  const backfill = {
+    ...config,
+    enabled: env.QDESK_BACKFILL_ENABLED === 'true',
+    source: positiveId(env.QDESK_BACKFILL_SOURCE_TEAM_ID ?? 129),
+    target: positiveId(env.QDESK_BACKFILL_TARGET_TEAM_ID ?? 151),
+    group: positiveId(env.QDESK_BACKFILL_GROUP_ID ?? 175),
+    interval: positiveId(env.QDESK_BACKFILL_INTERVAL_SECONDS ?? 60)
+  };
+  const prefix = `qdesk:${config.account}:backfill:${backfill.target}`;
+  const pendingKey = `${prefix}:pending`;
+  const lockKey = `${prefix}:lock`;
+  const options = requestOptions(config);
+  const api = path => `${config.url}/api/v1/accounts/${config.account}${path}`;
+  const get = async (url, params) => (await http.get(url, { ...options, ...(params ? { params } : {}) })).data;
+  const conversationUrl = id => api(`/conversations/${id}`);
+  let timer;
+
+  async function run() {
+    if (!backfill.enabled) return { decision: 'disabled' };
+    const stats = { eligibleAgents: null, availableCapacity: null, targetUnassigned: null, candidates: null,
+      conversation: null, dryRun: config.dryRun };
+    const finish = decision => {
+      logger.info('[qdesk-backfill]', { ...stats, decision });
+      return { ...stats, decision };
+    };
+    if (!config.enabled || !config.valid || !redis || !backfill.source || !backfill.target ||
+        !backfill.group || backfill.source === backfill.target || !backfill.interval ||
+        backfill.interval < 10 || backfill.interval > 86400) return finish('unavailable');
+    const owner = randomUUID();
+    let locked = false;
+    let conversationLock;
+    let phase = 'redis';
+    const owns = async () => {
+      requireData(await redis.get(lockKey) === owner, 'lock_lost');
+      if (conversationLock) requireData(await redis.get(conversationLock) === owner, 'conversation_lock_lost');
+    };
+    async function capacity() {
+      const team = await get(api(`/teams/${backfill.target}`));
+      requireData(positiveId(team?.id) === backfill.target &&
+        (team.account_id === undefined || positiveId(team.account_id) === config.account), 'invalid_team');
+      requireData(workingNow(team, now()), 'outside_working_hours');
+      requireData(team.allow_auto_assign === true && positiveId(team.max_assignment_limit), 'invalid_team_capacity');
+      const members = await get(api(`/teams/${backfill.target}/team_members`));
+      requireData(Array.isArray(members), 'invalid_members');
+      const ids = new Set();
+      for (const member of members) {
+        requireData(positiveId(member?.id) && !ids.has(positiveId(member.id)) &&
+          (member.account_id === undefined || positiveId(member.account_id) === config.account) &&
+          typeof member.active === 'boolean' && typeof member.confirmed === 'boolean' &&
+          typeof member.allow_auto_assign === 'boolean' &&
+          ['online', 'offline', 'busy'].includes(member.availability_status), 'invalid_members');
+        ids.add(positiveId(member.id));
+      }
+      const agents = members.filter(member => member.active && member.confirmed && member.allow_auto_assign &&
+        member.availability_status === 'online');
+      stats.eligibleAgents = agents.length;
+      const reports = `${config.url}/api/v2/accounts/${config.account}/live_reports/grouped_conversation_metrics`;
+      const byAgent = metricMap(await get(reports, { group_by: 'assignee_id' }), 'assignee_id');
+      const byTeam = metricMap(await get(reports, { group_by: 'team_id' }), 'team_id');
+      // O endpoint Chatwoot omite grupos sem conversas abertas; array validado é obrigatório.
+      stats.targetUnassigned = byTeam.get(backfill.target)?.unassigned ?? 0;
+      stats.availableCapacity = agents.reduce((sum, member) =>
+        sum + Math.max(0, Number(team.max_assignment_limit) - (byAgent.get(positiveId(member.id))?.open ?? 0)), 0);
+      requireData(stats.targetUnassigned === 0, 'target_queue_not_empty');
+      requireData(stats.availableCapacity > 0, 'no_capacity');
+    }
+    try {
+      locked = await redis.set(lockKey, owner, 'EX', BACKFILL_LOCK_SECONDS, 'NX') === 'OK';
+      if (!locked) return finish('busy');
+      // Reserva persistente: inclusive timeout do POST exige reconciliação antes de novo envio.
+      const pending = await redis.get(pendingKey);
+      if (pending) {
+        phase = 'reconcile';
+        const record = JSON.parse(pending);
+        requireData(positiveId(record.conversation), 'invalid_pending');
+        stats.conversation = record.conversation;
+        const conversation = await get(conversationUrl(record.conversation));
+        requireData(validConversation(conversation, record.conversation, config.account), 'invalid_conversation_response');
+        if (positiveId(conversation.meta?.team?.id) === backfill.target &&
+            ((conversation.meta?.assignee_type === 'User' && positiveId(conversation.meta?.assignee?.id)) ||
+              conversation.status === 'resolved')) {
+          await owns();
+          await redis.del(pendingKey);
+          return finish('previous_transfer_confirmed');
+        }
+        return finish('assignment_pending');
+      }
+      phase = 'capacity';
+      await capacity();
+      phase = 'list_candidates';
+      const all = [];
+      const seen = new Set();
+      let expectedTotal;
+      let complete = false;
+      for (let page = 1; page <= MAX_BACKFILL_PAGES; page++) {
+        await owns();
+        const response = await get(api('/conversations'), {
+          status: 'open', team_id: backfill.source, assignee_type: 'unassigned', page
+        });
+        const rows = response?.data?.payload;
+        const total = response?.data?.meta?.unassigned_count;
+        requireData(Array.isArray(rows) && Number.isSafeInteger(total) && total >= 0, 'invalid_candidate_list');
+        if (expectedTotal === undefined) expectedTotal = total;
+        requireData(total === expectedTotal, 'inconsistent_pagination');
+        for (const row of rows) {
+          const id = positiveId(row?.id);
+          requireData(id && !seen.has(id), 'invalid_pagination');
+          seen.add(id);
+          all.push(row);
+        }
+        requireData(all.length <= total, 'inconsistent_pagination');
+        if (all.length === total) { complete = true; break; }
+        requireData(rows.length > 0, 'incomplete_pagination');
+      }
+      requireData(complete, 'pagination_limit');
+      const candidates = [];
+      for (const row of all) {
+        if (!candidate(row, backfill)) continue;
+        const waiting = version(row.waiting_since) || version(row.created_at);
+        requireData(waiting, 'missing_waiting_time');
+        if (!await redis.get(`qdesk:${config.account}:backfill:moved:${row.id}`)) candidates.push({ row, waiting });
+      }
+      stats.candidates = candidates.length;
+      candidates.sort((a, b) => a.waiting - b.waiting || Number(a.row.id) - Number(b.row.id));
+      if (!candidates.length) return finish('no_candidates');
+      const selected = candidates[0].row;
+      stats.conversation = positiveId(selected.id);
+      conversationLock = `qdesk:${config.account}:${stats.conversation}:lock`;
+      if (await redis.set(conversationLock, owner, 'EX', BACKFILL_LOCK_SECONDS, 'NX') !== 'OK') {
+        conversationLock = null;
+        return finish('conversation_busy');
+      }
+      phase = 'revalidate';
+      // Revalida fila, agentes, limites e expediente imediatamente antes de reservar o envio.
+      await capacity();
+      const current = await get(conversationUrl(stats.conversation));
+      requireData(candidate(current, backfill) && positiveId(current.id) === stats.conversation &&
+        (version(current.waiting_since) || version(current.created_at)) === candidates[0].waiting, 'candidate_changed');
+      await owns();
+      if (config.dryRun) return finish('would_transfer');
+      requireData(!await redis.get(`qdesk:${config.account}:backfill:moved:${stats.conversation}`), 'already_moved');
+      phase = 'reserve';
+      requireData(await redis.set(pendingKey, JSON.stringify({ conversation: stats.conversation }), 'NX') === 'OK', 'pending_exists');
+      // Sem expiração: não voltar a mover uma conversa que a automação já tentou movimentar.
+      await redis.set(`qdesk:${config.account}:backfill:moved:${stats.conversation}`, '1');
+      await owns();
+      phase = 'assign';
+      await transferConversation(http, conversationUrl(stats.conversation), backfill.target, options);
+      phase = 'verify_assignment';
+      const after = await get(conversationUrl(stats.conversation));
+      requireData(validConversation(after, stats.conversation, config.account), 'invalid_conversation_response');
+      if (positiveId(after.meta?.team?.id) === backfill.target && after.meta?.assignee_type === 'User' &&
+          positiveId(after.meta?.assignee?.id)) {
+        await owns();
+        await redis.del(pendingKey);
+        return finish('transferred_and_assigned');
+      }
+      return finish('transferred_assignment_pending');
+    } catch (error) {
+      // Somente motivos internos; nunca mensagem/corpo/headers recebidos da API.
+      const reasons = new Set(['outside_working_hours', 'target_queue_not_empty', 'no_capacity', 'candidate_changed']);
+      const knownFailures = new Set(['invalid_working_hours', 'invalid_metrics', 'duplicate_metrics', 'invalid_team',
+        'invalid_team_capacity', 'invalid_members', 'invalid_pending', 'invalid_conversation_response',
+        'invalid_candidate_list', 'invalid_pagination', 'inconsistent_pagination', 'incomplete_pagination',
+        'pagination_limit', 'missing_waiting_time', 'already_moved', 'pending_exists', 'lock_lost', 'conversation_lock_lost']);
+      const decision = reasons.has(error.message) ? error.message : 'blocked_failure';
+      logger.info('[qdesk-backfill]', { ...stats, decision, phase,
+        reason: reasons.has(error.message) || knownFailures.has(error.message) ? error.message : 'dependency_failure',
+        upstreamStatus: Number.isInteger(error.response?.status) ? error.response.status : null });
+      return { ...stats, decision };
+    } finally {
+      if (conversationLock) {
+        try { await redis.eval(RELEASE_LOCK, 1, conversationLock, owner); } catch { /* TTL */ }
+      }
+      if (locked) {
+        try { await redis.eval(RELEASE_LOCK, 1, lockKey, owner); } catch { /* TTL */ }
+      }
+    }
+  }
+
+  function start() {
+    if (!backfill.enabled || timer || !backfill.interval || backfill.interval < 10 || backfill.interval > 86400) return;
+    timer = setInterval(() => { void run(); }, backfill.interval * 1000);
+    timer.unref?.();
+  }
+  function stop() { clearInterval(timer); timer = null; }
+  return { run, start, stop };
+}
+
+module.exports = { createQdeskRouter, createQdeskBackfill, positiveId, structure };

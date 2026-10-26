@@ -220,3 +220,104 @@ Um evento fora da origem compatível com estado recente pode ser suprimido antes
 da chegada do evento de retorno; o evento de retorno deve ser entregue para
 acionar imediatamente a avaliação. Sem dados/versionamento suficientes, o módulo
 prefere consultar a API.
+
+## Q-Desk — distribuição secundária do grupo Geral
+
+A rotina é criada pelo mesmo módulo `integrations/qdesk.js`, compartilha Redis,
+token, configuração HTTP e chamada de transferência com o webhook. O webhook
+continua aplicando sua regra original para grupos diferentes de 175.
+
+Novas variáveis (não são configuradas automaticamente):
+
+```env
+QDESK_BACKFILL_ENABLED=false
+QDESK_BACKFILL_DRY_RUN=true
+QDESK_BACKFILL_INTERVAL_SECONDS=60
+QDESK_BACKFILL_SOURCE_TEAM_ID=129
+QDESK_BACKFILL_TARGET_TEAM_ID=151
+QDESK_BACKFILL_GROUP_ID=175
+```
+
+Exige também `QDESK_ENABLED=true`, configuração Q-Desk válida e `REDIS_URL`.
+Respeita exclusivamente `QDESK_BACKFILL_DRY_RUN`: em `true` (padrão), realiza consultas e validações e registra
+`would_transfer`, sem POST nem reserva de movimentação. Em `false`, permite a
+transferência somente quando o backfill foi explicitamente habilitado e
+`QDESK_BACKFILL_DRY_RUN=false`. Valores inválidos bloqueiam a rotina.
+`QDESK_DRY_RUN` continua controlando somente o webhook existente e não interfere
+no backfill. É possível simular o backfill mantendo o webhook em execução real.
+
+O primeiro ciclo ocorre após o intervalo configurado (padrão 60 segundos,
+aceitos valores inteiros de 10 a 86400). Não existe endpoint público para
+disparar essa rotina. Por padrão está desabilitada e não acessa API/Redis.
+
+Cada ciclo valida duas vezes, antes e depois da seleção:
+
+- Time de destino com `allow_auto_assign=true` e `max_assignment_limit` positivo.
+- Expediente pelo `working_hours_enabled`, `timezone` e `working_hours` do time.
+  O formato confirmado do Q-Desk usa `day_of_week` de 0/domingo a 6/sábado,
+  `closed_all_day`, `open_all_day`, horas/minutos de abertura e fechamento e
+  `break_start_hour`, `break_start_minutes`, `break_end_hour`, `break_end_minutes`.
+  O intervalo 12:00–13:30 é fechado; 13:30 volta a permitir distribuição.
+  Fechamento é exclusivo: às 18:00 o expediente 09:00–18:00 está encerrado.
+  `working_hours_enabled=false` significa sem restrição de expediente.
+  Campos ausentes, timezone inválida ou intervalo parcial/inválido bloqueiam.
+- Integrantes: resposta como array, cada item com `id`, `active` booleano,
+  `confirmed` booleano, `allow_auto_assign` booleano e `availability_status`.
+  Somente ativos, confirmados, online e com distribuição automática contribuem.
+  Este formato de integrantes ainda precisa ser confirmado no Q-Desk real;
+  indicadores ausentes não são presumidos como verdadeiros.
+- Métricas: array de objetos com `assignee_id` ou `team_id`, `open` e `unassigned`
+  como inteiros não negativos. O endpoint padrão omite grupos sem conversas;
+  ausência de linha em um array validado significa zero. Arrays/envelopes
+  diferentes, duplicações e contadores incompletos bloqueiam o ciclo.
+- Soma de capacidade `max(0, max_assignment_limit - open)` dos agentes elegíveis,
+  usando métricas por agente de toda a conta; `unassigned` do time destino deve
+  ser zero. Não há atribuição direta de agente.
+
+A lista de origem usa paginação `page`, envelope `data.payload` e total em
+`data.meta.unassigned_count`. Somente após obter todas as páginas, até o limite
+conservador de 10, filtra conversas abertas, sem usuário/bot, time 129 e grupo
+175. Totais inconsistentes ou paginação incompleta bloqueiam. Ordena por
+`waiting_since` positivo, usando `created_at` positivo quando ausente/inválido;
+empates usam ID. Sem timestamp válido, o ciclo bloqueia para preservar a ordem.
+Revalida a conversa selecionada por GET, inclusive seu tempo de espera,
+imediatamente antes da reserva/POST. Uma conversa atribuída, encerrada, movida
+ou com grupo alterado não é transferida. Conversas já tentadas pelo backfill
+não voltam a ser movimentadas por ele.
+
+O máximo é uma transferência por ciclo. O POST usa somente `{"team_id":151}`;
+o próprio Q-Desk decide o agente, conforme acesso à caixa e regras internas.
+Depois do POST, um GET confirma destino e atribuição a um `User`.
+
+### Reservas, falhas e recuperação
+
+Há bloqueio Redis por destino (300 segundos) e o mesmo bloqueio por conversa
+usado pelo webhook, com liberação Lua por proprietário e revalidação antes do
+POST. Falhas de API/Redis e perda de bloqueio não autorizam envio. Não há fallback
+em memória. O limite de páginas e timeout HTTP de 10 segundos limitam o ciclo.
+
+Antes do POST, grava uma reserva persistente
+`qdesk:<conta>:backfill:<destino>:pending` e um histórico
+`qdesk:<conta>:backfill:moved:<conversa>`. Ambos não expiram automaticamente,
+para impedir novos envios após reinício, timeout ou resposta perdida.
+Cada ciclo reconcilia primeiro essa reserva. Enquanto não confirmar que a
+conversa está no destino e atribuída a um usuário (ou resolvida no destino),
+não envia outra. Mesmo após confirmar, encerra o ciclo; só o próximo pode
+selecionar outra conversa. O histórico impede movimentar novamente a mesma
+conversa se ela retornar à origem.
+
+Uma tentativa cujo resultado permaneça incerto ou que tenha sido desviada
+manualmente pode manter o backfill bloqueado. A recuperação exige revisão
+operacional do estado real antes de remover reserva/histórico; não há limpeza
+automática que arrisque repetir a transferência. Redis deve manter persistência
+e evitar evicção dessas chaves. Perda desses dados remove a garantia de histórico.
+
+Os logs `[qdesk-backfill]` incluem contagens de agentes elegíveis, capacidade,
+fila do destino, candidatas, ID selecionado, modo, decisão e, em falhas, fase e
+motivo interno. Contagens ainda não consultadas aparecem como `null`.
+Não incluem nomes, mensagens, tokens, URLs recebidas ou objetos de erro externos.
+
+APIs de leitura e atribuição não oferecem uma transação: agentes/automação do
+Q-Desk ainda podem alterar fila ou conversa entre o último GET e o POST. Os
+bloqueios coordenam instâncias deste serviço, não alterações externas.
+Os testes automatizados simulam respostas e não ativam nem chamam produção.

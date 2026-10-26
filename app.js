@@ -4075,6 +4075,7 @@ if (statusAprovacaoId && statusResolvidoId) {
 }
 
 app.listen(PORT, () => {
+  require('./integrations/qdesk').createQdeskBackfill({ redis }).start();
   console.log(`Servidor rodando com sucesso na porta ${PORT}`);
   console.log('Configuração carregada:', {
     timezone: TZ,
