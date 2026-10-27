@@ -7,6 +7,37 @@ const RELEASE_LOCK = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis
 const LOCK_SECONDS = 60;
 const DEDUP_SECONDS = 86400;
 const STATE_WINDOW_MS = 2000;
+const READ_SUMMARY = "local result = redis.call('HGETALL', KEYS[1]); redis.call('DEL', KEYS[1]); return result";
+const INCREMENT_SUMMARY = "local value = redis.call('HINCRBY', KEYS[1], ARGV[1], 1); if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end; return value";
+const SUMMARY_TTL_SECONDS = 300;
+
+function routingRecordDecision(body, record, rule, now) {
+  if (!record || record.schema !== 1 || record.rule !== rule) return 'rules_changed';
+  if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) return 'expired';
+  const team = positiveId(body.meta?.team?.id);
+  const group = positiveId(body.meta?.sender?.company?.group_company?.id);
+  if (!team || !group) return 'incomplete_event';
+  if (team !== record.team || group !== record.group) return 'team_or_group_changed';
+  const eventVersion = version(body.updated_at);
+  const confirmedVersion = version(record.version);
+  if (!eventVersion || !confirmedVersion || eventVersion < confirmedVersion ||
+      eventVersion < (version(record.lastEventVersion) || confirmedVersion)) return 'uncertain_event';
+  // Snapshot completo permite comparação mesmo se changed_attributes não vier no evento.
+  if (body.changed_attributes === undefined) return 'reuse';
+  if (!Array.isArray(body.changed_attributes)) return 'uncertain_event';
+  const irrelevant = new Set(['status', 'priority', 'assignee_id', 'assignee_agent_bot_id',
+    'snoozed_until', 'label_list', 'waiting_since', 'first_reply_created_at']);
+  for (const change of body.changed_attributes) {
+    if (!change || typeof change !== 'object' || Array.isArray(change) || !Object.keys(change).length) return 'uncertain_event';
+    for (const [key, delta] of Object.entries(change)) {
+      if (!irrelevant.has(key)) return 'relevant_or_unknown_change';
+      if (!delta || typeof delta !== 'object' || !Object.hasOwn(delta, 'current_value') ||
+          !Object.hasOwn(delta, 'previous_value')) return 'uncertain_event';
+      if (Object.hasOwn(body, key) && stableJson(body[key]) !== stableJson(delta.current_value)) return 'uncertain_event';
+    }
+  }
+  return 'reuse';
+}
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -126,17 +157,49 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
   const router = express.Router();
   const config = configuration(env);
   const log = details => logger.info('[qdesk]', details);
+  const ttlDays = positiveId(env.QDESK_ROUTING_PROCESSED_TTL_DAYS ?? 30);
+  const ttlSeconds = ttlDays && ttlDays <= 3650 ? ttlDays * 86400 : null;
+  const mode = config.dryRun ? 'dry' : 'live';
+  const rule = createHash('sha256').update(stableJson({ source: config.source, general: config.general,
+    target: config.target, mode, url: config.url })).digest('hex');
+  const summaryKey = `qdesk:routing:summary:${config.account}:${mode}`;
+  const count = field => redis.eval(INCREMENT_SUMMARY, 1, summaryKey, field, SUMMARY_TTL_SECONDS);
+  async function flushRoutingSummary() {
+    if (!config.enabled || !redis) return;
+    try {
+      const entries = await redis.eval(READ_SUMMARY, 1, summaryKey);
+      if (!entries?.length) return;
+      const totals = Object.fromEntries(Array.from({ length: entries.length / 2 }, (_, i) =>
+        [entries[i * 2], Number(entries[i * 2 + 1])]));
+      logger.info('[qdesk-routing-summary]', { account: config.account, dryRun: config.dryRun,
+        received: totals.received || 0, alreadyProcessed: totals.alreadyProcessed || 0,
+        validated: totals.validated || 0, transfers: totals.transfers || 0, errors: totals.errors || 0 });
+    } catch { log({ decision: 'summary_failed', reason: 'redis_failure' }); }
+  }
+  const summaryTimer = config.enabled && redis ? setInterval(() => { void flushRoutingSummary(); }, 60000) : null;
+  summaryTimer?.unref?.();
+  router.flushRoutingSummary = flushRoutingSummary;
+  router.stopRoutingSummary = () => clearInterval(summaryTimer);
 
   router.post('/', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     if (!config.enabled) return res.status(503).json({ status: 'disabled' });
-    if (!config.valid || !redis) return res.status(503).json({ status: 'unavailable' });
+    if (!config.valid || !ttlSeconds || !redis) {
+      if (!redis) log({ decision: 'failed', phase: 'redis', reason: 'redis_not_configured' });
+      return res.status(503).json({ status: 'unavailable' });
+    }
     const authorization = req.get('authorization');
     const supplied = authorization?.startsWith('Bearer ') ? authorization.slice(7) : req.query.secret;
     if (!equalSecret(supplied, config.secret)) return res.status(401).json({ status: 'unauthorized' });
     if (!req.is('application/json')) return res.status(415).json({ status: 'json_required' });
     return next();
-  }, express.json({ limit: '256kb', strict: true }), async (req, res) => {
+  }, express.json({ limit: '256kb', strict: true }), async (req, res, next) => {
+    try { await count('received'); return next(); }
+    catch {
+      log({ decision: 'failed', phase: 'metrics', reason: 'redis_failure' });
+      return res.status(503).json({ status: 'retryable_failure' });
+    }
+  }, async (req, res) => {
     const identity = identifyEvent(req.body, config.account);
     if (!identity) {
       log({ decision: 'unsupported_event_shape', structure: structure(req.body) });
@@ -149,18 +212,49 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
     const eventKey = `${base}:event:${config.dryRun ? 'dry' : 'live'}:${fingerprint}`;
     const lockKey = `${base}:lock`;
     const stateKey = `${base}:state:${config.dryRun ? 'dry' : 'live'}`;
+    const processedKey = `qdesk:routing:processed:${config.account}:${identity.conversation}`;
+    const pendingKey = `qdesk:routing:pending:${config.account}:${identity.conversation}:${mode}`;
     const owner = randomUUID();
     let locked = false;
     let phase = 'redis';
     try {
       locked = (await redis.set(lockKey, owner, 'EX', LOCK_SECONDS, 'NX')) === 'OK';
       if (!locked) return res.status(503).json({ status: 'busy', retryable: true });
-      if (await redis.get(eventKey)) return res.status(200).json({ status: 'duplicate' });
+      const pending = await redis.get(pendingKey);
+      const storedRecord = await redis.get(processedKey);
+      let record;
+      try { record = storedRecord ? JSON.parse(storedRecord) : null; } catch { record = null; }
+      const recordDecision = routingRecordDecision(req.body, record, rule, now());
+      const sameEvaluatedEvent = record?.schema === 1 && record.rule === rule &&
+        record.expiresAt > now() && record.eventFingerprint === fingerprint;
+      if (!pending && storedRecord && (sameEvaluatedEvent || recordDecision === 'reuse')) {
+        if (version(req.body.updated_at) > (version(record.lastEventVersion) || record.version)) {
+          if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
+          const remaining = record.expiresAt - now();
+          if (remaining <= 0) throw new Error('routing_record_expired');
+          await redis.set(processedKey, JSON.stringify({ ...record, lastEventVersion: version(req.body.updated_at) }), 'PX', remaining);
+        }
+        await count('alreadyProcessed');
+        return res.status(200).json({ status: 'already_processed' });
+      }
+      const duplicate = await redis.get(eventKey);
+      // Reentrega idêntica sem novo dado relevante continua deduplicada.
+      if (!pending && duplicate && (!storedRecord || recordDecision === 'incomplete_event' || recordDecision === 'uncertain_event')) {
+        if (storedRecord) await count('alreadyProcessed');
+        return res.status(200).json({ status: 'duplicate' });
+      }
+      if (storedRecord) {
+        if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
+        await redis.del(processedKey);
+        await redis.del(stateKey);
+        await redis.del(eventKey);
+        log({ ...context, decision: 'routing_invalidated', reason: pending ? 'transfer_pending' : recordDecision });
+      }
 
       let cached;
       const stored = await redis.get(stateKey);
       try { cached = stored ? JSON.parse(stored) : null; } catch { cached = null; }
-      if (canSuppress(req.body, cached, config.source, now())) {
+      if (!pending && !storedRecord && canSuppress(req.body, cached, config.source, now())) {
         // Atualiza somente a ordem observada, conservando o prazo original da janela.
         if (version(req.body.updated_at) > (version(cached.lastEventVersion) || cached.version)) {
           const remaining = STATE_WINDOW_MS - (now() - cached.confirmedAt);
@@ -169,7 +263,6 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
             'PX', remaining);
         }
         // Não marca evento: a supressão não pode persistir além da janela original.
-        log({ ...context, decision: 'recent_confirmed_state', team: cached.team, group: cached.group });
         return res.status(200).json({ status: 'processed', decision: 'recent_confirmed_state' });
       }
       // Remove estado anterior antes de qualquer consulta ou transferência, inclusive em falhas.
@@ -179,22 +272,57 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       const options = requestOptions(config);
       phase = 'read_conversation';
       const confirmedAt = now();
-      const { data: conversation } = await http.get(api, options);
+      let { data: conversation } = await http.get(api, options);
       if (!conversation || positiveId(conversation.id) !== identity.conversation ||
           (conversation.account_id !== undefined && positiveId(conversation.account_id) !== config.account) ||
           (conversation.account?.id !== undefined && positiveId(conversation.account.id) !== config.account)) {
         throw new Error('invalid_conversation_response');
       }
-      const team = positiveId(conversation.meta?.team?.id);
-      const group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
+      let team = positiveId(conversation.meta?.team?.id);
+      let group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
       const matches = team === config.source && group !== null && group !== config.general;
       let decision = !team || !group ? 'missing_team_or_group' : matches ? 'would_transfer' : 'no_change';
-      if (matches && !config.dryRun) {
+      if (pending) {
+        if (team !== config.target || !group) {
+          log({ ...context, decision: 'transfer_pending' });
+          return res.status(202).json({ status: 'pending', decision: 'transfer_pending' });
+        }
+        decision = 'transferred';
+      } else if (matches && !config.dryRun) {
         phase = 'verify_lock';
         if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
         phase = 'assign';
-        await transferConversation(http, api, config.target, options);
+        await redis.set(pendingKey, '1');
+        if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
+        try {
+          await transferConversation(http, api, config.target, options);
+        } catch (error) {
+          // Rejeição explícita permite corrigir a causa e tentar novamente; timeout/5xx são incertos.
+          if ([400, 401, 403, 404, 405, 413, 415, 422, 429].includes(error.response?.status) &&
+              await redis.get(lockKey) === owner) await redis.del(pendingKey);
+          throw error;
+        }
+        phase = 'confirm_transfer';
+        ({ data: conversation } = await http.get(api, options));
+        if (!validConversation(conversation, identity.conversation, config.account)) throw new Error('invalid_confirmation');
+        team = positiveId(conversation.meta?.team?.id);
+        group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
+        if (team !== config.target || !group) {
+          log({ ...context, decision: 'transfer_pending' });
+          return res.status(202).json({ status: 'pending', decision: 'transfer_pending' });
+        }
         decision = 'transferred';
+      }
+      if (team && group) {
+        phase = 'mark_routing';
+        if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
+        const expiresAt = now() + ttlSeconds * 1000;
+        await redis.set(processedKey, JSON.stringify({ schema: 1, rule, team, group, eventFingerprint: fingerprint,
+          version: version(conversation.updated_at),
+          lastEventVersion: Math.max(version(conversation.updated_at) || 0, version(req.body.updated_at) || 0), expiresAt }),
+        'EX', ttlSeconds);
+        if (decision === 'transferred') { await redis.del(pendingKey); await count('transfers'); }
+        await count('validated');
       }
       if (team && group && team !== config.source && version(conversation.updated_at) &&
           now() - confirmedAt < STATE_WINDOW_MS) {
@@ -213,11 +341,25 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
     } catch (error) {
       // Nunca registrar objeto Axios, URL recebida, corpo, headers ou mensagem externa.
       log({ ...context, decision: 'failed', phase, upstreamStatus: Number.isInteger(error.response?.status) ? error.response.status : null });
+      // Uma falha não pode deixar marcador de sucesso/deduplicação desta tentativa.
+      if (locked) {
+        try {
+          if (await redis.get(lockKey) === owner) {
+            await redis.del(processedKey);
+            await redis.del(eventKey);
+            await redis.del(stateKey);
+          }
+        } catch { /* Falha Redis já registrada; mantém reserva de transferência. */ }
+      }
+      try { await count('errors'); } catch { /* Redis indisponível: falha já registrada acima. */ }
       return res.status(503).json({ status: 'retryable_failure' });
     } finally {
       if (locked) {
         try { await redis.eval(RELEASE_LOCK, 1, lockKey, owner); }
-        catch { log({ ...context, decision: 'lock_release_failed' }); }
+        catch {
+          log({ ...context, decision: 'lock_release_failed' });
+          try { await count('errors'); } catch { /* Redis indisponível. */ }
+        }
       }
     }
   });

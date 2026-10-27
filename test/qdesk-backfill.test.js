@@ -287,3 +287,12 @@ for (const invalid of ['', 'TRUE', 'invalid']) {
     assert.equal(h.posts().length, 0);
   });
 }
+
+test('backfill seleciona conversa mesmo com marcador de roteamento do webhook', async () => {
+  const h = harness();
+  const marker = JSON.stringify({ team: 129, group: 175 });
+  h.values.set('qdesk:routing:processed:15:42', marker);
+  assert.equal((await h.run()).decision, 'transferred_and_assigned');
+  assert.equal(h.posts().length, 1);
+  assert.equal(h.values.get('qdesk:routing:processed:15:42'), marker);
+});

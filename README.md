@@ -321,3 +321,96 @@ APIs de leitura e atribuição não oferecem uma transação: agentes/automaçã
 Q-Desk ainda podem alterar fila ou conversa entre o último GET e o POST. Os
 bloqueios coordenam instâncias deste serviço, não alterações externas.
 Os testes automatizados simulam respostas e não ativam nem chamam produção.
+
+## Q-Desk — conversas com roteamento já avaliado
+
+O webhook mantém no Redis a chave
+`qdesk:routing:processed:<conta>:<conversa>`. O registro contém somente versão
+interna do formato, assinatura da regra/configuração/modo, IDs de time/grupo,
+versão `updated_at`, última versão observada, hash do último evento avaliado
+e prazo de expiração. Não contém
+mensagens, nomes, e-mails, tokens ou o corpo do evento.
+
+```env
+QDESK_ROUTING_PROCESSED_TTL_DAYS=30
+```
+
+O padrão é 30 dias. Aceita inteiro de 1 a 3650; vazio, zero, decimal ou valor
+inválido deixam o webhook indisponível, sem afetar a configuração do backfill.
+Repetições não renovam o prazo original. A última versão observada pode ser
+atualizada usando somente o TTL restante. Não existe cache local de marcadores.
+
+Após autenticação e validação de evento/conta, o mesmo lock Redis atômico por
+conversa protege leitura, invalidação e gravação. O marcador é consultado antes
+da API. Um snapshot completo com time/grupo iguais, versão numérica não anterior
+à confirmada/última observada e sem mudança relevante pode receber
+`200 {"status":"already_processed"}`, sem GET nem log individual.
+Campos ausentes, versões ausentes/antigas, JSON inválido no registro e mudanças
+relevantes/desconhecidas levam à revalidação conservadora. Snapshot completo
+pode ser comparado mesmo sem `changed_attributes`; quando presente, esse campo
+precisa ser válido. São reconhecidos como irrelevantes: status, prioridade,
+responsável, bot responsável, snooze, labels, waiting_since e primeira resposta.
+Deltas incompletos ou contraditórios não autorizam reutilização.
+
+Mudanças de time/grupo, modo dry-run/real ou assinatura da regra invalidam o
+marcador com log `routing_invalidated`. A invalidação também remove o cache
+curto e o hash daquele evento, para a deduplicação antiga não ocultar a correção.
+Reentregas exatamente iguais já concluídas continuam deduplicadas, inclusive
+quando o evento não contém todos os metadados necessários para comparar o
+marcador. A expiração força nova avaliação em notificações subsequentes; ela
+não dispara um job por si só. Sem entrega de evento relevante, não há garantia
+de detectar uma mudança feita apenas no cadastro do cliente.
+
+O marcador é criado para avaliação completa sem transferência, conversa no
+destino correto ou transferência confirmada. Dados incompletos, falhas de API,
+POST com erro e transferência sem confirmação não gravam sucesso. Em dry-run,
+uma decisão `would_transfer` pode ser marcada como avaliada, mas a assinatura
+inclui esse modo: uma simulação não dispensa o processamento real após troca
+de modo. A regra de roteamento e os IDs continuam os mesmos.
+
+### Confirmação de transferência do webhook
+
+Antes de um POST real, grava uma reserva independente em
+`qdesk:routing:pending:<conta>:<conversa>:live`. Depois do POST, faz GET e exige
+ID/conta válidos, time de destino e grupo válido antes de marcar sucesso.
+O webhook confirma o **time**, não espera atribuição de agente; o backfill tem
+seu próprio controle de atribuição. Enquanto não confirmar, responde `202`
+com `transfer_pending`, sem marcador de sucesso e sem repetir o POST.
+Novas notificações consultam a conversa novamente. Um POST com erro/timeout ou
+falha da consulta responde `503`. Timeout e falhas 5xx mantêm a reserva para evitar
+envio duplicado; rejeições explícitas 400/401/403/404/405/413/415/422/429 liberam
+a reserva para nova tentativa após corrigir a causa, sem marcar sucesso.
+Se o estado continuar incerto ou tiver sido movido manualmente para outro time,
+a revisão operacional é necessária antes de remover a reserva. Não há job
+adicional de reconciliação: a tentativa seguinte depende de novo webhook/reenvio.
+
+As chaves `qdesk:routing:*` não são usadas para selecionar nem bloquear candidatas
+no backfill. Seu histórico e reservas permanecem em `qdesk:<conta>:backfill:*`.
+Somente o lock por conversa é compartilhado para coordenar movimentações. Uma
+conversa Geral avaliada pelo webhook continua elegível ao backfill.
+
+### Resumo e redução dos logs
+
+Um resumo é emitido a cada 60 segundos quando há contagens, com prefixo
+`[qdesk-routing-summary]`: `received`, `alreadyProcessed`, `validated`,
+`transfers` e `errors`. Os contadores ficam em um hash Redis por conta e modo;
+incremento e expiração são atômicos via Lua. Cada hash expira em 5 minutos,
+sem renovação por incrementos; isso remove resíduos mesmo após interrupção do
+processo. A leitura e limpeza também são atômicas para coordenar múltiplas instâncias.
+São contagens de eventos/avaliações, não de IDs únicos no período.
+`received` conta requisições autenticadas que passaram pelo parser JSON.
+`alreadyProcessed` conta notificações suprimidas pelo marcador (inclusive
+reentregas idênticas associadas a ele). Eventos descartados só pelo hash antigo
+podem não entrar nesse contador. `transfers` conta confirmação, inclusive se
+ocorrer numa notificação posterior ao POST.
+
+Primeiras avaliações, simulações, confirmações, invalidações e falhas continuam
+com log individual. Eventos suprimidos pelo marcador ou cache curto não geram
+log individual. Indisponibilidade de Redis impede transferências e gera log de
+falha; se o Redis estiver indisponível, seus próprios contadores podem não ser
+atualizados. Logs de falha não incluem objetos Axios nem mensagens externas.
+A reentrega do último evento avaliado é reconhecida pelo hash estável salvo
+no marcador, inclusive após uma transferência que mudou o time. Um novo evento
+relevante continua invalidando a avaliação anterior.
+
+O Redis precisa autorizar também `HINCRBY`, `HGETALL`, `TTL` e `EXPIRE`, além de GET/SET/DEL/EVAL.
