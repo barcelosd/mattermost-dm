@@ -11,30 +11,33 @@ const READ_SUMMARY = "local result = redis.call('HGETALL', KEYS[1]); redis.call(
 const INCREMENT_SUMMARY = "local value = redis.call('HINCRBY', KEYS[1], ARGV[1], 1); if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end; return value";
 const SUMMARY_TTL_SECONDS = 300;
 
-function routingRecordDecision(body, record, rule, now) {
-  if (!record || record.schema !== 1 || record.rule !== rule) return 'rules_changed';
+// Ausência não equivale a remoção: null em qualquer ancestral é explícito.
+function routingField(body, path) {
+  let value = body;
+  for (const key of path) {
+    if (value === null) return { present: true, id: null };
+    if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return { present: false };
+    value = value[key];
+  }
+  return { present: true, id: positiveId(value) };
+}
+
+function routingRecordDecision(body, record, rule, mode, now) {
+  if (!record || record.schema !== 1 || record.rule !== rule || record.mode !== mode ||
+      !positiveId(record.team) || !positiveId(record.group)) return 'rules_changed';
   if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) return 'expired';
-  const team = positiveId(body.meta?.team?.id);
-  const group = positiveId(body.meta?.sender?.company?.group_company?.id);
-  if (!team || !group) return 'incomplete_event';
-  if (team !== record.team || group !== record.group) return 'team_or_group_changed';
-  const eventVersion = version(body.updated_at);
-  const confirmedVersion = version(record.version);
-  if (!eventVersion || !confirmedVersion || eventVersion < confirmedVersion ||
-      eventVersion < (version(record.lastEventVersion) || confirmedVersion)) return 'uncertain_event';
-  // Snapshot completo permite comparação mesmo se changed_attributes não vier no evento.
-  if (body.changed_attributes === undefined) return 'reuse';
-  if (!Array.isArray(body.changed_attributes)) return 'uncertain_event';
-  const irrelevant = new Set(['status', 'priority', 'assignee_id', 'assignee_agent_bot_id',
-    'snoozed_until', 'label_list', 'waiting_since', 'first_reply_created_at']);
-  for (const change of body.changed_attributes) {
-    if (!change || typeof change !== 'object' || Array.isArray(change) || !Object.keys(change).length) return 'uncertain_event';
-    for (const [key, delta] of Object.entries(change)) {
-      if (!irrelevant.has(key)) return 'relevant_or_unknown_change';
-      if (!delta || typeof delta !== 'object' || !Object.hasOwn(delta, 'current_value') ||
-          !Object.hasOwn(delta, 'previous_value')) return 'uncertain_event';
-      if (Object.hasOwn(body, key) && stableJson(body[key]) !== stableJson(delta.current_value)) return 'uncertain_event';
-    }
+  const team = routingField(body, ['meta', 'team', 'id']);
+  const group = routingField(body, ['meta', 'sender', 'company', 'group_company', 'id']);
+  if ((team.present && team.id !== record.team) || (group.present && group.id !== record.group)) {
+    return 'team_or_group_changed';
+  }
+  // Deltas explícitos exigem reconciliação mesmo se o snapshot estiver ausente
+  // ou contraditório. A API, nunca o delta, decide o roteamento.
+  const relevant = new Set(['team', 'team_id', 'group_company', 'group_company_id',
+    'group', 'group_id', 'company', 'company_id', 'sender', 'sender_id', 'meta']);
+  if (Array.isArray(body.changed_attributes) && body.changed_attributes.some(change =>
+    change && typeof change === 'object' && Object.keys(change).some(key => relevant.has(key)))) {
+    return 'explicit_routing_change';
   }
   return 'reuse';
 }
@@ -224,8 +227,8 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       const storedRecord = await redis.get(processedKey);
       let record;
       try { record = storedRecord ? JSON.parse(storedRecord) : null; } catch { record = null; }
-      const recordDecision = routingRecordDecision(req.body, record, rule, now());
-      const sameEvaluatedEvent = record?.schema === 1 && record.rule === rule &&
+      const recordDecision = routingRecordDecision(req.body, record, rule, mode, now());
+      const sameEvaluatedEvent = record?.schema === 1 && record.rule === rule && record.mode === mode &&
         record.expiresAt > now() && record.eventFingerprint === fingerprint;
       if (!pending && storedRecord && (sameEvaluatedEvent || recordDecision === 'reuse')) {
         if (version(req.body.updated_at) > (version(record.lastEventVersion) || record.version)) {
@@ -317,7 +320,7 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
         phase = 'mark_routing';
         if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
         const expiresAt = now() + ttlSeconds * 1000;
-        await redis.set(processedKey, JSON.stringify({ schema: 1, rule, team, group, eventFingerprint: fingerprint,
+        await redis.set(processedKey, JSON.stringify({ schema: 1, rule, mode, team, group, eventFingerprint: fingerprint,
           version: version(conversation.updated_at),
           lastEventVersion: Math.max(version(conversation.updated_at) || 0, version(req.body.updated_at) || 0), expiresAt }),
         'EX', ttlSeconds);

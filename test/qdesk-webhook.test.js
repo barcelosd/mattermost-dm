@@ -203,7 +203,7 @@ test('um novo evento pode reaplicar regra após retorno ao time de origem', asyn
   const h = await harness(t, { env: { QDESK_DRY_RUN: 'false' } });
   await h.send({ ...event, updated_at: 1 });
   h.conversation.meta.team.id = 129;
-  await h.send({ ...event, updated_at: 2 });
+  await h.send({ ...event, updated_at: 2, meta: current(129).meta });
   assert.equal(h.calls.filter(c => c.method === 'post').length, 2);
 });
 
@@ -347,14 +347,14 @@ test('retorno 151 → 129 transfere mesmo dentro da janela e não usa evento atr
   assert.equal(h.calls.filter(call => call.method === 'get').length, 4);
 });
 
-test('evento atrasado fora do time de origem ainda detecta estado atual elegível', async t => {
+test('snapshot igual ao confirmado dispensa API mesmo com versão antiga', async t => {
   const c = confirmedOutside();
   const h = await harness(t, { conversation: c, env: { QDESK_DRY_RUN: 'false' } });
   await h.send(outsideEvent());
   c.meta = current(129, 176).meta;
   c.updated_at = 102;
-  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).body.decision, 'transferred');
-  assert.equal(h.calls.filter(call => call.method === 'post').length, 1);
+  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).body.status, 'already_processed');
+  assert.equal(h.calls.filter(call => call.method === 'post').length, 0);
 });
 
 test('falha de API invalida cache anterior e permite nova tentativa', async t => {
@@ -362,10 +362,10 @@ test('falha de API invalida cache anterior e permite nova tentativa', async t =>
   await h.send(outsideEvent());
   const get = h.http.get;
   h.http.get = async () => { throw new Error('API unavailable'); };
-  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).status, 503);
+  assert.equal((await h.send(outsideEvent({ meta: current(129, 176).meta }))).status, 503);
   assert.equal([...h.values.keys()].some(key => key.includes(':state:')), false);
   h.http.get = get;
-  assert.equal((await h.send(outsideEvent({ updated_at: 99 }))).body.decision, 'no_change');
+  assert.equal((await h.send(outsideEvent({ meta: current(129, 176).meta }))).body.decision, 'no_change');
   assert.equal(h.calls.length, 2);
 });
 
@@ -701,3 +701,78 @@ test('hash de evento mantém deduplicação independente quando marcador de conv
   assert.equal((await h.send(outsideEvent())).body.status, 'duplicate');
   assert.equal(h.calls.length, 1);
 });
+
+
+test('evento completo seguido de vários incompletos preserva marcador e TTL sem logs ou GET', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  await h.send(outsideEvent());
+  const marker = JSON.parse(h.values.get(routingKey));
+  assert.equal(marker.mode, 'dry');
+  const deadline = h.expiries.get(routingKey);
+  const logs = h.logs.length;
+  for (const body of [event, { ...event, meta: {} },
+    { ...event, meta: { team: { id: 151 } } },
+    { ...event, meta: { sender: {} }, changed_attributes: [null] }]) {
+    assert.equal((await h.send(body)).body.status, 'already_processed');
+  }
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.expiries.get(routingKey), deadline);
+  assert.equal(h.logs.length, logs);
+});
+
+test('evento incompleto é enriquecido pela API; evento completo posterior reutiliza confirmação', async t => {
+  const h = await harness(t, { conversation: confirmedOutside() });
+  await h.send(event);
+  assert.equal((await h.send(outsideEvent())).body.status, 'already_processed');
+  assert.equal(h.calls.length, 1);
+});
+
+for (const meta of [{ team: null }, { team: { id: null } },
+  { sender: { company: null } }, { sender: { company: { group_company: { id: null } } } }, null]) {
+  test(`null explícito revalida pela API: ${JSON.stringify(meta)}`, async t => {
+    const h = await harness(t, { conversation: confirmedOutside() });
+    await h.send(outsideEvent());
+    assert.equal((await h.send({ ...event, meta })).body.decision, 'no_change');
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.logs.some(log => log[1].reason === 'team_or_group_changed'), true);
+  });
+}
+
+for (const field of ['team_id', 'group_company_id']) {
+  test(`evento parcial com delta de ${field} exige reconciliação`, async t => {
+    const h = await harness(t, { conversation: confirmedOutside() });
+    await h.send(outsideEvent());
+    await h.send({ ...event, changed_attributes: [{ [field]: { previous_value: 1, current_value: null } }] });
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.logs.some(log => log[1].reason === 'explicit_routing_change'), true);
+  });
+}
+
+test('sem marcador e sem dados na API permanece pendente até enriquecimento', async t => {
+  const h = await harness(t, { conversation: current(null, null) });
+  for (let i = 0; i < 3; i++) {
+    assert.equal((await h.send({ ...event, updated_at: i + 1 })).body.decision, 'missing_team_or_group');
+    assert.equal(h.values.has(routingKey), false);
+  }
+  h.conversation.meta = current(151, 176).meta;
+  await h.send(outsideEvent());
+  assert.equal(h.values.has(routingKey), true);
+});
+
+
+for (const field of ['team', 'group']) {
+  test(`mudança isolada de ${field} atualiza estado confirmado`, async t => {
+    const h = await harness(t, { conversation: confirmedOutside() });
+    await h.send(outsideEvent());
+    if (field === 'team') h.conversation.meta.team.id = 143;
+    else h.conversation.meta.sender.company.group_company.id = 175;
+    const body = { ...event, meta: structuredClone(h.conversation.meta) };
+    assert.equal((await h.send(body)).body.decision, 'no_change');
+    const marker = JSON.parse(h.values.get(routingKey));
+    assert.equal(marker.team, field === 'team' ? 143 : 151);
+    assert.equal(marker.group, field === 'group' ? 175 : 176);
+    assert.equal(h.calls.length, 2);
+    assert.equal((await h.send({ ...body, updated_at: 200 })).body.status, 'already_processed');
+    assert.equal(h.calls.length, 2);
+  });
+}
