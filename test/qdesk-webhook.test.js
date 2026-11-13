@@ -814,3 +814,56 @@ test('atributo da conversa não substitui atributo do contato', async t => {
   assert.equal((await h.send()).body.decision, 'no_change');
   assert.deepEqual(h.calls.map(call => call.method), ['get']);
 });
+
+// 777 é um ID fictício, usado somente nos testes.
+for (const [team, group, centralizada, expected] of [
+  [129, 777, false, 'transferred'],
+  [129, '777', undefined, 'transferred'],
+  [129, 175, true, 'transferred'],
+  [129, null, true, 'transferred'],
+  [129, 777, true, 'transferred'],
+  [129, 175, false, 'no_change'],
+  [129, null, false, 'no_change'],
+  [150, 777, true, 'no_change'],
+  [151, 777, false, 'no_change']
+]) {
+  test(`regra combinada: time=${team}, grupo=${group}, centralizada=${centralizada}`, async t => {
+    const c = current(team, group);
+    c.meta.sender.custom_attributes.centralizada = centralizada;
+    const h = await harness(t, { conversation: c,
+      env: { QDESK_DRY_RUN: 'false', QDESK_IMPLEMENTATION_GROUP_ID: '777' } });
+    assert.equal((await h.send()).body.decision, expected);
+    assert.equal(h.calls.filter(call => call.method === 'post').length, expected === 'transferred' ? 1 : 0);
+  });
+}
+
+test('entrada no grupo Implantação invalida avaliação anterior', async t => {
+  const c = current(129, 175);
+  c.meta.sender.custom_attributes.centralizada = false;
+  const h = await harness(t, { conversation: c,
+    env: { QDESK_DRY_RUN: 'false', QDESK_IMPLEMENTATION_GROUP_ID: '777' } });
+  assert.equal((await h.send()).body.decision, 'no_change');
+  c.meta.sender.company.group_company.id = 777;
+  assert.equal((await h.send({ ...event, meta: structuredClone(c.meta) })).body.decision, 'transferred');
+});
+
+for (const groupId of ['', 'invalid', '0']) {
+  test(`ID de Implantação vazio ou inválido não seleciona grupo: ${groupId}`, async t => {
+    const c = current(129, 777);
+    c.meta.sender.custom_attributes.centralizada = false;
+    const h = await harness(t, { conversation: c,
+      env: { QDESK_DRY_RUN: 'false', QDESK_IMPLEMENTATION_GROUP_ID: groupId } });
+    assert.equal((await h.send()).body.decision, 'no_change');
+    assert.deepEqual(h.calls.map(call => call.method), ['get']);
+  });
+}
+
+for (const group of [81, '81']) {
+  test(`grupo Implantação ${group} transfere por padrão sem centralizada`, async t => {
+    const c = current(129, group);
+    c.meta.sender.custom_attributes.centralizada = false;
+    const h = await harness(t, { conversation: c, env: { QDESK_DRY_RUN: 'false' } });
+    assert.equal((await h.send()).body.decision, 'transferred');
+    assert.deepEqual(h.calls.find(call => call.method === 'post').body, { team_id: 151 });
+  });
+}

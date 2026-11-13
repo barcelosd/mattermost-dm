@@ -69,15 +69,24 @@ Chatwoot está ativo, se o agente foi encontrado e qual conversa será usada.
 
 O endpoint `POST /qdesk/webhook` é independente das notificações `CHATWOOT_*`.
 Consulta `GET /api/v1/accounts/15/conversations/{id}` e só transfere quando o
-estado **atual** tiver `meta.team.id = 129` (Folha de pagamento) e o checkbox
-`meta.sender.custom_attributes.centralizada = true` no cadastro do contato.
-O destino é Folha de pagamento completo (151), independentemente do grupo da
-empresa, inclusive Geral. O atributo da conversa não substitui o do contato.
-Campo ausente, nulo, desmarcado ou com tipo diferente de booleano não autoriza
-transferência. O único body enviado a
-`POST .../assignments` é `{"team_id":151}`.
+estado **atual** tiver `meta.team.id = 129` (Folha de pagamento) e pelo menos
+uma das condições abaixo:
+
+- Grupo do cliente em `meta.sender.company.group_company.id` igual ao ID de
+  Implantação, configurado em `QDESK_IMPLEMENTATION_GROUP_ID`.
+- Checkbox `meta.sender.custom_attributes.centralizada = true` no contato.
+
+O destino é Folha de pagamento completo (151). Centralizada marcada autoriza
+transferência independentemente do grupo, inclusive Geral. O atributo da
+conversa não substitui o do contato. O checkbox precisa ser booleano `true`;
+quando ausente, nulo ou desmarcado, somente o grupo Implantação autoriza.
+O único body enviado a `POST .../assignments` é `{"team_id":151}`.
 
 ### Variáveis no Render
+
+O grupo Implantação usa o ID `81` por padrão. `QDESK_IMPLEMENTATION_GROUP_ID`
+permite substituir esse ID; valor vazio ou inválido desativa somente a condição
+de grupo. Alterar esse ID invalida as avaliações em cache.
 
 ```env
 QDESK_ENABLED=false
@@ -86,6 +95,8 @@ QDESK_URL=https://suporte.questor.com.br
 QDESK_API_ACCESS_TOKEN=
 QDESK_ACCOUNT_ID=15
 QDESK_SOURCE_TEAM_ID=129
+# Grupo de clientes Implantação (padrão):
+QDESK_IMPLEMENTATION_GROUP_ID=81
 QDESK_TARGET_TEAM_ID=151
 QDESK_WEBHOOK_SECRET=
 # Usar a conexão Redis já existente, se disponível:
@@ -134,9 +145,9 @@ Somente `QDESK_DRY_RUN=false` habilita POSTs; o padrão é simulação.
    time, centralizada, evento, modo e decisão. ID divergente gera falha e
    time ausente gera `missing_team`. Valide no retorno real o atributo
    `meta.sender.custom_attributes.centralizada` como booleano.
-6. Em simulação, confirme `would_transfer` para time 129 e centralizada marcada;
-   `no_change` para checkbox desmarcado/ausente ou outro time. O grupo não
-   participa dessa condição. Não há POST em simulação.
+6. Em simulação, confirme `would_transfer` para time 129 e grupo Implantação
+   ou centralizada marcada; `no_change` para outro time ou quando nenhuma
+   condição for atendida. Não há POST em simulação.
    Somente depois da validação e autorização altere `QDESK_DRY_RUN=false`.
 
 O módulo nunca registra a URL recebida. Porém, segredo em query pode aparecer
@@ -227,7 +238,7 @@ prefere consultar a API.
 
 A rotina é criada pelo mesmo módulo `integrations/qdesk.js`, compartilha Redis,
 token, configuração HTTP e chamada de transferência com o webhook. O webhook
-aplica a regra do checkbox centralizada do contato, independentemente do grupo.
+aplica a regra de grupo Implantação ou checkbox centralizada do contato.
 
 Novas variáveis (não são configuradas automaticamente):
 
@@ -369,7 +380,7 @@ POST com erro e transferência sem confirmação não gravam sucesso. Em dry-run
 uma decisão `would_transfer` pode ser marcada como avaliada, mas a assinatura
 inclui esse modo: uma simulação não dispensa o processamento real após troca
 de modo. A assinatura da regra invalida registros gerados pela regra antiga
-de grupo diferente do Geral.
+de grupo diferente do Geral ou somente centralizada.
 
 ### Confirmação de transferência do webhook
 

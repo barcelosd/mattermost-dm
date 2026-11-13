@@ -106,6 +106,7 @@ function configuration(env) {
     secret: env.QDESK_WEBHOOK_SECRET,
     account: positiveId(env.QDESK_ACCOUNT_ID ?? 15),
     source: positiveId(env.QDESK_SOURCE_TEAM_ID ?? 129),
+    implementationGroup: positiveId(env.QDESK_IMPLEMENTATION_GROUP_ID ?? 81),
     target: positiveId(env.QDESK_TARGET_TEAM_ID ?? 151)
   };
   config.valid = Boolean(url && url.protocol === 'https:' && !url.username && !url.password &&
@@ -166,7 +167,8 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
   const ttlDays = positiveId(env.QDESK_ROUTING_PROCESSED_TTL_DAYS ?? 30);
   const ttlSeconds = ttlDays && ttlDays <= 3650 ? ttlDays * 86400 : null;
   const mode = config.dryRun ? 'dry' : 'live';
-  const rule = createHash('sha256').update(stableJson({ source: config.source, contactAttribute: 'centralizada', ruleVersion: 2,
+  const rule = createHash('sha256').update(stableJson({ source: config.source, contactAttribute: 'centralizada', ruleVersion: 3,
+    implementationGroup: config.implementationGroup,
     target: config.target, mode, url: config.url })).digest('hex');
   const summaryKey = `qdesk:routing:summary:${config.account}:${mode}`;
   const count = field => redis.eval(INCREMENT_SUMMARY, 1, summaryKey, field, SUMMARY_TTL_SECONDS);
@@ -287,7 +289,8 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       let team = positiveId(conversation.meta?.team?.id);
       let group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
       let centralizada = conversation.meta?.sender?.custom_attributes?.centralizada === true;
-      const matches = team === config.source && centralizada;
+      const matches = team === config.source &&
+        (centralizada || (config.implementationGroup !== null && group === config.implementationGroup));
       let decision = !team ? 'missing_team' : matches ? 'would_transfer' : 'no_change';
       if (pending) {
         if (team !== config.target) {
