@@ -24,17 +24,21 @@ function routingField(body, path) {
 
 function routingRecordDecision(body, record, rule, mode, now) {
   if (!record || record.schema !== 1 || record.rule !== rule || record.mode !== mode ||
-      !positiveId(record.team) || !positiveId(record.group)) return 'rules_changed';
+      !positiveId(record.team) || typeof record.centralizada !== 'boolean') return 'rules_changed';
   if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) return 'expired';
   const team = routingField(body, ['meta', 'team', 'id']);
   const group = routingField(body, ['meta', 'sender', 'company', 'group_company', 'id']);
   if ((team.present && team.id !== record.team) || (group.present && group.id !== record.group)) {
     return 'team_or_group_changed';
   }
+  const attributes = body.meta?.sender?.custom_attributes;
+  if (body.meta?.sender && Object.hasOwn(body.meta.sender, 'custom_attributes') &&
+      (attributes?.centralizada === true) !== record.centralizada) return 'centralizada_changed';
   // Deltas explícitos exigem reconciliação mesmo se o snapshot estiver ausente
   // ou contraditório. A API, nunca o delta, decide o roteamento.
   const relevant = new Set(['team', 'team_id', 'group_company', 'group_company_id',
-    'group', 'group_id', 'company', 'company_id', 'sender', 'sender_id', 'meta']);
+    'group', 'group_id', 'company', 'company_id', 'sender', 'sender_id', 'meta',
+    'custom_attributes', 'centralizada']);
   if (Array.isArray(body.changed_attributes) && body.changed_attributes.some(change =>
     change && typeof change === 'object' && Object.keys(change).some(key => relevant.has(key)))) {
     return 'explicit_routing_change';
@@ -102,13 +106,12 @@ function configuration(env) {
     secret: env.QDESK_WEBHOOK_SECRET,
     account: positiveId(env.QDESK_ACCOUNT_ID ?? 15),
     source: positiveId(env.QDESK_SOURCE_TEAM_ID ?? 129),
-    general: positiveId(env.QDESK_GENERAL_GROUP_ID ?? 175),
     target: positiveId(env.QDESK_TARGET_TEAM_ID ?? 151)
   };
   config.valid = Boolean(url && url.protocol === 'https:' && !url.username && !url.password &&
     url.pathname === '/' && !url.search && !url.hash && config.token &&
     typeof config.secret === 'string' && Buffer.byteLength(config.secret) >= 32 &&
-    config.account && config.source && config.general && config.target && config.source !== config.target &&
+    config.account && config.source && config.target && config.source !== config.target &&
     ['true', 'false'].includes(env.QDESK_DRY_RUN ?? 'true'));
   return config;
 }
@@ -163,7 +166,7 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
   const ttlDays = positiveId(env.QDESK_ROUTING_PROCESSED_TTL_DAYS ?? 30);
   const ttlSeconds = ttlDays && ttlDays <= 3650 ? ttlDays * 86400 : null;
   const mode = config.dryRun ? 'dry' : 'live';
-  const rule = createHash('sha256').update(stableJson({ source: config.source, general: config.general,
+  const rule = createHash('sha256').update(stableJson({ source: config.source, contactAttribute: 'centralizada', ruleVersion: 2,
     target: config.target, mode, url: config.url })).digest('hex');
   const summaryKey = `qdesk:routing:summary:${config.account}:${mode}`;
   const count = field => redis.eval(INCREMENT_SUMMARY, 1, summaryKey, field, SUMMARY_TTL_SECONDS);
@@ -283,10 +286,11 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
       }
       let team = positiveId(conversation.meta?.team?.id);
       let group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
-      const matches = team === config.source && group !== null && group !== config.general;
-      let decision = !team || !group ? 'missing_team_or_group' : matches ? 'would_transfer' : 'no_change';
+      let centralizada = conversation.meta?.sender?.custom_attributes?.centralizada === true;
+      const matches = team === config.source && centralizada;
+      let decision = !team ? 'missing_team' : matches ? 'would_transfer' : 'no_change';
       if (pending) {
-        if (team !== config.target || !group) {
+        if (team !== config.target) {
           log({ ...context, decision: 'transfer_pending' });
           return res.status(202).json({ status: 'pending', decision: 'transfer_pending' });
         }
@@ -310,17 +314,18 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
         if (!validConversation(conversation, identity.conversation, config.account)) throw new Error('invalid_confirmation');
         team = positiveId(conversation.meta?.team?.id);
         group = positiveId(conversation.meta?.sender?.company?.group_company?.id);
-        if (team !== config.target || !group) {
+        if (team !== config.target) {
           log({ ...context, decision: 'transfer_pending' });
           return res.status(202).json({ status: 'pending', decision: 'transfer_pending' });
         }
         decision = 'transferred';
       }
-      if (team && group) {
+      centralizada = conversation.meta?.sender?.custom_attributes?.centralizada === true;
+      if (team) {
         phase = 'mark_routing';
         if (await redis.get(lockKey) !== owner) throw new Error('lock_lost');
         const expiresAt = now() + ttlSeconds * 1000;
-        await redis.set(processedKey, JSON.stringify({ schema: 1, rule, mode, team, group, eventFingerprint: fingerprint,
+        await redis.set(processedKey, JSON.stringify({ schema: 1, rule, mode, team, group, centralizada, eventFingerprint: fingerprint,
           version: version(conversation.updated_at),
           lastEventVersion: Math.max(version(conversation.updated_at) || 0, version(req.body.updated_at) || 0), expiresAt }),
         'EX', ttlSeconds);
@@ -334,9 +339,9 @@ function createQdeskRouter({ redis, env = process.env, http = axios, logger = co
           lastEventVersion: Math.max(version(conversation.updated_at), version(req.body.updated_at) || 0), confirmedAt }),
           'PX', STATE_WINDOW_MS);
       }
-      log({ ...context, decision, team, group });
+      log({ ...context, decision, team, centralizada });
       // Dados ausentes podem ser enriquecidos antes de uma reentrega do mesmo evento.
-      if (team && group) {
+      if (team) {
         phase = 'mark_event';
         await redis.set(eventKey, '1', 'EX', DEDUP_SECONDS);
       }

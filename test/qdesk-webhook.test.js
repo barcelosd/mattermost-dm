@@ -7,7 +7,7 @@ const secret = 'a-secure-test-secret-of-at-least-32-characters';
 const event = { event: 'conversation_updated', id: 42, account: { id: 15 } };
 const current = (team = 129, group = 200) => ({
   id: 42, account_id: 15,
-  meta: { team: { id: team }, sender: { company: { group_company: { id: group } } } }
+  meta: { team: { id: team }, sender: { custom_attributes: { centralizada: true }, company: { group_company: { id: group } } } }
 });
 async function harness(t, { env = {}, conversation = current(), redisMissing = false, now = Date.now } = {}) {
   const values = new Map();
@@ -97,17 +97,21 @@ test('modo real envia somente team_id e usa token no header', async t => {
   assert.equal(h.calls[1].options.headers.api_access_token, 'private-api-token');
 });
 
-for (const [name, team, group] of [
-  ['grupo Geral', 129, 175], ['outro time', 151, 200], ['time ausente', null, 200],
-  ['grupo ausente', 129, undefined], ['grupo nulo', 129, null], ['grupo inválido', 129, true],
-  ['grupo zero', 129, 0]
-]) {
-  test(`${name} não transfere mesmo com evento elegível`, async t => {
-    const c = current(team, group);
-    if (group === undefined) delete c.meta.sender.company.group_company.id;
+for (const value of [false, undefined, null, 'true', 'false', 1, 0]) {
+  test(`centralizada=${String(value)} não transfere mesmo com evento elegível`, async t => {
+    const c = current();
+    c.meta.sender.custom_attributes.centralizada = value;
     const h = await harness(t, { env: { QDESK_DRY_RUN: 'false' }, conversation: c });
-    await h.send({ ...event, meta: current().meta });
+    assert.equal((await h.send({ ...event, meta: current().meta })).body.decision, 'no_change');
     assert.deepEqual(h.calls.map(c => c.method), ['get']);
+  });
+}
+
+for (const group of [175, 200, null, undefined, true, 0]) {
+  test(`centralizada marcada transfere independentemente do grupo ${String(group)}`, async t => {
+    const h = await harness(t, { env: { QDESK_DRY_RUN: 'false' }, conversation: current(129, group) });
+    assert.equal((await h.send()).body.decision, 'transferred');
+    assert.deepEqual(h.calls.map(c => c.method), ['get', 'post', 'get']);
   });
 }
 
@@ -255,7 +259,7 @@ test('conversa sem acesso pela API não é processada nem marcada', async t => {
   assert.equal(h.values.size, 0);
 });
 
-for (const [team, group] of [[129, 175], [151, 200], [129, null]]) {
+for (const [team, group] of [[150, 175], [151, 200], [null, null]]) {
   test(`evento sem conta preserva regra sem transferência: time=${team}, grupo=${group}`, async t => {
     const h = await harness(t, { conversation: current(team, group), env: { QDESK_DRY_RUN: 'false' } });
     assert.equal((await h.send({ event: 'conversation_updated', id: 42 })).status, 200);
@@ -523,8 +527,8 @@ test('erro da transferência não grava marcador nem deduplicação de sucesso',
 });
 
 test('dados incompletos e falha de API não marcam processamento', async t => {
-  const h = await harness(t, { conversation: current(129, null) });
-  assert.equal((await h.send(event)).body.decision, 'missing_team_or_group');
+  const h = await harness(t, { conversation: current(null, null) });
+  assert.equal((await h.send(event)).body.decision, 'missing_team');
   assert.equal(h.values.has(routingKey), false);
   await h.send(event);
   assert.equal(h.calls.length, 2);
@@ -751,7 +755,7 @@ for (const field of ['team_id', 'group_company_id']) {
 test('sem marcador e sem dados na API permanece pendente até enriquecimento', async t => {
   const h = await harness(t, { conversation: current(null, null) });
   for (let i = 0; i < 3; i++) {
-    assert.equal((await h.send({ ...event, updated_at: i + 1 })).body.decision, 'missing_team_or_group');
+    assert.equal((await h.send({ ...event, updated_at: i + 1 })).body.decision, 'missing_team');
     assert.equal(h.values.has(routingKey), false);
   }
   h.conversation.meta = current(151, 176).meta;
@@ -776,3 +780,37 @@ for (const field of ['team', 'group']) {
     assert.equal(h.calls.length, 2);
   });
 }
+
+for (const value of [true, false, null, undefined]) {
+  test(`mudança de centralizada para ${String(value)} invalida marcador`, async t => {
+    const c = current();
+    c.meta.sender.custom_attributes.centralizada = value !== true;
+    const h = await harness(t, { conversation: c });
+    await h.send(event);
+    c.meta.sender.custom_attributes.centralizada = value;
+    const result = await h.send({ ...event, meta: structuredClone(c.meta), updated_at: 2 });
+    assert.equal(result.body.decision, value === true ? 'would_transfer' : 'no_change');
+    assert.equal(h.calls.length, 2);
+  });
+}
+
+test('delta de atributo do contato exige consulta atual mesmo sem snapshot', async t => {
+  const c = current();
+  c.meta.sender.custom_attributes.centralizada = false;
+  const h = await harness(t, { conversation: c });
+  await h.send(event);
+  c.meta.sender.custom_attributes.centralizada = true;
+  assert.equal((await h.send({ ...event, changed_attributes: [
+    { custom_attributes: { previous_value: { centralizada: false }, current_value: { centralizada: true } } }
+  ] })).body.decision, 'would_transfer');
+  assert.equal(h.calls.length, 2);
+});
+
+test('atributo da conversa não substitui atributo do contato', async t => {
+  const c = current();
+  delete c.meta.sender.custom_attributes;
+  c.custom_attributes = { centralizada: true };
+  const h = await harness(t, { conversation: c, env: { QDESK_DRY_RUN: 'false' } });
+  assert.equal((await h.send()).body.decision, 'no_change');
+  assert.deepEqual(h.calls.map(call => call.method), ['get']);
+});

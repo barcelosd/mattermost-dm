@@ -69,9 +69,12 @@ Chatwoot está ativo, se o agente foi encontrado e qual conversa será usada.
 
 O endpoint `POST /qdesk/webhook` é independente das notificações `CHATWOOT_*`.
 Consulta `GET /api/v1/accounts/15/conversations/{id}` e só transfere quando o
-estado **atual** tiver `meta.team.id = 129` e um ID de grupo válido em
-`meta.sender.company.group_company.id`, diferente de `175`. Campos ausentes,
-nulos ou inválidos não causam transferência. O único body enviado a
+estado **atual** tiver `meta.team.id = 129` (Folha de pagamento) e o checkbox
+`meta.sender.custom_attributes.centralizada = true` no cadastro do contato.
+O destino é Folha de pagamento completo (151), independentemente do grupo da
+empresa, inclusive Geral. O atributo da conversa não substitui o do contato.
+Campo ausente, nulo, desmarcado ou com tipo diferente de booleano não autoriza
+transferência. O único body enviado a
 `POST .../assignments` é `{"team_id":151}`.
 
 ### Variáveis no Render
@@ -83,7 +86,6 @@ QDESK_URL=https://suporte.questor.com.br
 QDESK_API_ACCESS_TOKEN=
 QDESK_ACCOUNT_ID=15
 QDESK_SOURCE_TEAM_ID=129
-QDESK_GENERAL_GROUP_ID=175
 QDESK_TARGET_TEAM_ID=151
 QDESK_WEBHOOK_SECRET=
 # Usar a conexão Redis já existente, se disponível:
@@ -129,12 +131,12 @@ Somente `QDESK_DRY_RUN=false` habilita POSTs; o padrão é simulação.
 5. O diagnóstico registra somente tipos/presença de caminhos conhecidos, nunca
    conteúdo de mensagens, nomes, e-mails, tokens ou chaves arbitrárias do JSON.
    Para eventos reconhecidos, os logs contêm IDs técnicos de conta/conversa,
-   time/grupo, evento, modo e decisão. Resposta da API fora do contrato
-   (`id`, `meta.team.id`, `meta.sender.company.group_company.id`) não autoriza
-   transferência; ID divergente gera falha, e metadados ausentes geram
-   `missing_team_or_group`. Valide também esse retorno real.
-6. Em simulação, confirme `would_transfer` para grupo diferente de 175 e time
-   129; `no_change` para grupo 175 ou outro time. Não há POST em simulação.
+   time, centralizada, evento, modo e decisão. ID divergente gera falha e
+   time ausente gera `missing_team`. Valide no retorno real o atributo
+   `meta.sender.custom_attributes.centralizada` como booleano.
+6. Em simulação, confirme `would_transfer` para time 129 e centralizada marcada;
+   `no_change` para checkbox desmarcado/ausente ou outro time. O grupo não
+   participa dessa condição. Não há POST em simulação.
    Somente depois da validação e autorização altere `QDESK_DRY_RUN=false`.
 
 O módulo nunca registra a URL recebida. Porém, segredo em query pode aparecer
@@ -150,7 +152,7 @@ volume abusivo pode ser configurada no proxy, conforme a infraestrutura real.
 Chaves usam exclusivamente `qdesk:`. Cada conversa possui bloqueio atômico
 `SET NX EX` de 60 segundos, liberado via Lua somente pelo proprietário.
 As chamadas à API têm timeout de 10 segundos cada; o bloqueio é revalidado antes
-do POST. Eventos concluídos com time/grupo válidos são identificados pelo hash
+do POST. Eventos concluídos com time válido são identificados pelo hash
 SHA-256 do JSON recebido e deduplicados por 24 horas. O corpo não é salvo no
 Redis. Simulação e execução real usam marcadores separados.
 
@@ -175,7 +177,7 @@ O GET seguido de POST não é transação: uma alteração manual entre as duas
 chamadas ainda pode disputar a atribuição. O bloqueio Redis coordena apenas
 instâncias desta integração. Evicção/perda de Redis ou pausa do processo além
 do prazo do bloqueio também impedem garantia absoluta de execução única.
-Alterar somente o grupo no cadastro do cliente pode não emitir evento de
+Alterar somente centralizada no cadastro do contato pode não emitir evento de
 conversa; isso deve ser validado no Q-Desk.
 
 ### Testes
@@ -225,7 +227,7 @@ prefere consultar a API.
 
 A rotina é criada pelo mesmo módulo `integrations/qdesk.js`, compartilha Redis,
 token, configuração HTTP e chamada de transferência com o webhook. O webhook
-continua aplicando sua regra original para grupos diferentes de 175.
+aplica a regra do checkbox centralizada do contato, independentemente do grupo.
 
 Novas variáveis (não são configuradas automaticamente):
 
@@ -326,7 +328,7 @@ Os testes automatizados simulam respostas e não ativam nem chamam produção.
 
 O webhook mantém no Redis a chave
 `qdesk:routing:processed:<conta>:<conversa>`. O registro contém somente versão
-interna do formato, assinatura da regra/configuração/modo, IDs de time/grupo,
+interna do formato, assinatura da regra/configuração/modo, IDs de time/grupo, estado booleano de centralizada,
 versão `updated_at`, última versão observada, hash do último evento avaliado
 e prazo de expiração. Não contém
 mensagens, nomes, e-mails, tokens ou o corpo do evento.
@@ -352,7 +354,7 @@ precisa ser válido. São reconhecidos como irrelevantes: status, prioridade,
 responsável, bot responsável, snooze, labels, waiting_since e primeira resposta.
 Deltas incompletos ou contraditórios não autorizam reutilização.
 
-Mudanças de time/grupo, modo dry-run/real ou assinatura da regra invalidam o
+Mudanças de centralizada, time/grupo, modo dry-run/real ou assinatura da regra invalidam o
 marcador com log `routing_invalidated`. A invalidação também remove o cache
 curto e o hash daquele evento, para a deduplicação antiga não ocultar a correção.
 Reentregas exatamente iguais já concluídas continuam deduplicadas, inclusive
@@ -366,13 +368,14 @@ destino correto ou transferência confirmada. Dados incompletos, falhas de API,
 POST com erro e transferência sem confirmação não gravam sucesso. Em dry-run,
 uma decisão `would_transfer` pode ser marcada como avaliada, mas a assinatura
 inclui esse modo: uma simulação não dispensa o processamento real após troca
-de modo. A regra de roteamento e os IDs continuam os mesmos.
+de modo. A assinatura da regra invalida registros gerados pela regra antiga
+de grupo diferente do Geral.
 
 ### Confirmação de transferência do webhook
 
 Antes de um POST real, grava uma reserva independente em
 `qdesk:routing:pending:<conta>:<conversa>:live`. Depois do POST, faz GET e exige
-ID/conta válidos, time de destino e grupo válido antes de marcar sucesso.
+ID/conta válidos e time de destino antes de marcar sucesso.
 O webhook confirma o **time**, não espera atribuição de agente; o backfill tem
 seu próprio controle de atribuição. Enquanto não confirmar, responde `202`
 com `transfer_pending`, sem marcador de sucesso e sem repetir o POST.
