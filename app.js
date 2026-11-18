@@ -1402,6 +1402,7 @@ function buildWhatsAppMessage(issue, alertMinutes, timeLabel) {
 function buildClientSummaryMessage(issue, timeLabel, preferredDate = null) {
   const meetLink = getCustomFieldValue(issue, 'Google Meet');
   const publicoAlvoRaw = getCustomFieldValue(issue, 'Público Alvo');
+  const preRequisitos = String(getCustomFieldValue(issue, 'Pré-Requisitos') || '').trim();
   const appointmentDate = getAppointmentDate(issue, preferredDate);
 
   let publicoAlvo = '';
@@ -1421,6 +1422,10 @@ function buildClientSummaryMessage(issue, timeLabel, preferredDate = null) {
 
   if (publicoAlvo) {
     msg += `*Público Alvo:* ${publicoAlvo}\n`;
+  }
+
+  if (preRequisitos) {
+    msg += `*Pré-Requisitos:* ${preRequisitos}\n`;
   }
 
   msg += `*Horário:* ${timeLabel}\n`;
