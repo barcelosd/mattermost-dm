@@ -2008,6 +2008,7 @@ async function getOrCreateClientFolderStructure(issue) {
 
 // Tempo máximo aguardando o Drive gerar os metadados do vídeo antes de mover sem duração
 const RECORDING_METADATA_MAX_WAIT_MS = 6 * 60 * 60 * 1000;
+const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 
 function formatVideoDuration(durationMillis) {
   if (!durationMillis) return 'Não identificada';
@@ -2024,10 +2025,50 @@ function formatVideoDuration(durationMillis) {
     : `${minutes}m ${seconds}s`;
 }
 
-function issueHasRecordingNote(issue, fileId) {
+// Reconhece a nota pelo ID do arquivo (formato atual) ou pelo nome do
+// arquivo (notas antigas, que não tinham o ID).
+function issueHasRecordingNote(issue, file) {
   return (issue?.journals || []).some(
-    (journal) => typeof journal.notes === 'string' && journal.notes.includes(fileId)
+    (journal) =>
+      typeof journal.notes === 'string' &&
+      (journal.notes.includes(file.id) || journal.notes.includes(file.name))
   );
+}
+
+function isDriveFolder(file) {
+  return file?.mimeType === DRIVE_FOLDER_MIME_TYPE;
+}
+
+// Nome da pasta da reunião: remove o sufixo que o Meet adiciona após o
+// horário (ex.: " - Recording", " - Notes by Gemini") e a extensão.
+function getRecordingFolderName(item) {
+  if (isDriveFolder(item)) return item.name.trim();
+
+  return item.name
+    .replace(/\.[a-z0-9]{2,4}$/i, '')
+    .replace(/(GMT[+-]\d{1,2}(?::\d{2})?).*$/i, '$1')
+    .trim();
+}
+
+async function listDriveChildren(drive, parentId, fields = 'id, name, mimeType, createdTime, videoMediaMetadata(durationMillis)') {
+  const items = [];
+  let pageToken;
+
+  do {
+    const res = await drive.files.list({
+      q: `'${parentId}' in parents and trashed = false`,
+      fields: `nextPageToken, files(${fields})`,
+      pageSize: 1000,
+      pageToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true
+    });
+
+    items.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+
+  return items;
 }
 
 async function getVideoDurationMillis(drive, file) {
@@ -2053,112 +2094,194 @@ async function getVideoDurationMillis(drive, file) {
   }
 }
 
+async function moveDriveItem(drive, fileId, fromParentId, toParentId) {
+  await drive.files.update({
+    fileId,
+    addParents: toParentId,
+    removeParents: fromParentId,
+    fields: 'id, parents',
+    supportsAllDrives: true
+  });
+}
+
+async function trashDriveFolderIfEmpty(drive, folderId, folderName) {
+  const remaining = await listDriveChildren(drive, folderId, 'id');
+  if (remaining.length > 0) return false;
+
+  await drive.files.update({
+    fileId: folderId,
+    requestBody: { trashed: true },
+    supportsAllDrives: true
+  });
+
+  console.log(`Pasta vazia [${folderName}] enviada para a lixeira.`);
+  return true;
+}
+
+// Garante UMA pasta por tarefa dentro de Treinamentos. Se já existirem
+// pastas duplicadas para o mesmo #ID, o conteúdo delas é unificado.
+async function getOrCreateIssueRecordingFolder(drive, treinamentosFolderId, issueId, folderName, issue) {
+  const idPattern = new RegExp(`^#${issueId}(?!\\d)`);
+  const existing = (await listDriveChildren(drive, treinamentosFolderId, 'id, name, mimeType, createdTime'))
+    .filter((item) => isDriveFolder(item) && idPattern.test(item.name.trim()))
+    .sort((a, b) => String(a.createdTime).localeCompare(String(b.createdTime)));
+
+  if (existing.length === 0) {
+    const created = await drive.files.create({
+      requestBody: {
+        name: folderName,
+        mimeType: DRIVE_FOLDER_MIME_TYPE,
+        parents: [treinamentosFolderId]
+      },
+      fields: 'id',
+      supportsAllDrives: true
+    });
+
+    console.log(`Pasta [${folderName}] criada em Treinamentos para a tarefa #${issueId}.`);
+    return created.data.id;
+  }
+
+  const [target, ...duplicates] = existing;
+
+  for (const duplicate of duplicates) {
+    console.log(`Unificando pasta duplicada [${duplicate.name}] na pasta da tarefa #${issueId}.`);
+    await consolidateRecordingFolder(drive, duplicate, target.id, issue);
+  }
+
+  return target.id;
+}
+
+// Processa um arquivo da reunião: registra a nota no Redmine (vídeos) e move
+// para a pasta da tarefa. Retorna true se o arquivo foi movido.
+async function processRecordingFile(drive, file, sourceParentId, targetFolderId, issue) {
+  const issueId = issue.id;
+  const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
+
+  if (isVideo && !issueHasRecordingNote(issue, file)) {
+    const durationMillis = await getVideoDurationMillis(drive, file);
+
+    if (!durationMillis) {
+      const ageMs = file.createdTime
+        ? Date.now() - new Date(file.createdTime).getTime()
+        : 0;
+
+      if (ageMs < RECORDING_METADATA_MAX_WAIT_MS) {
+        console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
+        return false;
+      }
+
+      console.warn(
+        `O vídeo [${file.name}] está sem metadados de duração há mais de ${RECORDING_METADATA_MAX_WAIT_MS / 3600000}h. Movendo sem duração.`
+      );
+    }
+
+    // A nota é registrada ANTES de mover: se falhar, o arquivo permanece na
+    // origem e é reprocessado na próxima rodada. O ID do arquivo na nota
+    // evita notas duplicadas.
+    const journalNote = [
+      `*Gravação de Reunião Disponibilizada*`,
+      ``,
+      `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
+      ``,
+      `* *Arquivo:* ${file.name}`,
+      `* *Duração do vídeo:* ${formatVideoDuration(durationMillis)}`,
+      `* *Link:* https://drive.google.com/file/d/${file.id}/view`
+    ].join('\n');
+
+    const noteAdded = await addRedmineJournalNote(issueId, journalNote);
+    if (!noteAdded) return false;
+
+    // O Redmine responde 204 mesmo quando ignora a nota (ex.: usuário da API
+    // sem permissão "Adicionar notas" no projeto). Confirma que foi gravada.
+    const updatedIssue = await fetchIssueDetails(issueId);
+    if (!issueHasRecordingNote(updatedIssue, file)) {
+      console.error(`Redmine aceitou a requisição mas não registrou a nota na tarefa #${issueId}.`);
+      await notifyAttention(
+        `redmine_note_not_saved:${issueId}`,
+        'Redmine não registrou a nota da gravação (verifique a permissão "Adicionar notas" do usuário da API no projeto)',
+        { issueId, projectId: issue.project?.id, fileName: file.name }
+      );
+      return false;
+    }
+
+    issue.journals = updatedIssue.journals;
+  }
+
+  await moveDriveItem(drive, file.id, sourceParentId, targetFolderId);
+  console.log(`Arquivo [${file.name}] movido para a pasta da tarefa #${issueId}.`);
+  return true;
+}
+
+// Move todo o conteúdo de uma pasta (incluindo subpastas) para a pasta da
+// tarefa e envia a pasta de origem para a lixeira quando ficar vazia.
+async function consolidateRecordingFolder(drive, folder, targetFolderId, issue) {
+  const children = await listDriveChildren(drive, folder.id);
+
+  for (const child of children) {
+    if (isDriveFolder(child)) {
+      await consolidateRecordingFolder(drive, child, targetFolderId, issue);
+    } else {
+      await processRecordingFile(drive, child, folder.id, targetFolderId, issue);
+    }
+  }
+
+  // O Meet pode gravar arquivos na pasta minutos depois (ex.: anotações do
+  // Gemini após o vídeo). Só descarta a pasta vazia após a janela de espera;
+  // até lá, novos arquivos que chegarem nela continuam sendo movidos.
+  const folderAgeMs = folder.createdTime
+    ? Date.now() - new Date(folder.createdTime).getTime()
+    : 0;
+
+  if (folderAgeMs >= RECORDING_METADATA_MAX_WAIT_MS) {
+    await trashDriveFolderIfEmpty(drive, folder.id, folder.name);
+  }
+}
+
 async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
 
   try {
     const drive = getGoogleDriveClient();
+    const items = await listDriveChildren(drive, GOOGLE_DRIVE_RECORDINGS_FOLDER_ID);
 
-    // Busca todos os arquivos da pasta original
-    const res = await drive.files.list({
-      q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name, mimeType, createdTime, videoMediaMetadata(durationMillis))',
-      pageSize: 100
-    });
-
-    const files = res.data.files || res.data.items || [];
-
-    for (const file of files) {
-      // 1. Verifica primeiro se o arquivo possui a marcação da tarefa (#ID) no nome
-      const match = file.name.match(/#(\d+)/);
+    for (const item of items) {
+      // O item (arquivo ou pasta criada pelo Meet) precisa ter o #ID da tarefa no nome
+      const match = item.name.match(/#(\d+)/);
       if (!match) continue;
 
       const issueId = match[1];
-      const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
-
-      // 2. SE FOR VÍDEO: aguarda o Drive disponibilizar a duração (com limite de espera)
-      let durationMillis = null;
-
-      if (isVideo) {
-        durationMillis = await getVideoDurationMillis(drive, file);
-
-        if (!durationMillis) {
-          const ageMs = file.createdTime
-            ? Date.now() - new Date(file.createdTime).getTime()
-            : 0;
-
-          if (ageMs < RECORDING_METADATA_MAX_WAIT_MS) {
-            console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
-            continue;
-          }
-
-          console.warn(
-            `O vídeo [${file.name}] está sem metadados de duração há mais de ${RECORDING_METADATA_MAX_WAIT_MS / 3600000}h. Movendo sem duração.`
-          );
-        }
-      } else {
-        console.log(`Arquivo [${file.name}] (${file.mimeType}) não é vídeo; será movido sem nota no Redmine.`);
-      }
 
       try {
         const issue = await fetchIssueDetails(issueId);
         const structure = await getOrCreateClientFolderStructure(issue);
 
         if (!structure?.treinamentosFolderId) {
-          console.log(`Tarefa #${issueId} sem estrutura de pasta no Drive (projeto sem "Sincroniza G-Drive" = Sim?). Arquivo [${file.name}] mantido.`);
+          console.log(`Tarefa #${issueId} sem estrutura de pasta no Drive (projeto sem "Sincroniza G-Drive" = Sim?). Item [${item.name}] mantido.`);
           continue;
         }
 
-        // 3. Registra a nota no Redmine ANTES de mover. Assim, se a nota falhar,
-        // o arquivo permanece na pasta de origem e é reprocessado na próxima rodada.
-        // O ID do arquivo na nota garante que não haverá nota duplicada.
-        if (isVideo && !issueHasRecordingNote(issue, file.id)) {
-          const journalNote = [
-            `*Gravação de Reunião Disponibilizada*`,
-            ``,
-            `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
-            ``,
-            `* *Arquivo:* ${file.name}`,
-            `* *Duração do vídeo:* ${formatVideoDuration(durationMillis)}`,
-            `* *Link:* https://drive.google.com/file/d/${file.id}/view`
-          ].join('\n');
+        const targetFolderId = await getOrCreateIssueRecordingFolder(
+          drive,
+          structure.treinamentosFolderId,
+          issueId,
+          getRecordingFolderName(item),
+          issue
+        );
 
-          const noteAdded = await addRedmineJournalNote(issueId, journalNote);
-          if (!noteAdded) continue;
-
-          // O Redmine responde 204 mesmo quando ignora a nota (ex.: usuário da API
-          // sem permissão "Adicionar notas" no projeto). Confirma que foi gravada.
-          const updatedIssue = await fetchIssueDetails(issueId);
-          if (!issueHasRecordingNote(updatedIssue, file.id)) {
-            console.error(`Redmine aceitou a requisição mas não registrou a nota na tarefa #${issueId}.`);
-            await notifyAttention(
-              `redmine_note_not_saved:${issueId}`,
-              'Redmine não registrou a nota da gravação (verifique a permissão "Adicionar notas" do usuário da API no projeto)',
-              { issueId, projectId: issue.project?.id, fileName: file.name }
-            );
-            continue;
-          }
+        if (isDriveFolder(item)) {
+          await consolidateRecordingFolder(drive, item, targetFolderId, issue);
+        } else {
+          await processRecordingFile(drive, item, GOOGLE_DRIVE_RECORDINGS_FOLDER_ID, targetFolderId, issue);
         }
-
-        // 4. Move o arquivo (seja nota ou vídeo) para a pasta de Treinamentos do cliente
-        await drive.files.update({
-          fileId: file.id,
-          addParents: structure.treinamentosFolderId,
-          removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-          fields: 'id, parents',
-          supportsAllDrives: true
-        });
-
-        console.log(`Arquivo [${file.name}] movido com sucesso para a tarefa #${issueId}`);
       } catch (err) {
         console.error(
-          `Erro ao mover arquivo ou atualizar tarefa #${issueId}:`,
+          `Erro ao organizar gravação ou atualizar tarefa #${issueId}:`,
           err.response?.data || err.message
         );
         await notifyAttention(
           `drive_recording_move_error:${issueId}`,
           'Erro ao mover arquivo no Google Drive / Atualizar Redmine',
-          { issueId, fileId: file.id, fileName: file.name, error: err.response?.data || err.message }
+          { issueId, itemId: item.id, itemName: item.name, error: err.response?.data || err.message }
         );
       }
     }
@@ -2170,6 +2293,64 @@ async function processMeetRecordings() {
     await notifyAttention(
       'drive_recordings_general_error',
       'Erro geral no processamento de gravações',
+      error.response?.data || error.message
+    );
+  }
+}
+
+// Varredura única (na inicialização): unifica pastas duplicadas do mesmo
+// #ID já existentes dentro de Treinamentos de cada cliente.
+async function consolidateExistingRecordingFolders() {
+  if (!GOOGLE_DRIVE_CLIENTES_FOLDER_ID || !googleCalendarIsConfigured()) return;
+
+  try {
+    const drive = getGoogleDriveClient();
+    const clientFolders = (await listDriveChildren(drive, GOOGLE_DRIVE_CLIENTES_FOLDER_ID, 'id, name, mimeType'))
+      .filter(isDriveFolder);
+    let mergedGroups = 0;
+
+    for (const clientFolder of clientFolders) {
+      const treinamentos = (await listDriveChildren(drive, clientFolder.id, 'id, name, mimeType'))
+        .find((item) => isDriveFolder(item) && item.name.trim() === 'Treinamentos');
+
+      if (!treinamentos) continue;
+
+      const groups = new Map();
+      const folders = (await listDriveChildren(drive, treinamentos.id, 'id, name, mimeType, createdTime'))
+        .filter(isDriveFolder);
+
+      for (const folder of folders) {
+        const match = folder.name.trim().match(/^#(\d+)/);
+        if (!match) continue;
+        if (!groups.has(match[1])) groups.set(match[1], []);
+        groups.get(match[1]).push(folder);
+      }
+
+      for (const [issueId, group] of groups) {
+        if (group.length < 2) continue;
+
+        try {
+          const issue = await fetchIssueDetails(issueId);
+          await getOrCreateIssueRecordingFolder(drive, treinamentos.id, issueId, group[0].name, issue);
+          mergedGroups++;
+        } catch (err) {
+          console.error(
+            `Erro ao unificar pastas da tarefa #${issueId} em [${clientFolder.name}]:`,
+            err.response?.data || err.message
+          );
+        }
+      }
+    }
+
+    console.log(`Varredura de pastas de gravação concluída: ${mergedGroups} tarefa(s) com pastas unificadas.`);
+  } catch (error) {
+    console.error(
+      'Erro na varredura de pastas de gravação:',
+      error.response?.data || error.message
+    );
+    await notifyAttention(
+      'drive_recordings_consolidation_error',
+      'Erro na varredura de pastas duplicadas de gravação',
       error.response?.data || error.message
     );
   }
@@ -4179,7 +4360,8 @@ app.listen(PORT, () => {
   pollingAppointmentAlerts();
   processDailySummary();
   processClientMorningSummary();
-  processMeetRecordings();
+  // A varredura roda após o primeiro processamento para não concorrer com ele
+  processMeetRecordings().then(consolidateExistingRecordingFolders);
   processAutoResolution();
 
   setInterval(
