@@ -739,6 +739,7 @@ async function addRedmineJournalNote(issueId, notes) {
       { headers: redmineHeaders }
     );
     console.log(`Nota adicionada com sucesso na tarefa #${issueId}`);
+    return true;
   } catch (err) {
     console.error(`Erro ao adicionar nota na tarefa #${issueId}:`, err.response?.data || err.message);
     await notifyAttention(
@@ -746,6 +747,7 @@ async function addRedmineJournalNote(issueId, notes) {
       'Erro ao adicionar histórico/nota na tarefa do Redmine',
       { issueId, error: err.response?.data || err.message }
     );
+    return false;
   }
 }
 
@@ -2004,6 +2006,53 @@ async function getOrCreateClientFolderStructure(issue) {
   }
 }
 
+// Tempo máximo aguardando o Drive gerar os metadados do vídeo antes de mover sem duração
+const RECORDING_METADATA_MAX_WAIT_MS = 6 * 60 * 60 * 1000;
+
+function formatVideoDuration(durationMillis) {
+  if (!durationMillis) return 'Não identificada';
+
+  const totalSeconds = Math.floor(Number(durationMillis) / 1000);
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return 'Não identificada';
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return hours > 0
+    ? `${hours}h ${minutes}m ${seconds}s`
+    : `${minutes}m ${seconds}s`;
+}
+
+function issueHasRecordingNote(issue, fileId) {
+  return (issue?.journals || []).some(
+    (journal) => typeof journal.notes === 'string' && journal.notes.includes(fileId)
+  );
+}
+
+async function getVideoDurationMillis(drive, file) {
+  if (file.videoMediaMetadata?.durationMillis) {
+    return file.videoMediaMetadata.durationMillis;
+  }
+
+  // O files.list às vezes não retorna videoMediaMetadata mesmo quando o
+  // Drive já processou o vídeo; consulta o arquivo individualmente.
+  try {
+    const res = await drive.files.get({
+      fileId: file.id,
+      fields: 'id, videoMediaMetadata(durationMillis)',
+      supportsAllDrives: true
+    });
+    return res.data.videoMediaMetadata?.durationMillis || null;
+  } catch (err) {
+    console.error(
+      `Erro ao consultar metadados do vídeo [${file.name}]:`,
+      err.response?.data || err.message
+    );
+    return null;
+  }
+}
+
 async function processMeetRecordings() {
   if (!GOOGLE_DRIVE_RECORDINGS_FOLDER_ID || !googleCalendarIsConfigured()) return;
 
@@ -2013,7 +2062,8 @@ async function processMeetRecordings() {
     // Busca todos os arquivos da pasta original
     const res = await drive.files.list({
       q: `'${GOOGLE_DRIVE_RECORDINGS_FOLDER_ID}' in parents and trashed = false`,
-      fields: 'files(id, name, mimeType, videoMediaMetadata(durationMillis))'
+      fields: 'files(id, name, mimeType, createdTime, videoMediaMetadata(durationMillis))',
+      pageSize: 100
     });
 
     const files = res.data.files || res.data.items || [];
@@ -2024,62 +2074,82 @@ async function processMeetRecordings() {
       if (!match) continue;
 
       const issueId = match[1];
-      
-      // 2. Identifica se o arquivo atual é um vídeo
-      const isVideo = file.mimeType && file.mimeType.startsWith('video/');
+      const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
 
-      // 3. SE FOR VÍDEO: Valida se o Google Drive já disponibilizou a duração/metadados
-      if (isVideo && (!file.videoMediaMetadata || !file.videoMediaMetadata.durationMillis)) {
-        console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
-        continue;
+      // 2. SE FOR VÍDEO: aguarda o Drive disponibilizar a duração (com limite de espera)
+      let durationMillis = null;
+
+      if (isVideo) {
+        durationMillis = await getVideoDurationMillis(drive, file);
+
+        if (!durationMillis) {
+          const ageMs = file.createdTime
+            ? Date.now() - new Date(file.createdTime).getTime()
+            : 0;
+
+          if (ageMs < RECORDING_METADATA_MAX_WAIT_MS) {
+            console.log(`O vídeo [${file.name}] ainda está sendo processado pelo Google Drive. Aguardando metadados...`);
+            continue;
+          }
+
+          console.warn(
+            `O vídeo [${file.name}] está sem metadados de duração há mais de ${RECORDING_METADATA_MAX_WAIT_MS / 3600000}h. Movendo sem duração.`
+          );
+        }
+      } else {
+        console.log(`Arquivo [${file.name}] (${file.mimeType}) não é vídeo; será movido sem nota no Redmine.`);
       }
 
       try {
         const issue = await fetchIssueDetails(issueId);
         const structure = await getOrCreateClientFolderStructure(issue);
 
-        if (structure?.treinamentosFolderId) {
-          // Move o arquivo (seja nota ou vídeo) para a pasta de Treinamentos do cliente
-          await drive.files.update({
-            fileId: file.id,
-            addParents: structure.treinamentosFolderId,
-            removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
-            fields: 'id, parents'
-          });
+        if (!structure?.treinamentosFolderId) {
+          console.log(`Tarefa #${issueId} sem estrutura de pasta no Drive (projeto sem "Sincroniza G-Drive" = Sim?). Arquivo [${file.name}] mantido.`);
+          continue;
+        }
 
-          console.log(`Arquivo [${file.name}] movido com sucesso para a tarefa #${issueId}`);
+        // 3. Registra a nota no Redmine ANTES de mover. Assim, se a nota falhar,
+        // o arquivo permanece na pasta de origem e é reprocessado na próxima rodada.
+        // O ID do arquivo na nota garante que não haverá nota duplicada.
+        if (isVideo && !issueHasRecordingNote(issue, file.id)) {
+          const journalNote = [
+            `*Gravação de Reunião Disponibilizada*`,
+            ``,
+            `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
+            ``,
+            `* *Arquivo:* ${file.name}`,
+            `* *Duração do vídeo:* ${formatVideoDuration(durationMillis)}`,
+            `* *Link:* https://drive.google.com/file/d/${file.id}/view`
+          ].join('\n');
 
-          // 4. REGRA CONDICIONAL: Só faz o registro de comentário no Redmine se for um vídeo
-          if (isVideo) {
-            // --- CÁLCULO DA DURAÇÃO DO VÍDEO ---
-            let durationText = 'Não identificada';
-            const durationMillis = file.videoMediaMetadata?.durationMillis;
+          const noteAdded = await addRedmineJournalNote(issueId, journalNote);
+          if (!noteAdded) continue;
 
-            if (durationMillis) {
-              const totalSeconds = Math.floor(Number(durationMillis) / 1000);
-              const hours = Math.floor(totalSeconds / 3600);
-              const minutes = Math.floor((totalSeconds % 3600) / 60);
-              const seconds = totalSeconds % 60;
-
-              if (hours > 0) {
-                durationText = `${hours}h ${minutes}m ${seconds}s`;
-              } else {
-                durationText = `${minutes}m ${seconds}s`;
-              }
-            }
-
-            // Monta o comentário/histórico que será inserido no Redmine
-            const journalNote = [
-              `🎥 *Gravação de Reunião Disponibilizada*`,
-              `O vídeo da reunião foi organizado e movido para a pasta de Treinamentos do cliente no Google Drive.`,
-              `• **Arquivo:** \`${file.name}\``,
-              `• **Duração do vídeo:** ${durationText}`
-            ].join('\n');
-
-            // Envia o comentário para a tarefa do Redmine
-            await addRedmineJournalNote(issueId, journalNote);
+          // O Redmine responde 204 mesmo quando ignora a nota (ex.: usuário da API
+          // sem permissão "Adicionar notas" no projeto). Confirma que foi gravada.
+          const updatedIssue = await fetchIssueDetails(issueId);
+          if (!issueHasRecordingNote(updatedIssue, file.id)) {
+            console.error(`Redmine aceitou a requisição mas não registrou a nota na tarefa #${issueId}.`);
+            await notifyAttention(
+              `redmine_note_not_saved:${issueId}`,
+              'Redmine não registrou a nota da gravação (verifique a permissão "Adicionar notas" do usuário da API no projeto)',
+              { issueId, projectId: issue.project?.id, fileName: file.name }
+            );
+            continue;
           }
         }
+
+        // 4. Move o arquivo (seja nota ou vídeo) para a pasta de Treinamentos do cliente
+        await drive.files.update({
+          fileId: file.id,
+          addParents: structure.treinamentosFolderId,
+          removeParents: GOOGLE_DRIVE_RECORDINGS_FOLDER_ID,
+          fields: 'id, parents',
+          supportsAllDrives: true
+        });
+
+        console.log(`Arquivo [${file.name}] movido com sucesso para a tarefa #${issueId}`);
       } catch (err) {
         console.error(
           `Erro ao mover arquivo ou atualizar tarefa #${issueId}:`,
